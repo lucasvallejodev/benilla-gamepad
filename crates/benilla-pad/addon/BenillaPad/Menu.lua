@@ -88,6 +88,10 @@ Menu.pages = {
             { label = "Always show the bar", desc = "Show the gamepad bar even with no controller connected.", key = "alwaysShow" },
             { label = "Hide the stock bars", desc = "While the gamepad bar shows, the stock action bars, bags, XP bar and micro menu go (the window wheel opens everything). The pet bar stays.",
                 key = "hideStockBars" },
+            { label = "Experience bar", desc = "A thin experience bar along the bottom of the screen, with the rested bonus shown ahead of it.",
+                key = "xpBar" },
+            { label = "Experience numbers", desc = "Level, experience and rested bonus as text over the bar. Off: shown only under the mouse pointer.",
+                key = "xpText" },
             { label = "Cooldowns from other layers", desc = "A row above the bar with what is cooling down on the layers you are not holding.",
                 key = "layerCooldowns" },
         },
@@ -122,7 +126,7 @@ hint:SetPoint("BOTTOM", win, "BOTTOM", 0, 20)
 hint:SetText("D-pad: move    Left / Right: change    A: choose    B: back")
 
 local rows = {}
-for i = 1, 8 do
+for i = 1, 10 do
     local r = CreateFrame("Button", nil, win)
     r:SetWidth(WIDTH - 40)
     r:SetHeight(ROW - 2)

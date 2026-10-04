@@ -371,6 +371,9 @@ function Bar.Refresh()
         frame:Hide()
     end
     Bar.StockBar()
+    if P.Xp then
+        P.Xp.Refresh()
+    end
     if not frame:IsShown() then
         return
     end

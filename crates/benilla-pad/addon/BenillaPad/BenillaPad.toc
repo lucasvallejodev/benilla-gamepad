@@ -8,6 +8,7 @@
 Core.lua
 Actions.lua
 Bar.lua
+XpBar.lua
 Keyboard.lua
 Keybinds.lua
 Menu.lua

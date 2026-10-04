@@ -56,6 +56,9 @@ P.DEFAULTS = {
     -- Stock windows take the pad as a mouse cursor; and how fast it moves, pixels a second.
     padCursor = true,
     cursorSpeed = 1100,
+    -- The experience bar along the bottom of the screen, and its numbers.
+    xpBar = true,
+    xpText = true,
     -- Interact loots a whole corpse at once.
     interactLootAll = true,
     -- A row above the bar with the cooldowns of the layers not held.
@@ -254,6 +257,9 @@ function P.Changed()
     end
     if P.Binds and P.Binds.Refresh then
         P.Binds.Refresh()
+    end
+    if P.Xp then
+        P.Xp.Refresh()
     end
 end
 
