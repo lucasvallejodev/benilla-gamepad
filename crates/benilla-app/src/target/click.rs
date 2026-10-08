@@ -224,6 +224,7 @@ pub(crate) struct Dispatch<'w, 's> {
     service: ServiceArms<'w>,
     feedback: Feedback<'w>,
     auto: crate::player::AutoMove<'w, 's>,
+    player: Res<'w, crate::player::Player>,
 }
 
 /// The Loot walk's stop radius: the arm (`0x611130`) takes the square root (`0x6111ab`) of what
@@ -244,6 +245,11 @@ impl Dispatch<'_, '_> {
     fn self_store(&self) -> Option<&ObjectStore> {
         let (me, ..) = self.me()?;
         self.stores.get(me).ok().map(|(s, _)| s)
+    }
+
+    /// Any `0x20ff` bit in our last streamed movement word: a direction, turn, pitch or fall.
+    fn moving(&self) -> bool {
+        self.player.move_flags() & crate::creature_anim::move_flags::INTEGRATED != 0
     }
 
     /// The reference's one mounted predicate, the player's `UNIT_FIELD_MOUNTDISPLAYID`.
@@ -449,10 +455,13 @@ impl Dispatch<'_, '_> {
         }
     }
 
-    /// `0x5df130`: `CMSG_LOOT` at a lootable corpse, walked to first when `walk` and beyond its
-    /// 5 yd (`0x5df1c3`), stopping at [`loot_stop`] of 5. A walk that does not start falls through
-    /// to the send.
+    /// `0x5df130`: `CMSG_LOOT` at a lootable corpse, never while [`Self::moving`] (`0x5df173`),
+    /// walked to first when `walk` and beyond its 5 yd (`0x5df1c3`), stopping at [`loot_stop`] of
+    /// 5. A walk that does not start falls through to the send.
     fn loot_corpse(&mut self, entity: Entity, guid: u64, walk: bool) {
+        if self.moving() {
+            return;
+        }
         if walk
             && self
                 .dist_sq(entity)
@@ -474,10 +483,10 @@ impl Dispatch<'_, '_> {
     }
 
     /// `0x5df2a0`: `CMSG_LOOT` at a dead unit, which `can_loot` (`CanLootNow 0x5ec110`) must
-    /// allow, walked to first when `walk` and beyond melee reach. A walk that does not start falls
-    /// through to the send.
+    /// allow, never while [`Self::moving`] (`0x5df2e9`), walked to first when `walk` and beyond
+    /// melee reach. A walk that does not start falls through to the send.
     fn loot_unit(&mut self, entity: Entity, guid: u64, can_loot: bool, walk: bool) {
-        if !can_loot {
+        if !can_loot || self.moving() {
             return;
         }
         let reach = self.melee_reach(entity);
@@ -987,6 +996,14 @@ pub(super) fn act_on_arrival(
 ) {
     use crate::player::{ApproachVerb, Subject};
     use benilla_protocol::EntityKind;
+    // Owed while any `0x20ff` bit is set: the reference drains it from the movement emitter
+    // `0x60e0a0` only at a stop, strafe stop, root or unroot ack that leaves none (`0x60e352`), never
+    // at a landing. Deviation: it runs on the first frame with none, so an arrival that sends no stop
+    // (mid-air, rooted, under a held turn key) acts at once or on landing or release, where the
+    // reference waits for the next ground stop and can act long after, wherever the player then is.
+    if dispatch.moving() {
+        return;
+    }
     let Some((verb, guid)) = dispatch.auto.approach.arrived.take() else {
         return;
     };
@@ -1430,7 +1447,7 @@ pub(crate) fn service_action(
 /// Drain the guid-scoped deselects ([`DeselectGuid`]). `ClearTarget()`, the last leg of the Esc
 /// chain (`UIParent.lua:1492`), is a script call and lands in call order
 /// ([`crate::script_calls`]).
-pub(super) fn clear_target_requests(
+pub(crate) fn clear_target_requests(
     mut selection: ResMut<Selection>,
     mut seam: crate::creature_anim::AttackSeam,
     engaged: Query<(), (With<Engaged>, With<SelfPlayer>)>,
@@ -2551,33 +2568,8 @@ mod tests {
     /// `0x5df2a0`: beyond melee reach the walk comes first and nothing is looted yet.
     #[test]
     fn a_far_body_to_loot_is_walked_to_before_the_loot() {
-        const BODY: u64 = 0xB0D7;
-        const F_DYNAMIC_FLAGS: u16 = 143;
-        let (mut world, _vendor, rx) = walking_world(Vec3::new(14.0, 0.0, 0.0), true);
-        let body = world
-            .spawn((
-                Guid(BODY),
-                store(&[(F_HEALTH, 0), (F_MAXHEALTH, 100), (F_DYNAMIC_FLAGS, 0x1)]),
-                Transform::from_xyz(0.0, 0.0, -12.0),
-            ))
-            .id();
-        *world.resource_mut::<PressPick>() = PressPick {
-            hovered: Hovered {
-                target: Some(body),
-                guid: Some(BODY),
-                distance: 12.0,
-                ..Hovered::default()
-            },
-            cursor: WorldCursor {
-                kind: cursor_mode::CursorKind::Pickup,
-                unable: false,
-            },
-            ..PressPick::default()
-        };
-        world
-            .resource_mut::<Messages<WorldRightClick>>()
-            .write(WorldRightClick);
-        world.run_system_once(act_on_right_click).unwrap();
+        let (mut world, body, corpse, rx) = loot_world(12.0, 0, true);
+        right_click_loot(&mut world, loot_hover(false, body, corpse, 12.0));
         assert!(world.resource::<crate::player::Approach>().active());
         assert!(!rx
             .try_iter()
@@ -2589,24 +2581,8 @@ mod tests {
     /// for a unit.
     #[test]
     fn a_loot_walk_stops_at_the_square_root_of_the_melee_reach() {
-        const BODY: u64 = 0xB0D7;
-        const CORPSE: u64 = 0xC0D5;
         const F_DYNAMIC_FLAGS: u16 = 143;
         const F_COMBAT_REACH: u16 = 130;
-        let loot_click = |world: &mut World, hovered: Hovered| {
-            *world.resource_mut::<PressPick>() = PressPick {
-                hovered,
-                cursor: WorldCursor {
-                    kind: cursor_mode::CursorKind::Pickup,
-                    unable: false,
-                },
-                ..PressPick::default()
-            };
-            world
-                .resource_mut::<Messages<WorldRightClick>>()
-                .write(WorldRightClick);
-            world.run_system_once(act_on_right_click).unwrap();
-        };
         // A unit of reach 4 against our default 1.5: 4 + 1.5 + 1.3333 = 6.8333.
         let (mut world, _vendor, _rx) = walking_world(Vec3::new(14.0, 0.0, 0.0), true);
         let body = world
@@ -2621,7 +2597,7 @@ mod tests {
                 Transform::from_xyz(0.0, 0.0, -12.0),
             ))
             .id();
-        loot_click(
+        right_click_loot(
             &mut world,
             Hovered {
                 target: Some(body),
@@ -2647,7 +2623,7 @@ mod tests {
                 Transform::from_xyz(0.0, 0.0, -12.0),
             ))
             .id();
-        loot_click(
+        right_click_loot(
             &mut world,
             Hovered {
                 corpse: Some(corpse),
@@ -3002,177 +2978,170 @@ mod tests {
             );
         }
     }
-}
 
-/// Armed by [`aim_target_interact`] for [`press_target_interact`] in the same frame.
-#[derive(Resource, Default)]
-pub(crate) struct TargetInteractArmed(bool);
+    const BODY: u64 = 0xB0D7;
+    const CORPSE: u64 = 0xC0D5;
 
-/// Deviation, [`benilla_world::interact::TargetInteract`] (a gamepad's Interact): stands the
-/// hover on the current target for this frame, so the cursor classifier grades it as a cursor
-/// over it would be. Runs after the picks and before [`cursor_mode::classify_cursor`].
-///
-/// With no target it takes a soft target ([`soft_target`]): a corpse to loot or skin (the death
-/// edge clears the selection, `ring::update_ring`), else an NPC or a usable object in front.
-pub(super) fn aim_target_interact(
-    mut asks: MessageReader<benilla_world::interact::TargetInteract>,
-    selection: Res<Selection>,
-    units: Query<(
+    /// A dead lootable unit and a lootable corpse `at` yd off and the vendor in reach, with our last
+    /// streamed movement word `flags` and Click to Move set as `walk`.
+    fn loot_world(
+        at: f32,
+        flags: u32,
+        walk: bool,
+    ) -> (
+        World,
         Entity,
-        &Guid,
-        &Transform,
-        &ObjectStore,
-        &crate::net::NetEntity,
-    )>,
-    self_q: Query<&Transform, With<SelfPlayer>>,
-    camera: Query<&GlobalTransform, With<benilla_world::view::WorldCamera>>,
-    mut hovered: ResMut<Hovered>,
-    mut object: ResMut<HoveredObject>,
-    mut armed: ResMut<TargetInteractArmed>,
-    loot_all: Option<ResMut<crate::ui_loot::PadLootAll>>,
-) {
-    let Some(ask) = asks.read().last().copied() else {
-        return;
-    };
-    let pick = match (selection.target, selection.guid) {
-        (Some(target), Some(guid)) => Some(SoftTarget::Unit(target, guid)),
-        _ => self_q.single().ok().and_then(|me| {
-            let ahead = camera
-                .single()
-                .ok()
-                .map(|c| c.forward().as_vec3().with_y(0.0).normalize_or_zero())
-                .unwrap_or(Vec3::ZERO);
-            soft_target(&units, me.translation, ahead, selection.last)
-        }),
-    };
-    *hovered = Hovered::default();
-    *object = HoveredObject::default();
-    match pick {
-        Some(SoftTarget::Unit(target, guid)) => {
-            *hovered = Hovered {
-                target: Some(target),
-                guid: Some(guid),
-                distance: 0.0,
-                ..Hovered::default()
-            };
-        }
-        Some(SoftTarget::Object(target, guid)) => {
-            *object = HoveredObject {
-                target: Some(target),
-                guid: Some(guid),
-                distance: 0.0,
-            };
-        }
-        None => return,
-    }
-    if let (true, Some(mut loot_all)) = (ask.loot_all, loot_all) {
-        loot_all.0 = Some(std::time::Instant::now() + std::time::Duration::from_secs(3));
-    }
-    armed.0 = true;
-}
-
-/// What a soft-target Interact acts on.
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum SoftTarget {
-    Unit(Entity, u64),
-    Object(Entity, u64),
-}
-
-/// How far a soft target may be, in yards: corpses, then NPCs and objects (whose use still needs
-/// the classifier's reach).
-const SOFT_CORPSE_RANGE: f32 = 10.0;
-const SOFT_RANGE: f32 = 6.0;
-
-/// The GameObject types a soft Interact uses: quest giver, chest (herbs and veins too), goober,
-/// text, mailbox.
-const SOFT_GO_TYPES: [i32; 5] = [2, 3, 10, 9, 19];
-/// `GAMEOBJECT_FLAGS` bit `0x10`: no interact.
-const GO_FLAG_NO_INTERACT: u32 = 0x10;
-
-/// The soft target near `me`: a dead unit to loot or skin (`last`, the last target, first), else
-/// the nearest NPC with a service or usable GameObject, favouring what lies ahead of the camera
-/// (`ahead`, flat) and skipping what lies behind it.
-fn soft_target(
-    units: &Query<(
         Entity,
-        &Guid,
-        &Transform,
-        &ObjectStore,
-        &crate::net::NetEntity,
-    )>,
-    me: Vec3,
-    ahead: Vec3,
-    last: Option<u64>,
-) -> Option<SoftTarget> {
-    let mut corpse: Option<(f32, SoftTarget)> = None;
-    let mut other: Option<(f32, SoftTarget)> = None;
-    for (entity, guid, tf, store, net) in units {
-        let s = &store.0;
-        let offset = (tf.translation - me).with_y(0.0);
-        let d = offset.length();
-        let facing = if ahead == Vec3::ZERO || d < 0.5 {
-            1.0
-        } else {
-            offset.normalize().dot(ahead)
+        crossbeam_channel::Receiver<ClientCommand>,
+    ) {
+        const F_DYNAMIC_FLAGS: u16 = 143;
+        let (mut world, _vendor, rx) = walking_world(Vec3::new(2.5, 0.0, 0.0), walk);
+        world.insert_resource(crate::player::Player::with_move_flags(flags));
+        let body = world
+            .spawn((
+                Guid(BODY),
+                store(&[(F_HEALTH, 0), (F_MAXHEALTH, 100), (F_DYNAMIC_FLAGS, 0x1)]),
+                Transform::from_xyz(0.0, 0.0, -at),
+                crate::net::NetEntity {
+                    kind: benilla_protocol::EntityKind::Unit,
+                    display_id: None,
+                    scale: 1.0,
+                },
+            ))
+            .id();
+        world
+            .resource_mut::<crate::net::GuidIndex>()
+            .0
+            .insert(BODY, body);
+        let corpse = world
+            .spawn((
+                Guid(CORPSE),
+                store(&[(benilla_protocol::field::FIELD_CORPSE_DYNAMIC_FLAGS, 0x1)]),
+                Transform::from_xyz(0.0, 0.0, at),
+            ))
+            .id();
+        (world, body, corpse, rx)
+    }
+
+    fn right_click_loot(world: &mut World, hovered: Hovered) {
+        *world.resource_mut::<PressPick>() = PressPick {
+            hovered,
+            cursor: WorldCursor {
+                kind: cursor_mode::CursorKind::Pickup,
+                unable: false,
+            },
+            ..PressPick::default()
         };
-        match net.kind {
-            benilla_protocol::EntityKind::Unit | benilla_protocol::EntityKind::Player => {
-                let dead_usable = s.unit_is_dead()
-                    && (s.unit_lootable()
-                        || s.unit_flags() & cursor_mode::UNIT_FLAG_SKINNABLE != 0);
-                if dead_usable && d <= SOFT_CORPSE_RANGE {
-                    let rank = if last == Some(guid.0) { -1.0 } else { d };
-                    if corpse.is_none_or(|(r, _)| rank < r) {
-                        corpse = Some((rank, SoftTarget::Unit(entity, guid.0)));
-                    }
-                } else if !s.unit_is_dead()
-                    && s.unit_npc_flags() != 0
-                    && d <= SOFT_RANGE
-                    && facing > 0.0
-                {
-                    let rank = d * (2.0 - facing);
-                    if other.is_none_or(|(r, _)| rank < r) {
-                        other = Some((rank, SoftTarget::Unit(entity, guid.0)));
-                    }
-                }
-            }
-            benilla_protocol::EntityKind::GameObject => {
-                let usable = SOFT_GO_TYPES.contains(&s.gameobject_type_id())
-                    && s.gameobject_flags() & GO_FLAG_NO_INTERACT == 0;
-                if usable && d <= SOFT_RANGE && facing > 0.0 {
-                    let rank = d * (2.0 - facing);
-                    if other.is_none_or(|(r, _)| rank < r) {
-                        other = Some((rank, SoftTarget::Object(entity, guid.0)));
-                    }
-                }
-            }
-            _ => {}
+        world
+            .resource_mut::<Messages<WorldRightClick>>()
+            .write(WorldRightClick);
+        world.run_system_once(act_on_right_click).unwrap();
+    }
+
+    /// The press over the corpse when `on_corpse`, else over the dead unit.
+    fn loot_hover(on_corpse: bool, body: Entity, corpse: Entity, at: f32) -> Hovered {
+        let (unit, object) = if on_corpse {
+            (None, Some(corpse))
+        } else {
+            (Some(body), None)
+        };
+        Hovered {
+            target: unit,
+            guid: unit.map(|_| BODY),
+            corpse: object,
+            corpse_guid: object.map(|_| CORPSE),
+            distance: at,
+            ..Hovered::default()
         }
     }
-    corpse.or(other).map(|(_, t)| t)
-}
 
-/// The other half of [`aim_target_interact`]: latch the graded pick as a press and send the
-/// right-click the context ladder ([`act_on_right_click`]) acts on.
-pub(super) fn press_target_interact(
-    mut armed: ResMut<TargetInteractArmed>,
-    hovered: Res<Hovered>,
-    object: Res<HoveredObject>,
-    occlusion: Res<PickOcclusion>,
-    cursor: Res<WorldCursor>,
-    fork: Res<cursor_mode::AttackFork>,
-    mut press: ResMut<PressPick>,
-    mut right_clicks: MessageWriter<WorldRightClick>,
-) {
-    if !std::mem::take(&mut armed.0) {
-        return;
+    /// `0x5df2e9` and `0x5df173`: both loot senders return silently on any `0x20ff` bit, a
+    /// direction, turn, pitch or fall; swimming and walk mode are outside the mask.
+    #[test]
+    fn a_loot_click_while_moving_sends_nothing() {
+        use crate::creature_anim::move_flags as f;
+        for (flags, loots) in [
+            (0, true),
+            (f::FORWARD, false),
+            (f::BACKWARD, false),
+            (f::STRAFE_LEFT, false),
+            (f::TURN_RIGHT, false),
+            (f::FALLING, false),
+            (f::FORWARD | f::FALLING, false),
+            (f::SWIMMING, true),
+            (f::WALK_MODE, true),
+        ] {
+            for on_corpse in [false, true] {
+                let (mut world, body, corpse, rx) = loot_world(2.0, flags, false);
+                right_click_loot(&mut world, loot_hover(on_corpse, body, corpse, 2.0));
+                let looted = rx
+                    .try_iter()
+                    .any(|c| matches!(c, ClientCommand::Loot { .. }));
+                let latched = world.resource::<crate::ui_loot::LootLatch>().0.is_some();
+                assert_eq!(
+                    (looted, latched),
+                    (loots, loots),
+                    "flags {flags:#x}, corpse {on_corpse}"
+                );
+            }
+        }
     }
-    *press = PressPick {
-        hovered: *hovered,
-        object: *object,
-        occlusion: *occlusion,
-        cursor: *cursor,
-        attack_fork: *fork,
-    };
-    right_clicks.write(WorldRightClick);
+
+    /// The movement test comes before the walk (`0x5df2f6`, `0x5df180`): a far body or corpse
+    /// clicked on the run starts no Click to Move walk.
+    #[test]
+    fn a_far_loot_click_while_moving_starts_no_walk() {
+        use crate::creature_anim::move_flags as f;
+        for (flags, walks) in [(0, true), (f::FORWARD, false), (f::FALLING, false)] {
+            for on_corpse in [false, true] {
+                let (mut world, body, corpse, rx) = loot_world(12.0, flags, true);
+                right_click_loot(&mut world, loot_hover(on_corpse, body, corpse, 12.0));
+                assert_eq!(
+                    world.resource::<crate::player::Approach>().active(),
+                    walks,
+                    "flags {flags:#x}, corpse {on_corpse}"
+                );
+                assert!(!rx
+                    .try_iter()
+                    .any(|c| matches!(c, ClientCommand::Loot { .. })));
+            }
+        }
+    }
+
+    /// `0x60e352`: the owed verb (`0x60fa20`) runs only once no `0x20ff` bit is left, and the cell
+    /// stays armed until then.
+    #[test]
+    fn a_verb_owed_on_arrival_waits_for_a_word_with_no_move_bit() {
+        use crate::creature_anim::move_flags as f;
+        use crate::player::ApproachVerb;
+        for (verb, guid) in [(ApproachVerb::Loot, BODY), (ApproachVerb::Talk, VENDOR)] {
+            let (mut world, _body, _corpse, rx) = loot_world(2.0, f::FALLING, true);
+            world.resource_mut::<crate::player::Approach>().arrived = Some((verb, guid));
+            world.run_system_once(act_on_arrival).unwrap();
+            assert_eq!(rx.try_iter().count(), 0, "{verb:?} mid-air");
+            assert_eq!(
+                world.resource::<crate::player::Approach>().arrived,
+                Some((verb, guid)),
+                "{verb:?} stays owed"
+            );
+            world.insert_resource(crate::player::Player::with_move_flags(0));
+            world.run_system_once(act_on_arrival).unwrap();
+            let sent: Vec<ClientCommand> = rx.try_iter().collect();
+            assert!(
+                match verb {
+                    ApproachVerb::Loot =>
+                        matches!(sent.as_slice(), [ClientCommand::Loot { guid: BODY }]),
+                    _ => matches!(
+                        sent.as_slice(),
+                        [ClientCommand::ListInventory { guid: VENDOR }]
+                    ),
+                },
+                "{verb:?} landed: {sent:?}"
+            );
+            assert!(world
+                .resource::<crate::player::Approach>()
+                .arrived
+                .is_none());
+        }
+    }
 }

@@ -7,7 +7,8 @@
 //!   bar and answers what a press does: `BenillaPad_Resolve(button, layer)` returns a binding
 //!   command, which runs through the UI VM's `execute_binding`, the path a key takes, so the
 //!   hardware-event gate and the press/release bodies behave as the keyboard's do. A command with
-//!   a leading `@` is native (`@INTERACT`, the right-click context action on the target).
+//!   a leading `@` is native (`@INTERACT`, the right-click context action on the target or a
+//!   soft target, [`interact`]).
 //!
 //! The addon hears `BENILLAPAD_CONNECTED(style)`, `BENILLAPAD_DISCONNECTED`,
 //! `BENILLAPAD_LAYER(layer)`, `BENILLAPAD_BUTTON(button, down)`, and outside the world mode
@@ -19,6 +20,7 @@
 //! ([`drive_glue`]).
 
 pub mod addon;
+pub mod interact;
 pub mod map;
 
 use bevy::input::keyboard::{Key, KeyboardInput};
@@ -29,7 +31,6 @@ use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
 
 use benilla_ui::script::{ScriptValue, UiScript};
-use benilla_world::interact::TargetInteract;
 
 /// The gamepad plugin: re-enables bevy's gilrs backend, which benilla's boot disables, keeps the
 /// addon installed, and runs [`drive_pad`] after bevy's input update so the commands land in this
@@ -165,7 +166,21 @@ struct PadState {
     resolve_failed: bool,
     /// Last frame was in the cursor mode.
     cursor: bool,
+    /// The last target we had, which a soft Interact loots first: 1.12 clears the selection when
+    /// the target dies.
+    last_target: Option<u64>,
+    /// An Interact on a target the object mirror had not streamed yet, retried until this
+    /// `Time::elapsed_secs`.
+    interact_retry: Option<f32>,
+    /// We hold Shift for an Interact's loot-all (1.12's auto-loot is the Shift held as the loot
+    /// window opens), until this `Time::elapsed_secs` or the window shows.
+    loot_shift: Option<f32>,
 }
+
+/// How long an Interact waits for its target to be streamed, and how long its Shift is held for
+/// the loot window, in seconds.
+const INTERACT_RETRY_SECS: f32 = 0.3;
+const LOOT_SHIFT_SECS: f32 = 1.5;
 
 fn fire(script: &mut UiScript, event: &str, args: Vec<ScriptValue>) {
     script.fire_event(event, args);
@@ -236,7 +251,7 @@ fn drive_pad(
     time: Res<Time>,
     mut motion: ResMut<AccumulatedMouseMotion>,
     mut state: ResMut<PadState>,
-    mut interact: MessageWriter<TargetInteract>,
+    mut interacting: interact::Interacting,
     mut windows: Query<&mut Window, With<PrimaryWindow>>,
     mut mouse: ResMut<ButtonInput<MouseButton>>,
     mut scroll: ResMut<AccumulatedMouseScroll>,
@@ -251,6 +266,9 @@ fn drive_pad(
         .as_ref()
         .is_some_and(|s| s.eval::<bool>("return UIParent ~= nil").unwrap_or(false));
     let Some(mut script) = script.filter(|_| in_world) else {
+        if state.loot_shift.is_some() {
+            keys.release(KeyCode::ShiftLeft);
+        }
         *state = PadState::default();
         drive_glue(
             pads.iter().next().map(|(_, g)| g),
@@ -270,6 +288,9 @@ fn drive_pad(
     }
     let session = script.session();
     if state.session != Some(session) {
+        if state.loot_shift.is_some() {
+            keys.release(KeyCode::ShiftLeft);
+        }
         *state = PadState {
             session: Some(session),
             layer: "bare",
@@ -337,6 +358,26 @@ fn drive_pad(
     }
     state.cursor = cursor;
     let typing = script.has_keyboard_focus();
+
+    // ── Interact's upkeep ──
+    let now = time.elapsed_secs();
+    if let Some(target) = interacting.target() {
+        state.last_target = Some(target);
+    }
+    if let Some(until) = state.interact_retry {
+        if interacting.with_target() || now > until {
+            state.interact_retry = None;
+        }
+    }
+    if let Some(until) = state.loot_shift {
+        let open = script
+            .eval::<bool>("return LootFrame ~= nil and LootFrame:IsVisible() ~= nil")
+            .unwrap_or(false);
+        if open || now > until {
+            keys.release(KeyCode::ShiftLeft);
+            state.loot_shift = None;
+        }
+    }
 
     // ── Layer ──
     let layer = pad.map_or("bare", |p| {
@@ -417,9 +458,29 @@ fn drive_pad(
             }
             let latched = match resolve(&script, &mut state, addon, name, layer) {
                 Some(command) if command == "@INTERACT" => {
-                    interact.write(TargetInteract {
-                        loot_all: settings.loot_all,
-                    });
+                    let now = time.elapsed_secs();
+                    // The UI knows at once whether there is a target; the mirror's own record of
+                    // it (`UNIT_FIELD_TARGET`) follows the server's echo, so a target not there
+                    // yet is retried for a moment.
+                    let has_target = script
+                        .eval::<bool>("return UnitExists('target') ~= nil")
+                        .unwrap_or(false);
+                    if has_target {
+                        if !interacting.with_target() {
+                            state.interact_retry = Some(now + INTERACT_RETRY_SECS);
+                        }
+                    } else {
+                        interacting.with_soft_target(state.last_target);
+                    }
+                    // Loot everything: hold Shift over the loot window's opening, unless
+                    // benilla's own auto-loot is on, where Shift would turn it off.
+                    let auto = script
+                        .eval::<bool>("return GetCVar('autoLootDefault') == '1'")
+                        .unwrap_or(false);
+                    if settings.loot_all && !auto && state.loot_shift.is_none() {
+                        keys.press(KeyCode::ShiftLeft);
+                        state.loot_shift = Some(now + LOOT_SHIFT_SECS);
+                    }
                     Latched::Done
                 }
                 Some(command) if command.starts_with('@') => {

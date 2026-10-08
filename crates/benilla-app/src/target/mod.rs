@@ -74,7 +74,9 @@ pub(crate) use by_name::{AssistRequest, PlayerLookup, TargetByNameRequest};
 pub(crate) use by_name::SelectCommit;
 // The reaction decode and its faction catalog, which also tint the target frame
 // (`TargetFrame_CheckFaction`); `duel_rung` is the same walk, for `/reaction`.
-pub(crate) use ring::{duel_rung, ring_reaction, ring_variant, Factions, RingVariant};
+pub(crate) use ring::{duel_rung, ring_reaction, selection_variant, Factions, RingVariant};
+#[cfg(test)]
+pub(crate) use ring::{ring_variant, PlayerPath, SelectorInput};
 
 pub(crate) use click::DeselectGuid;
 pub use click::Interact;
@@ -286,7 +288,6 @@ impl Plugin for TargetPlugin {
             .init_resource::<WorldCursor>()
             .init_resource::<cursor_mode::AttackFork>()
             .init_resource::<CombatFlash>()
-            .init_resource::<click::TargetInteractArmed>()
             .init_resource::<scan::TabHistory>()
             .init_resource::<scan::LastEnemy>()
             .add_message::<AttackNearestRequest>()
@@ -312,13 +313,7 @@ impl Plugin for TargetPlugin {
                     (latch_press_pick, hover::update_pick_occlusion).chain(),
                     hover::update_hover,
                     hover::update_hovered_object,
-                    // A gamepad's Interact stands the hover on the target, then presses it.
-                    (
-                        click::aim_target_interact,
-                        cursor_mode::classify_cursor,
-                        click::press_target_interact,
-                    )
-                        .chain(),
+                    cursor_mode::classify_cursor,
                     // The right press's two legs of the reference's OnMouseDown hook (`0x492c20`),
                     // the targeting cancel and the repair-mode reset, before the cursor drive, so
                     // the press frame already reads both modes cleared.

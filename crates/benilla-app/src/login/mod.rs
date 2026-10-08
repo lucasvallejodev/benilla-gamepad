@@ -385,16 +385,6 @@ fn drive_policy(
     // login smoke, which drives its own credentials. There is no default account.
     if !attempt.intent.env_read {
         attempt.intent.env_read = true;
-        // Deviation: the kept auto-login ("Log in automatically"), once per start and behind the
-        // env fast path; the player typed these at the screen, so the account guard does not
-        // apply, and a failure shows its dialog like a typed one.
-        if !crate::run_mode::env_login() && !smoke {
-            if let Some((user, pass)) = load_autologin() {
-                info!("login: auto-login as {user}");
-                dialog.open_status(strings.text("LOGIN_STATE_CONNECTING", "Connecting"));
-                attempt.send(&user, &pass, true);
-            }
-        }
         if crate::run_mode::env_login() && std::env::var_os("WOW_LOGIN_SMOKE").is_none() {
             let user = std::env::var("WOW_USER").unwrap_or_default();
             let pass = std::env::var("WOW_PASS").unwrap_or_default();
@@ -472,8 +462,6 @@ fn drive_policy(
             // No resubmit can change it: show the server's words and drop the credentials.
             warn!("login: {}", msg.reason);
             attempt.intent.clear();
-            // Kept credentials the server refuses would be refused at every start.
-            save_autologin(None);
             dialog.open_error(&msg.reason);
             if may_end_the_run
                 && crate::run_mode::fatal_when_driverless(&format!(
@@ -593,9 +581,6 @@ pub(crate) struct LoginForm {
     pub(super) password: EditBoxState,
     pub(super) focus: Field,
     pub(super) save: bool,
-    /// Deviation: "Log in automatically". Checked, a submit that logs in keeps the account and
-    /// password ([`save_autologin`]) and the next start submits them by itself.
-    pub(super) auto: bool,
 }
 
 impl Default for LoginForm {
@@ -606,7 +591,6 @@ impl Default for LoginForm {
             password: textinput::field(MAX_LETTERS, true),
             focus: Field::default(),
             save: false,
-            auto: false,
         }
     }
 }
@@ -642,7 +626,6 @@ struct QuitArm(Option<f32>);
 fn enter_login(mut form: ResMut<LoginForm>, mut preview: ResMut<GluePreview>) {
     let saved = load_saved_account();
     form.save = !saved.is_empty();
-    form.auto = load_autologin().is_some();
     form.focus = if saved.is_empty() {
         Field::Account
     } else {
@@ -681,8 +664,9 @@ fn login_input(
     time: Res<Time>,
 ) {
     // The reference's `RealmList` is a DIALOG-strata frame over this screen, so while it is up
-    // everything here is inert, Escape included (it is the list's Cancel).
-    if realms.shown {
+    // everything here is inert, Escape included (it is the list's Cancel), through the frame
+    // its own Escape closes it in.
+    if realms.owns_input() {
         return;
     }
     let empty = GlueStrings::default();
@@ -744,18 +728,6 @@ fn login_input(
                 }));
                 if !form.save {
                     save_account("");
-                }
-            }
-            LoginAction::ToggleAuto => {
-                form.auto = !form.auto;
-                sounds.write(GlueSound(if form.auto {
-                    "igMainMenuOptionCheckBoxOff"
-                } else {
-                    "igMainMenuOptionCheckBoxOn"
-                }));
-                // Unchecking forgets the kept credentials at once.
-                if !form.auto {
-                    save_autologin(None);
                 }
             }
         }
@@ -840,10 +812,6 @@ fn login_input(
                     save_account("");
                 }
                 let (user, pass) = (form.account.text.clone(), form.password.text.clone());
-                // Kept now, dropped again by a refusal (the policy's terminal failure).
-                if form.auto {
-                    save_autologin(Some((&user, &pass)));
-                }
                 form.password.set_text("");
                 dialog.open_status(strings.text("LOGIN_STATE_CONNECTING", "Connecting"));
                 attempt.send(&user, &pass, true);
@@ -993,47 +961,6 @@ fn save_account_to(path: &std::path::Path, name: &str) {
     }
 }
 
-/// The kept auto-login credentials, account then password.
-fn load_autologin() -> Option<(String, String)> {
-    let path = crate::local_state::autologin_path()?;
-    load_autologin_from(&path)
-}
-
-fn load_autologin_from(path: &std::path::Path) -> Option<(String, String)> {
-    let text = std::fs::read_to_string(path).ok()?;
-    let mut lines = text.lines();
-    let user = lines.next()?.to_string();
-    let pass = lines.next()?.to_string();
-    (!user.is_empty() && !pass.is_empty()).then_some((user, pass))
-}
-
-/// Keep `creds` for the next start, or forget them.
-fn save_autologin(creds: Option<(&str, &str)>) {
-    if let Some(path) = crate::local_state::autologin_path() {
-        save_autologin_to(&path, creds);
-    }
-}
-
-fn save_autologin_to(path: &std::path::Path, creds: Option<(&str, &str)>) {
-    match creds {
-        Some((user, pass)) => {
-            if let Some(dir) = path.parent() {
-                let _ = std::fs::create_dir_all(dir);
-            }
-            if let Err(e) = std::fs::write(path, format!("{user}\n{pass}\n")) {
-                warn!("login: keeping the auto-login failed: {e}");
-            }
-        }
-        None => {
-            if path.exists() {
-                if let Err(e) = std::fs::remove_file(path) {
-                    warn!("login: forgetting the auto-login failed: {e}");
-                }
-            }
-        }
-    }
-}
-
 /// `GetSavedAccountName`, at [`crate::local_state`]'s path.
 fn load_saved_account() -> String {
     crate::local_state::saved_account_path()
@@ -1078,6 +1005,73 @@ mod tests {
         app.world_mut().resource_mut::<LoginIntent>().env_read = true;
         // Returned, not dropped: a dropped receiver turns every submit into an `Err`.
         (app, rx)
+    }
+
+    /// Escape on the realm list over this screen closes the list and nothing else: the press is
+    /// the list's (`Realms::owns_input`), so the login screen does not also quit, in either
+    /// order the two run.
+    #[test]
+    fn escape_on_the_realm_list_does_not_also_quit() {
+        for list_first in [true, false] {
+            let (tx, _requests) = crossbeam_channel::unbounded();
+            let (realm_tx, realm_rx) = crossbeam_channel::unbounded();
+            let mut app = App::new();
+            app.add_plugins(MinimalPlugins)
+                .init_resource::<crate::glue::GlueClicks>()
+                .init_resource::<ButtonInput<KeyCode>>()
+                .init_resource::<crate::bindings::LayoutNames>()
+                .insert_non_send_resource(HostClipboard::default())
+                .init_resource::<LoginForm>()
+                .init_resource::<LoginIntent>()
+                .init_resource::<GlueDialog>()
+                .init_resource::<crate::realm_select::Realms>()
+                .insert_resource(crate::realmlist::Realmlist::unpinned(
+                    crate::realmlist::DEFAULT_REALMLIST,
+                ))
+                .insert_resource(LoginSubmit(tx))
+                .insert_resource(LoginAbandon(std::sync::Arc::new(
+                    std::sync::atomic::AtomicU64::new(0),
+                )))
+                .insert_resource(crate::net::RealmChoice(realm_tx))
+                .add_message::<KeyboardInput>()
+                .add_message::<GlueSound>()
+                .add_message::<bevy::input::mouse::MouseWheel>()
+                .add_systems(PreUpdate, crate::realm_select::take_input);
+            let list = crate::realm_select::list_keys;
+            if list_first {
+                app.add_systems(Update, (list, login_input).chain());
+            } else {
+                app.add_systems(Update, (login_input, list).chain());
+            }
+            // The list stands over this screen, as the realm park raises it after logon.
+            app.world_mut()
+                .resource_mut::<crate::realm_select::Realms>()
+                .shown = true;
+            app.world_mut()
+                .resource_mut::<ButtonInput<KeyCode>>()
+                .press(KeyCode::Escape);
+            app.update();
+
+            let order = if list_first {
+                "list first"
+            } else {
+                "screen first"
+            };
+            assert!(
+                !app.world().resource::<crate::realm_select::Realms>().shown,
+                "{order}: the list's Cancel closed it"
+            );
+            assert!(
+                realm_rx
+                    .try_iter()
+                    .any(|r| matches!(r, crate::net::RealmRequest::Abandon)),
+                "{order}: and answered the park"
+            );
+            assert!(
+                !app.world().contains_resource::<QuitArm>(),
+                "{order}: the press was the list's, so the login screen does not also quit"
+            );
+        }
     }
 
     /// A lost session does not log itself back in: a displaced client's resubmit would kick the
@@ -1608,30 +1602,6 @@ mod tests {
         // A refusal keeps its own string.
         assert!(fail_text(&strings, Some(LoginRefusal::Logon(0x05)), None)
             .starts_with("The information you have entered is not valid."));
-    }
-
-    /// The auto-login keeps both lines, forgets them on `None`, and a half-written file is
-    /// nothing.
-    #[test]
-    fn the_autologin_round_trips_and_forgets() {
-        let dir = std::env::temp_dir().join(format!("benilla-autologin-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let path = dir.join("autologin");
-        assert_eq!(load_autologin_from(&path), None);
-        save_autologin_to(&path, Some(("PLAYER", "secret")));
-        assert_eq!(
-            load_autologin_from(&path),
-            Some(("PLAYER".to_string(), "secret".to_string()))
-        );
-        std::fs::write(
-            &path, "PLAYER
-",
-        )
-        .unwrap();
-        assert_eq!(load_autologin_from(&path), None);
-        save_autologin_to(&path, None);
-        assert!(!path.exists());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Save, load and clear round-trip through the file (`Get`/`SetSavedAccountName`).

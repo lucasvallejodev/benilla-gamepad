@@ -215,9 +215,11 @@ pub fn run_with(build: BuildId, extend: impl FnOnce(&mut App)) -> AppExit {
     launch(build, Some(Box::new(extend)))
 }
 
-/// The local state folder, `benilla-config/` (`local_state`), for a crate on top that keeps files
-/// there (an addon it installs into `AddOns/`); `None` when persistence is off. Valid once the app
-/// is built, as the dev build resolves it from the launcher's project folder.
+/// The state folder, `benilla-config/`, where a crate on top keeps its own files: an addon it ships
+/// goes in its `AddOns/`, where benilla finds addons and their art and fonts. `None` when
+/// persistence is off (a capture run, or no executable path), and it may not exist yet. A dev
+/// build resolves it from the launcher's folder, which [`run_with`] sets, so ask from `extend` or
+/// a system, never before.
 pub fn config_dir() -> Option<std::path::PathBuf> {
     local_state::home()
 }

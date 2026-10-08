@@ -22,12 +22,13 @@ top of benilla the way upstream asks a feature 1.12.1 lacks to be built. It has 
   stock 1.12 interface functions, and its art is drawn from scratch by
   [`tools/gen_art.py`](crates/benilla-pad/tools/gen_art.py).
 
-A few small changes reach into benilla itself: an Interact action (1.12 can only interact with a
-right-click), an optional "Log in automatically" tick on the login screen, and a loot-all hook.
+Nothing in benilla itself is changed: the crate uses only what benilla offers a crate built on top
+of it. An optional "Log in automatically" tick for the login screen, which does change benilla,
+lives on the separate [`auto-login`](../../tree/auto-login) branch.
 
 ## What the controller covers
 
-- **Before the world:** the login, realm and character screens, and an optional automatic login.
+- **Before the world:** the login, realm and character screens.
 - **Moving and looking:** left stick to move in eight directions, right stick for the camera,
   zoom with a shoulder held.
 - **Fighting:** four layers of buttons (no trigger, LT, RT, LT+RT) on the D-pad, the face buttons,
@@ -93,10 +94,9 @@ Plug the controller in before you start. Xbox names are used below.
 | Y | Tab between the account and password boxes |
 | Right stick, X | Move the cursor, click |
 
-Tick **Log in automatically** on the login screen and log in once with the keyboard: from then on
-the client logs in by itself at start and you land on the character screen. The account and
-password are kept in plain text in `benilla-config/autologin`, so use it on a server you run, not
-on someone else's.
+The password still needs a keyboard, or the `WOW_USER` and `WOW_PASS` environment variables, which
+log in without typing. The `auto-login` branch adds a **Log in automatically** tick that saves the
+login instead (in plain text, so only for a server you run).
 
 **In the world**
 
