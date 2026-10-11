@@ -262,9 +262,17 @@ fn drive_pad(
     // Before the world (login, realm list, character select) the VM is the boot one, with no
     // stock UI loaded (`UIParent` is FrameXML's): nothing of the world's survives, and the pad
     // drives those screens' own keys and the cursor.
-    let in_world = script
+    // One Lua call a frame answers it, with the addon's mode and settings generation.
+    let (in_world, mode, gen) = script
         .as_ref()
-        .is_some_and(|s| s.eval::<bool>("return UIParent ~= nil").unwrap_or(false));
+        .and_then(|s| {
+            s.eval::<(bool, Option<String>, Option<u32>)>(
+                "if BenillaPad_Mode then return UIParent ~= nil, BenillaPad_Mode() end \
+                 return UIParent ~= nil",
+            )
+            .ok()
+        })
+        .unwrap_or((false, None, None));
     let Some(mut script) = script.filter(|_| in_world) else {
         if state.loot_shift.is_some() {
             keys.release(KeyCode::ShiftLeft);
@@ -322,11 +330,6 @@ fn drive_pad(
     let pad = pad.map(|(_, g)| g);
 
     // ── The addon: its mode and settings ──
-    let (mode, gen) = script
-        .eval::<(Option<String>, Option<u32>)>(
-            "if BenillaPad_Mode then return BenillaPad_Mode() end",
-        )
-        .unwrap_or((None, None));
     let addon = mode.is_some();
     let mode = mode.unwrap_or_else(|| "world".to_string());
     let cursor = mode == "cursor";
