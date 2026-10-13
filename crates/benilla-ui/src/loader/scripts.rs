@@ -62,11 +62,10 @@ impl Loader<'_> {
                 if name.eq_ignore_ascii_case("OnMouseWheel") {
                     self.call(wrapper, "EnableMouseWheel", true, dbg);
                 }
-                // The key handlers, the same rule (`OnChar` kind 0, `OnKeyDown`/`OnKeyUp` kind 1);
-                // here any of them sets the one flag both key walks read.
-                const KEY_KIND: [&str; 3] = ["OnChar", "OnKeyDown", "OnKeyUp"];
-                if KEY_KIND.iter().any(|k| name.eq_ignore_ascii_case(k)) {
-                    self.call(wrapper, "EnableKeyboard", true, dbg);
+                // The key handlers, the same rule, one bit each: `OnChar` the char bit,
+                // `OnKeyDown` and `OnKeyUp` the key bit (`0x769f6b`, `0x769fa4`).
+                if let Err(e) = crate::script::enable_for_script(self.lua, wrapper, &name) {
+                    self.report.fault(format!("{dbg}: {name}: {e}"));
                 }
                 if name.eq_ignore_ascii_case("OnLoad") {
                     // A cleared `OnLoad` also unsets a template's, or the caller would fire it.
@@ -126,6 +125,25 @@ impl Loader<'_> {
     ) {
         if let Err(e) = wrapper.call_method::<()>(method, args) {
             self.report.fault(format!("{dbg}: {method}: {e}"));
+        }
+    }
+
+    /// Install the texture a widget element's child (`<BarTexture>`, `<ThumbTexture>`, a ColorSelect
+    /// texture) built as the widget's object, through the engine's own install, recording (not
+    /// propagating) any error: the Lua setters take the object too, but the loader needs no Lua
+    /// call to say it.
+    pub(super) fn install_texture(
+        &mut self,
+        wrapper: &Table,
+        tag: &str,
+        texture: &Table,
+        layer: Option<&str>,
+        dbg: &str,
+    ) {
+        if let Err(e) =
+            crate::script::install_loaded_texture(self.lua, wrapper, tag, texture, layer)
+        {
+            self.report.fault(format!("{dbg}: <{tag}>: {e}"));
         }
     }
 
