@@ -96,6 +96,16 @@ impl super::UiScript {
         std::mem::take(&mut self.model_mut().petition_requests)
     }
 
+    /// Take the `CloseGuildRegistrar()` calls queued since the last drain, leaving the other
+    /// intents in order: a close core answers the call its own `GUILD_REGISTRAR_CLOSED` raised
+    /// through `OnHide`.
+    pub fn take_registrar_close(&mut self) -> bool {
+        let requests = &mut self.model_mut().petition_requests;
+        let before = requests.len();
+        requests.retain(|r| !matches!(r, PetitionRequest::CloseRegistrar));
+        requests.len() != before
+    }
+
     /// Drop the queued close intents, returning how many. Firing `PETITION_CLOSED` runs `OnHide`,
     /// whose `ClosePetition()` queues a close; on a switch to a newly offered charter that close
     /// would shut the new window and decline it on the wire. A user's close survives, as the feed
@@ -192,7 +202,13 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     // argument raises, through mlua's coercion as through the reference's `Usage:`.
     g.set(
         "GetPetitionNameInfo",
-        lua.create_function(|lua, index: i64| {
+        lua.create_function(|lua, index: Value| {
+            // `is-number` else `Usage: GetPetitionNameInfo(index)` (`0x84cf94`, `0x4f453a`).
+            let index = i64::from(binding_abi::number_arg(
+                lua,
+                index,
+                "Usage: GetPetitionNameInfo(index)",
+            )?);
             let model = lua.app_data_ref::<Model>().expect("model app_data");
             let Some(name) = usize::try_from(index)
                 .ok()
@@ -250,10 +266,12 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     // 1, not 0 (`0x4f46d9`, `0x4f4749 Put8`); the server skips it.
     g.set(
         "SignPetition",
-        lua.create_function(|lua, n: Option<f64>| {
+        lua.create_function(|lua, n: Value| {
             let mut model = lua.app_data_mut::<Model>().expect("model app_data");
-            // `trunc` toward zero, then narrowed the way the `Put8` does.
-            let byte = n.map_or(1i8, |v| v.trunc() as i64 as i8);
+            // `lua_isnumber` (`0x4f46e2`) gates the read, a miss keeping the 1 (`0x4f46d9`); `_ftol`
+            // truncates toward zero, then the `Put8` keeps the low byte.
+            let byte = crate::script::binding_abi::is_number(lua, n)
+                .map_or(1i8, |v| crate::script::binding_abi::ftol(v) as i8);
             model.petition_requests.push(PetitionRequest::Sign(byte));
             Ok(())
         })?,

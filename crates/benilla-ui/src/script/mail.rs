@@ -4,10 +4,9 @@
 
 use mlua::{Lua, MultiValue, Value};
 
-use super::binding_abi::flag;
+use super::binding_abi::{self, flag};
 use super::cursor;
 use super::Model;
-use crate::script::binding_abi::Idx;
 
 /// `CheckInbox`'s throttle window, 60 000 ms (`0x4aeb06`).
 const CHECK_INBOX_WINDOW_SECS: f64 = 60.0;
@@ -159,6 +158,14 @@ impl super::UiScript {
     /// Push (or clear, with `None`) the open mailbox's inbox snapshot.
     pub fn set_mail(&mut self, state: Option<MailState>) {
         self.model_mut().mail = state;
+    }
+
+    /// The close core zeroed the mailbox (`0x4acd8f`): the verbs find none from here, ahead of
+    /// the snapshot the next feed pushes.
+    pub fn mail_closed(&mut self) {
+        if let Some(mail) = self.model_mut().mail.as_mut() {
+            mail.open = false;
+        }
     }
 
     /// Take the `CheckInbox` flag; the app answers it with `CMSG_GET_MAIL_LIST`.
@@ -380,7 +387,9 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     // (`0x4aeff0`..`0x4af05e`): four nils, 0 for money, COD amount and days left, six nils.
     g.set(
         "GetInboxHeaderInfo",
-        lua.create_function(|lua, Idx(index): Idx| {
+        lua.create_function(|lua, index: Value| {
+            // `is-number` else `Usage: GetInboxHeaderInfo(index)` (`0x8463b8`, `0x4aebee`).
+            let index = binding_abi::index_arg(lua, index, "Usage: GetInboxHeaderInfo(index)")?;
             let row = {
                 let model = lua.app_data_ref::<Model>().expect("model app_data");
                 row_at(&model, index)
@@ -427,7 +436,9 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     // (`MailFrame.lua:366`), the pair vmangos requires (`MailHandler.cpp:867`).
     g.set(
         "GetInboxText",
-        lua.create_function(|lua, Idx(index): Idx| {
+        lua.create_function(|lua, index: Value| {
+            // `is-number` else `Usage: GetInboxText(index)` (`0x8463dc`, `0x4af142`).
+            let index = binding_abi::index_arg(lua, index, "Usage: GetInboxText(index)")?;
             let row = {
                 let mut model = lua.app_data_mut::<Model>().expect("model app_data");
                 let row = row_at(&model, index);
@@ -463,7 +474,9 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     // being three nils and four zeros (`0x4af559`).
     g.set(
         "GetInboxInvoiceInfo",
-        lua.create_function(|lua, Idx(index): Idx| {
+        lua.create_function(|lua, index: Value| {
+            // `is-number` else `Usage: GetInboxInvoiceInfo(index)` (`0x84642c`, `0x4af38e`).
+            let index = binding_abi::index_arg(lua, index, "Usage: GetInboxInvoiceInfo(index)")?;
             let row = {
                 let model = lua.app_data_ref::<Model>().expect("model app_data");
                 row_at(&model, index)
@@ -498,7 +511,9 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     // the shared item-usable gate, true while the template is in flight.
     g.set(
         "GetInboxItem",
-        lua.create_function(|lua, Idx(index): Idx| {
+        lua.create_function(|lua, index: Value| {
+            // `is-number` else `Usage: GetInboxItem(index)` (`0x846450`, `0x4af5fe`).
+            let index = binding_abi::index_arg(lua, index, "Usage: GetInboxItem(index)")?;
             let (row, usable) = {
                 let model = lua.app_data_ref::<Model>().expect("model app_data");
                 let row = row_at(&model, index);
@@ -539,7 +554,9 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
 
     g.set(
         "InboxItemCanDelete",
-        lua.create_function(|lua, index: usize| {
+        lua.create_function(|lua, index: Value| {
+            // `is-number` else `Usage: InboxItemCanDelete(index)` (`0x846508`, `0x4afe11`).
+            let index = binding_abi::index_arg(lua, index, "Usage: InboxItemCanDelete(index)")?;
             let model = lua.app_data_ref::<Model>().expect("model app_data");
             Ok(flag(row_at(&model, index).is_some_and(|r| r.can_delete)))
         })?,
@@ -622,7 +639,9 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
                     return Ok(());
                 };
                 if let Err(refusal) = verb.sends(&model, &row) {
-                    model.ui_errors.extend(refusal);
+                    if let Some(key) = refusal {
+                        model.push_ui_error(key);
+                    }
                     return Ok(());
                 }
                 match verb {
@@ -680,7 +699,8 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
                 // An attached item whose object is gone (`0x4ae92e` resolves its guid):
                 // `ERR_ITEM_NOT_FOUND` (equip error 0x17, `0x4ae957`), the attachment dropped and
                 // `MAIL_SEND_INFO_UPDATE` (`0x4ae98d`), no packet. Checked before the money
-                // (`0x4ae917` ahead of `0x4ae99e`). The attachment is locked, so it cannot have moved.
+                // (`0x4ae917` ahead of `0x4ae99e`). The attachment is locked, so it cannot have
+                // moved.
                 if let Some(item) = model.mail_send_item.as_ref() {
                     let held = model
                         .containers
@@ -688,7 +708,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
                         .and_then(|c| c.slots.get(&item.slot))
                         .is_some_and(|s| s.guid == item.guid);
                     if !held {
-                        model.ui_errors.push("ERR_ITEM_NOT_FOUND");
+                        model.push_ui_error("ERR_ITEM_NOT_FOUND");
                         model.mail_send_item = None;
                         model.raise("MAIL_SEND_INFO_UPDATE", Vec::new());
                         return;
@@ -725,7 +745,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
             )? as u32;
             Ok(super::tick::verb(lua, |model| {
                 if u64::from(n) > model.money {
-                    model.ui_errors.push("ERR_NOT_ENOUGH_MONEY");
+                    model.push_ui_error("ERR_NOT_ENOUGH_MONEY");
                     return Value::Nil;
                 }
                 // The write (`0x4adc39`), then the signal (`0x4adc44`).

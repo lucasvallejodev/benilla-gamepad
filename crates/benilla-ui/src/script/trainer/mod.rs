@@ -8,7 +8,6 @@ use mlua::{Lua, MultiValue, Value};
 
 use super::binding_abi;
 use super::Model;
-use crate::script::binding_abi::Idx;
 
 /// A service's state (the wire's `TrainerSpellState`): green learnable, red gated, gray known.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -109,7 +108,8 @@ pub struct TrainerService {
     pub spell_id: u32,
     /// The wire spell's name; `None` (before `Spell.dbc` loads) answers nil, shown as `UNKNOWN`.
     pub name: Option<String>,
-    /// The wire spell's rank text, such as "Rank 2".
+    /// The wire spell's NameSubtext, such as "Rank 2", "" for a rankless spell; `None` is no Spell
+    /// record and answers nil (`0x4d8b58`).
     pub subtext: Option<String>,
     pub texture: Option<String>,
     /// The expanded text; `None` answers nil (`0x4d9d90`).
@@ -132,6 +132,18 @@ pub struct TrainerService {
     /// type 2 `TRADESKILL_SERVICE_STEP`/`_LEARN`.
     pub group_name: String,
     pub tooltip: TrainerTooltip,
+    /// The wire spell has a skill-step effect (id 44, `0x2c`) in any of its three slots:
+    /// `IsTrainerServiceSkillStep` (`0x4d9dd0`).
+    pub skill_step: bool,
+    /// `GetTrainerServiceStepIncrease`'s text (`0x4da030`) for the wire spell's first skill-step
+    /// effect: `INCREASE_POTENTIAL` filled with the effect's skill line and five times its step.
+    /// `None` when the spell has no such effect, the step is 0 or the line has no row; the binding
+    /// answers nil for a used service whatever this holds.
+    pub step_increase: Option<String>,
+    /// The name of the skill line whose id is [`Self::group_key`] (`SkillLine.dbc`), which
+    /// `GetTrainerSkillLines` (`0x4da660`) lists per header; `None` for a key with no row, the
+    /// known-talents group's -1 and a tradeskill trainer's 1 and 2 included.
+    pub line_name: Option<String>,
 }
 
 /// One header and its services, built by [`UiScript::set_trainer`].
@@ -140,6 +152,8 @@ pub struct TrainerGroup {
     /// Also the collapse key.
     pub key: u32,
     pub name: String,
+    /// [`TrainerService::line_name`] of the group's first service: a group's services share a key.
+    pub line_name: Option<String>,
     /// Positions into [`TrainerState::services`], in display order.
     pub services: Vec<usize>,
 }
@@ -191,6 +205,8 @@ impl super::UiScript {
             [true, true, false]
         };
         model.trainer_collapsed.clear();
+        // The skill-line filter resets to every group with the list (`0x4d7560`).
+        model.trainer_line_filter = u32::MAX;
         model.trainer_selection = None;
     }
 
@@ -202,6 +218,13 @@ impl super::UiScript {
     /// Whether `CloseTrainer` was called since the last drain; the close sends no packet.
     pub fn take_trainer_close(&mut self) -> bool {
         std::mem::take(&mut self.model_mut().trainer_close)
+    }
+
+    /// Whether `OpenTrainer` was called since the last drain: with a player, the app closes the
+    /// window and asks the server for the player's own trainer list (`CMSG_TRAINER_LIST`), as
+    /// `TalkToTrainer` (`0x5df680`) does.
+    pub fn take_trainer_open_own(&mut self) -> bool {
+        std::mem::take(&mut self.model_mut().trainer_open_own)
     }
 }
 
@@ -277,6 +300,7 @@ fn build_groups(services: &[TrainerService], trainer_type: u32) -> Vec<TrainerGr
             .or_insert_with(|| TrainerGroup {
                 key: s.group_key,
                 name: s.group_name.clone(),
+                line_name: s.line_name.clone(),
                 services: Vec::new(),
             })
             .services
@@ -325,7 +349,12 @@ fn rows(model: &Model) -> (Vec<Row>, usize) {
             .iter()
             .copied()
             .partition(|&si| model.trainer_filter[t.services[si].category.filter_slot()]);
-        if passes.is_empty() {
+        // A group the skill-line filter clears is hidden whole (`0x4d8508`), header included.
+        let line_shown = model.trainer_line_filter & 1u32.wrapping_shl(gi as u32) != 0;
+        if !line_shown {
+            tail.push(Row::Header(gi));
+            tail.extend(passes.into_iter().map(Row::Service));
+        } else if passes.is_empty() {
             // The filter hid every service, so the header goes too.
             tail.push(Row::Header(gi));
         } else {
@@ -443,7 +472,9 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     // header, which pushes 1); a service row answers 1 there too, a header 1 when it is expanded.
     g.set(
         "GetTrainerServiceInfo",
-        lua.create_function(|lua, Idx(index): Idx| {
+        lua.create_function(|lua, index: Value| {
+            // `is-number` else `Usage: GetTrainerServiceInfo(index)` (`0x84a884`, `0x4d8dd1`).
+            let index = binding_abi::index_arg(lua, index, "Usage: GetTrainerServiceInfo(index)")?;
             let model = lua.app_data_ref::<Model>().expect("model app_data");
             let miss = || binding_abi::tuple(&[None, None, None, Some(1)]);
             let Some(n) = index.checked_sub(1) else {
@@ -486,7 +517,10 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     // (`0x4d9160`) is untraced; the stock `CONFIRM_PROFESSION` dialog shows it as the profession.
     g.set(
         "GetTrainerServiceSkillLine",
-        lua.create_function(|lua, Idx(index): Idx| {
+        lua.create_function(|lua, index: Value| {
+            // `is-number` else `Usage: GetTrainerServiceSkillLine(index)` (`0x84a8f0`, `0x4d917a`).
+            let index =
+                binding_abi::index_arg(lua, index, "Usage: GetTrainerServiceSkillLine(index)")?;
             let model = lua.app_data_ref::<Model>().expect("model app_data");
             let Some(n) = index.checked_sub(1) else {
                 return Ok(Value::Nil);
@@ -506,7 +540,9 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
 
     g.set(
         "GetTrainerServiceIcon",
-        lua.create_function(|lua, Idx(index): Idx| {
+        lua.create_function(|lua, index: Value| {
+            // `is-number` else `Usage: GetTrainerServiceIcon(index)` (`0x84a8cc`, `0x4d8f81`).
+            let index = binding_abi::index_arg(lua, index, "Usage: GetTrainerServiceIcon(index)")?;
             let model = lua.app_data_ref::<Model>().expect("model app_data");
             opt_str(lua, service(&model, index).and_then(|s| s.texture.as_ref()))
         })?,
@@ -514,7 +550,11 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
 
     g.set(
         "GetTrainerServiceDescription",
-        lua.create_function(|lua, Idx(index): Idx| {
+        lua.create_function(|lua, index: Value| {
+            // `is-number` else `Usage: GetTrainerServiceDescription(index)` (`0x84a9e4`,
+            // `0x4d9b71`).
+            let index =
+                binding_abi::index_arg(lua, index, "Usage: GetTrainerServiceDescription(index)")?;
             let model = lua.app_data_ref::<Model>().expect("model app_data");
             opt_str(
                 lua,
@@ -527,7 +567,9 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     // is always 0, the profession cost 1 for a primary profession's first rank.
     g.set(
         "GetTrainerServiceCost",
-        lua.create_function(|lua, Idx(index): Idx| {
+        lua.create_function(|lua, index: Value| {
+            // `is-number` else `Usage: GetTrainerServiceCost(index)` (`0x84a91c`, `0x4d9307`).
+            let index = binding_abi::index_arg(lua, index, "Usage: GetTrainerServiceCost(index)")?;
             let model = lua.app_data_ref::<Model>().expect("model app_data");
             let (money, prof) = service(&model, index)
                 .map(|s| (s.cost, u32::from(s.prof_first_rank)))
@@ -542,7 +584,10 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
 
     g.set(
         "GetTrainerServiceLevelReq",
-        lua.create_function(|lua, Idx(index): Idx| {
+        lua.create_function(|lua, index: Value| {
+            // `is-number` else `Usage: GetTrainerServiceLevelReq(index)` (`0x84a940`, `0x4d93b5`).
+            let index =
+                binding_abi::index_arg(lua, index, "Usage: GetTrainerServiceLevelReq(index)")?;
             let model = lua.app_data_ref::<Model>().expect("model app_data");
             Ok(service(&model, index).map_or(0, |s| s.level_req) as i64)
         })?,
@@ -550,7 +595,10 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
 
     g.set(
         "GetTrainerServiceSkillReq",
-        lua.create_function(|lua, Idx(index): Idx| {
+        lua.create_function(|lua, index: Value| {
+            // `is-number` else `Usage: GetTrainerServiceSkillReq(index)` (`0x84a968`, `0x4d942a`).
+            let index =
+                binding_abi::index_arg(lua, index, "Usage: GetTrainerServiceSkillReq(index)")?;
             let model = lua.app_data_ref::<Model>().expect("model app_data");
             // No skill requirement, or no such row: nil, 0, 1 (`0x4d95bc`).
             let Some(req) = service(&model, index).and_then(|s| s.skill_req.as_ref()) else {
@@ -566,7 +614,11 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
 
     g.set(
         "GetTrainerServiceNumAbilityReq",
-        lua.create_function(|lua, Idx(index): Idx| {
+        lua.create_function(|lua, index: Value| {
+            // `is-number` else `Usage: GetTrainerServiceAbilityReq(index)` (`0x84a990`,
+            // `0x4d9617`), the client's own text naming `GetTrainerServiceAbilityReq`.
+            let index =
+                binding_abi::index_arg(lua, index, "Usage: GetTrainerServiceAbilityReq(index)")?;
             let model = lua.app_data_ref::<Model>().expect("model app_data");
             Ok(service(&model, index).map_or(0, |s| s.ability_reqs.len()) as i64)
         })?,
@@ -574,7 +626,12 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
 
     g.set(
         "GetTrainerServiceAbilityReq",
-        lua.create_function(|lua, (Idx(index), Idx(i)): (Idx, Idx)| {
+        lua.create_function(|lua, (index, i): (Value, Value)| {
+            // Both `is-number` else `Usage: GetTrainerServiceAbilityReq(index)` (`0x84a990`,
+            // `0x4d990e`).
+            let index =
+                binding_abi::index_arg(lua, index, "Usage: GetTrainerServiceAbilityReq(index)")?;
+            let i = binding_abi::index_arg(lua, i, "Usage: GetTrainerServiceAbilityReq(index)")?;
             let model = lua.app_data_ref::<Model>().expect("model app_data");
             let Some(req) = service(&model, index)
                 .and_then(|s| i.checked_sub(1).and_then(|n| s.ability_reqs.get(n)))
@@ -593,12 +650,19 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     // is the reference's tuple for a row with no step spell and for a miss (`0x4d9afc`).
     g.set(
         "GetTrainerServiceStepReq",
-        lua.create_function(|_, Idx(_index): Idx| Ok(binding_abi::tuple(&[None, Some(1)])))?,
+        lua.create_function(|lua, index: Value| {
+            // `is-number` else `Usage: GetTrainerServiceStepReq(index)` (`0x84a9bc`, `0x4d994a`).
+            binding_abi::index_arg(lua, index, "Usage: GetTrainerServiceStepReq(index)")?;
+            Ok(binding_abi::tuple(&[None, Some(1)]))
+        })?,
     )?;
 
     g.set(
         "IsTrainerServiceTradeSkill",
-        lua.create_function(|lua, Idx(index): Idx| {
+        lua.create_function(|lua, index: Value| {
+            // `is-number` else `Usage: IsTrainerServiceTradeSkill(index)` (`0x84aa64`, `0x4d9f83`).
+            let index =
+                binding_abi::index_arg(lua, index, "Usage: IsTrainerServiceTradeSkill(index)")?;
             let model = lua.app_data_ref::<Model>().expect("model app_data");
             Ok(binding_abi::flag(
                 service(&model, index).is_some_and(|s| s.is_trade_skill),
@@ -610,7 +674,10 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     // tradeskill is a learn spell; isPetLearnSpell is not built and always answers nil.
     g.set(
         "IsTrainerServiceLearnSpell",
-        lua.create_function(|lua, Idx(index): Idx| {
+        lua.create_function(|lua, index: Value| {
+            // `is-number` else `Usage: IsTrainerServiceLearnSpell(index)` (`0x84aa38`, `0x4d9e83`).
+            let index =
+                binding_abi::index_arg(lua, index, "Usage: IsTrainerServiceLearnSpell(index)")?;
             let model = lua.app_data_ref::<Model>().expect("model app_data");
             let learn = service(&model, index).is_some_and(|s| !s.is_trade_skill);
             Ok(MultiValue::from_vec(vec![
@@ -681,11 +748,148 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         })?,
     )?;
 
+    // OpenTrainer() (`0x4d8cf0`): `TalkToTrainer` (`0x5df680`) with the player's own guid, which
+    // first closes the window (`0x4d7440` with a zero guid) and then sends `CMSG_TRAINER_LIST`
+    // for that guid. All of it waits on the player (`0x4d8d24`), which only the app can see.
+    g.set(
+        "OpenTrainer",
+        lua.create_function(|lua, ()| {
+            let mut model = lua.app_data_mut::<Model>().expect("model app_data");
+            model.trainer_open_own = true;
+            Ok(())
+        })?,
+    )?;
+
+    // IsTrainerServiceSkillStep(index) (`0x4d9dd0`): 1 when the row's wire spell has a skill-step
+    // effect, nil for a header, a missing row or a spell without one.
+    g.set(
+        "IsTrainerServiceSkillStep",
+        lua.create_function(|lua, index: Value| {
+            let index =
+                binding_abi::index_arg(lua, index, "Usage: IsTrainerServiceSkillStep(index)")?;
+            let model = lua.app_data_ref::<Model>().expect("model app_data");
+            Ok(binding_abi::flag(
+                service(&model, index).is_some_and(|s| s.skill_step),
+            ))
+        })?,
+    )?;
+
+    // GetTrainerServiceStepIncrease(index) (`0x4da030`): the `INCREASE_POTENTIAL` text of a
+    // skill-step row, nil for a used row (state 2, `0x4da0eb`) and wherever the text cannot form.
+    g.set(
+        "GetTrainerServiceStepIncrease",
+        lua.create_function(|lua, index: Value| {
+            let index =
+                binding_abi::index_arg(lua, index, "Usage: GetTrainerServiceStepIncrease(index)")?;
+            let model = lua.app_data_ref::<Model>().expect("model app_data");
+            let text = service(&model, index)
+                .filter(|s| s.category != TrainerServiceCategory::Used)
+                .and_then(|s| s.step_increase.as_ref());
+            opt_str(lua, text)
+        })?,
+    )?;
+
+    // SetTrainerSkillLineFilter(index [, on, exclusive]) (`0x4da3f0`): an index below 1 shows every
+    // group; otherwise the group `index - 1` must exist, `on` must be a number, and a zero clears
+    // its bit, a nonzero `on` with a nonzero `exclusive` leaves only that bit, any other nonzero
+    // `on` adds it. The mask is committed through `0x4d8cb0`: the finalizer, then `TRAINER_UPDATE`.
+    g.set(
+        "SetTrainerSkillLineFilter",
+        lua.create_function(|lua, (index, on, exclusive): (Value, Value, Value)| {
+            let index = binding_abi::number_arg(
+                lua,
+                index,
+                r"Usage: SetTrainerSkillLineFilter(index [, on\off, exclusive])",
+            )?
+            .wrapping_sub(1);
+            let groups = {
+                let model = lua.app_data_ref::<Model>().expect("model app_data");
+                model.trainer.as_ref().map_or(0, |t| t.groups.len())
+            };
+            let mask = if index < 0 {
+                u32::MAX
+            } else {
+                if index as usize >= groups {
+                    return Err(mlua::Error::runtime(
+                        "Bad skill line in SetTrainerSkillLineFilter",
+                    ));
+                }
+                let on = binding_abi::number_arg(
+                    lua,
+                    on,
+                    "Missing on//off parameter in SetTrainerSkillLineFilter",
+                )?;
+                let current = lua
+                    .app_data_ref::<Model>()
+                    .expect("model app_data")
+                    .trainer_line_filter;
+                let bit = 1u32.wrapping_shl(index as u32);
+                if on == 0 {
+                    current & !bit
+                } else if lua
+                    .coerce_number(exclusive)?
+                    .is_some_and(|n| binding_abi::ftol(n) != 0)
+                {
+                    bit
+                } else {
+                    current | bit
+                }
+            };
+            super::tick::verb(lua, |model| {
+                model.trainer_line_filter = mask;
+                raise_trainer_update(model);
+            });
+            Ok(())
+        })?,
+    )?;
+
+    // GetTrainerSkillLineFilter(index) (`0x4da590`): 1 when the group `index - 1` is shown, nil
+    // when
+    // it is not; an index below 1 asks whether every group is. Past the group count it raises.
+    g.set(
+        "GetTrainerSkillLineFilter",
+        lua.create_function(|lua, index: Value| {
+            let index =
+                binding_abi::number_arg(lua, index, "Usage: GetTrainerSkillLineFilter(index)")?
+                    .wrapping_sub(1);
+            let model = lua.app_data_ref::<Model>().expect("model app_data");
+            let groups = model.trainer.as_ref().map_or(0, |t| t.groups.len());
+            let shown = |g: usize| model.trainer_line_filter & 1u32.wrapping_shl(g as u32) != 0;
+            if index < 0 {
+                return Ok(binding_abi::flag((0..groups).all(shown)));
+            }
+            if index as usize >= groups {
+                return Err(mlua::Error::runtime(
+                    "Bad skill line in GetTrainerSkillLineFilter",
+                ));
+            }
+            Ok(binding_abi::flag(shown(index as usize)))
+        })?,
+    )?;
+
+    // GetTrainerSkillLines() (`0x4da660`): the skill line name of each group's key, nil for a key
+    // with no `SkillLine.dbc` row (the known group's -1 too), one value per group, and the count.
+    g.set(
+        "GetTrainerSkillLines",
+        lua.create_function(|lua, ()| {
+            let model = lua.app_data_ref::<Model>().expect("model app_data");
+            let mut out = Vec::new();
+            if let Some(t) = model.trainer.as_ref() {
+                for g in &t.groups {
+                    out.push(opt_str(lua, g.line_name.as_ref())?);
+                }
+            }
+            Ok(MultiValue::from_vec(out))
+        })?,
+    )?;
+
     // Collapse/ExpandTrainerSkillLine(id): fold the group headed by row `id`, or all at 0. `id`
     // spans the whole row array like the getters' gate (`0x4d89b0`); their own bound is untraced.
     g.set(
         "CollapseTrainerSkillLine",
-        lua.create_function(|lua, id: usize| {
+        lua.create_function(|lua, id: Value| {
+            // `is-number` else `Usage: CollapseTrainerSkillLine(index)` (`0x84ad24`, `0x4da6d1`).
+            let id = binding_abi::index_arg(lua, id, "Usage: CollapseTrainerSkillLine(index)")?;
             super::tick::verb(lua, |model| {
                 set_collapsed(model, id, true);
                 raise_trainer_update(model);
@@ -695,7 +899,9 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     )?;
     g.set(
         "ExpandTrainerSkillLine",
-        lua.create_function(|lua, id: usize| {
+        lua.create_function(|lua, id: Value| {
+            // `is-number` else `Usage: ExpandTrainerSkillLine(index)` (`0x84ad78`, `0x4da751`).
+            let id = binding_abi::index_arg(lua, id, "Usage: ExpandTrainerSkillLine(index)")?;
             super::tick::verb(lua, |model| {
                 set_collapsed(model, id, false);
                 raise_trainer_update(model);
@@ -710,7 +916,9 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     // stock window's `> 1` test treats the same as 0.
     g.set(
         "SelectTrainerService",
-        lua.create_function(|lua, index: usize| {
+        lua.create_function(|lua, index: Value| {
+            // `is-number` else `Usage: SelectTrainerService(index)` (`0x84a8a8`, `0x4d8e71`).
+            let index = binding_abi::index_arg(lua, index, "Usage: SelectTrainerService(index)")?;
             let mut model = lua.app_data_mut::<Model>().expect("model app_data");
             model.trainer_selection = service(&model, index).map(|s| s.spell_id);
             Ok(())
@@ -731,7 +939,9 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     // buys every visible service for any index at or below 0 (`0x4da244`, `0x4d8a70`).
     g.set(
         "BuyTrainerService",
-        lua.create_function(|lua, index: usize| {
+        lua.create_function(|lua, index: Value| {
+            // `is-number` else `Usage: BuyTrainerService(index)` (`0x84aad0`, `0x4da221`).
+            let index = binding_abi::index_arg(lua, index, "Usage: BuyTrainerService(index)")?;
             let mut model = lua.app_data_mut::<Model>().expect("model app_data");
             let buyable = service(&model, index)
                 .filter(|s| s.category == TrainerServiceCategory::Available)

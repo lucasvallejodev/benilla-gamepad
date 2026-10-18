@@ -7,26 +7,25 @@
 //! | `AssistByName 0x489c40` | 0x10, players only | 0 | 0 |
 //! | `FollowByName 0x489ec0` | 0x10, players only | 2, `CanAssist` and alive | Lua arg 2 |
 //!
-//! Filter mode 0 underflows `0x493e40`'s jump table into accept-all: no range, facing, reaction,
-//! liveness, visibility or self test. A name matches whole-string first (`0x64a4c0` → CRT
-//! `0x414310`), else by the longest common prefix (`0x493cb6`-`0x493cf6`), both case-insensitive.
+//! The ranking is [`benilla_ui::script::by_name::resolve`], the one resolver `SetLootMethod`'s master
+//! name and `TargetByName`'s view of the pick share; this module feeds it the held units, positioned
+//! by [`GlobalTransform`] as [`crate::ui_unit`]'s candidate feed does, and breaks a full tie by
+//! guid, so the chunk shows the unit the commit picks. The reference's walk follows the object
+//! list's order (a tail append, `0x4646c3`-`0x4646d4`), the deviation documented there.
 //!
-//! Deviation: the reference ends the walk at the first whole-string hit (`0x493ca2`), so its pick
-//! follows the object list's order (a tail append, `0x4646c3`-`0x4646d4`); we rank exact, then
-//! longer prefix, then nearest ([`Rank::beats`]), because the nearest namesake is the better pick.
-//!
-//! Not built: the reference's party (`0x493b20`) and raid (`0x493b9d`) pre-scans, which select an
-//! unstreamed groupmate; [`Selection::target`] is an `Entity`.
-
-use std::cmp::Ordering;
+//! Not built for these selecting callers: the roster passes (party `0x493b20`, raid `0x493b9d`),
+//! because the selection holds an entity, not a guid, and `0x493540` stores a guid with no object
+//! (`0x493605`). `DoEmote`'s [`PlayerLookup`] needs only a guid and runs them.
 
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 
 use benilla_protocol::guid;
+use benilla_ui::script::by_name::{resolve, Filter, Held, Kinds, Match, RosterEntry, Search};
 
 use crate::names::NameCache;
 use crate::net::{Guid, GuidIndex, ObjectStore, SelfPlayer};
+use crate::query_cache::Ask;
 
 use super::{scan, Selection};
 
@@ -39,12 +38,43 @@ pub(crate) enum NameSearch {
     PlayerOnly,
 }
 
+/// What a by-name search makes of one unit, [`NameSearch::candidacy`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Candidacy<'a> {
+    /// Its guid family is outside the search's typemask.
+    Outside,
+    /// In the typemask, but its name is not cached; a sweep sends no query, so it cannot match.
+    Nameless,
+    /// A candidate under its cached name.
+    Named(&'a str),
+}
+
 impl NameSearch {
+    /// The resolver's typemask argument.
+    fn kinds(self) -> Kinds {
+        match self {
+            Self::AnyUnit => Kinds::AnyUnit,
+            Self::PlayerOnly => Kinds::PlayerOnly,
+        }
+    }
+
     fn accepts(self, guid_val: u64) -> bool {
         match self {
             Self::AnyUnit => guid::is_player(guid_val) || guid::is_creature_or_pet(guid_val),
             Self::PlayerOnly => guid::is_player(guid_val),
         }
+    }
+
+    /// Whether `guid_val` is a candidate of this search: the typemask, then a name already in the
+    /// cache. The one test both [`scan_units`] and the VM's candidate feed
+    /// (`ui_unit::held::feed_name_candidates`) apply, so the chunk's candidates are the commit's.
+    pub(crate) fn candidacy<'a>(self, names: &'a NameCache, guid_val: u64) -> Candidacy<'a> {
+        if !self.accepts(guid_val) {
+            return Candidacy::Outside;
+        }
+        names
+            .resolve_unit(guid_val, None, Ask::Read)
+            .map_or(Candidacy::Nameless, Candidacy::Named)
     }
 }
 
@@ -59,43 +89,6 @@ pub(crate) struct TargetByNameRequest {
 #[derive(bevy::ecs::message::Message, Clone, Debug)]
 pub(crate) struct AssistRequest {
     pub(crate) name: Option<String>,
-}
-
-/// How well one candidate answered the query, ordered by [`Rank::beats`].
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct Rank {
-    /// A whole-string, case-insensitive match.
-    exact: bool,
-    /// The folded common-prefix length.
-    prefix: usize,
-    /// 3D centre-to-centre squared distance from the active player.
-    dist2: f32,
-}
-
-impl Rank {
-    /// Strictly better than the incumbent: exact, then the longer prefix, then the strictly nearer.
-    /// A tie or a NaN distance keeps the incumbent, as the reference's `fcomp`/`jp` compare does.
-    fn beats(self, other: Rank) -> bool {
-        match (self.exact, other.exact) {
-            (true, false) => true,
-            (false, true) => false,
-            _ => match self.prefix.cmp(&other.prefix) {
-                Ordering::Greater => true,
-                Ordering::Less => false,
-                Ordering::Equal => self.dist2 < other.dist2,
-            },
-        }
-    }
-}
-
-/// The case-folded common-prefix length, the reference's lockstep walk (`0x493cc0`-`0x493cee`)
-/// through the ASCII fold `0x41089b`.
-fn common_prefix_len(query: &str, name: &str) -> usize {
-    query
-        .bytes()
-        .zip(name.bytes())
-        .take_while(|(q, n)| q.eq_ignore_ascii_case(n))
-        .count()
 }
 
 /// The follow start gate (`0x60fed0`'s mode-3 chain) as a pure function, its order pinned by test:
@@ -133,38 +126,6 @@ fn follow_refusal_key(
     None
 }
 
-/// Whether the prefix tier is live, the resolver's exact-only argument. The unit popup's Target and
-/// Follow pass 1 (`UnitPopup.lua:557`, `UnitPopup.lua:623`), so a menu naming its unit never lands
-/// on a bystander sharing a first letter; the slash commands pass nothing.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum Match {
-    /// A whole-string hit, else the longest common prefix.
-    PrefixOk,
-    /// Whole-string only.
-    ExactOnly,
-}
-
-/// Score one candidate against the query. The reference's best length seeds at 1, so a zero-length
-/// overlap is no match.
-fn rank(query: &str, name: &str, dist2: f32, mode: Match) -> Option<Rank> {
-    if query.eq_ignore_ascii_case(name) {
-        return Some(Rank {
-            exact: true,
-            prefix: query.len(),
-            dist2,
-        });
-    }
-    if mode == Match::ExactOnly {
-        return None;
-    }
-    let prefix = common_prefix_len(query, name);
-    (prefix >= 1).then_some(Rank {
-        exact: false,
-        prefix,
-        dist2,
-    })
-}
-
 /// Everything a by-name search reads.
 #[derive(SystemParam)]
 #[allow(clippy::type_complexity)] // one bundled param, the app's convention for big query sets
@@ -177,7 +138,7 @@ pub(crate) struct ByNameScan<'w, 's> {
         (
             Entity,
             &'static Guid,
-            &'static Transform,
+            &'static GlobalTransform,
             Option<&'static ObjectStore>,
         ),
         With<SelfPlayer>,
@@ -188,15 +149,8 @@ pub(crate) struct ByNameScan<'w, 's> {
     /// The reaction inputs behind `CanAssist`, for [`Filter::AssistableAlive`] and the follow gate.
     factions: Option<Res<'w, super::Factions>>,
     reputations: Res<'w, crate::net::Reputations>,
-}
-
-/// The per-candidate filter, the mode argument the reference hands `0x493e40`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Filter {
-    /// Mode 0, which underflows the jump table's bound into accept-all: `/target`, `/assist`.
-    AcceptAll,
-    /// Mode 2, `CanAssist` and `UNIT_FIELD_HEALTH > 0`: `/follow`.
-    AssistableAlive,
+    /// The guid to entity map, for the owner `CanAssist`'s PvP arm reads.
+    index: Res<'w, GuidIndex>,
 }
 
 impl ByNameScan<'_, '_> {
@@ -206,21 +160,22 @@ impl ByNameScan<'_, '_> {
         self.self_q
             .single()
             .ok()
-            .map(|(_, _, tf, _)| tf.translation)
+            .map(|(_, _, tf, _)| tf.translation())
     }
 
-    /// The mode-2 arm (`0x493eca`): alive, and `CanAssist 0x6066f0` as a friendly reaction (4+).
+    /// [`assistable_alive`] for a unit the scan walks.
     fn assistable_alive(&self, store: Option<&ObjectStore>) -> bool {
-        if store.is_some_and(|s| s.0.unit_is_dead()) {
-            return false;
-        }
         let self_store = self.self_q.single().ok().and_then(|(_, _, _, s)| s);
-        super::ring_reaction(
+        assistable_alive(
+            store,
             self.factions.as_deref(),
             &self.reputations,
-            store,
             self_store,
-        ) >= 4
+            |guid| {
+                let entity = self.index.0.get(&guid)?;
+                self.units.get(*entity).ok()?.3.cloned()
+            },
+        )
     }
 
     /// The follow start gate ([`follow_refusal_key`], entered at `0x60ff59`): the key of the first
@@ -257,42 +212,80 @@ impl ByNameScan<'_, '_> {
         scan_units(
             self.units
                 .iter()
-                .map(|(e, g, tf, store)| (e, g.0, tf.translation, store)),
+                .map(|(e, g, tf, store)| (e, g.0, tf.translation(), store)),
             self.origin(),
             &self.names,
             query,
             search,
+            filter,
             mode,
-            |store| filter != Filter::AssistableAlive || self.assistable_alive(store),
+            Roster::default(),
+            |store| self.assistable_alive(store),
         )
+        // With no roster every pick is a held unit.
+        .and_then(|(e, g, n)| Some((e?, g, n)))
     }
 }
 
-/// One unit query's candidates, shared by [`ByNameScan`] and [`PlayerLookup`].
+/// The mode-2 filter (`0x493eca`): `CanAssist 0x6066f0` toward the active player and
+/// `UNIT_FIELD_HEALTH > 0` (`[unit+0x110]+0x40`). `owner_store` finds an owner's descriptor, for
+/// [`super::can_assist`]'s PvP arm. The follow gate and the VM's by-name candidates share it.
+pub(crate) fn assistable_alive(
+    store: Option<&ObjectStore>,
+    factions: Option<&super::Factions>,
+    reputations: &crate::net::Reputations,
+    self_store: Option<&ObjectStore>,
+    owner_store: impl FnOnce(u64) -> Option<ObjectStore>,
+) -> bool {
+    super::can_assist(
+        store,
+        factions,
+        reputations,
+        self_store,
+        owner_store,
+        super::Assist::PlayerToUnit,
+    ) && store.is_some_and(|s| s.0.unit_health().unwrap_or(0) > 0)
+}
+
+/// One unit query's candidates, positioned by [`GlobalTransform`] as the VM's candidate feed
+/// (`ui_unit::held::feed_name_candidates`) does: nothing writes it during `Update`, so both walks
+/// read one value in a frame, and it adds no undeclared order against the systems that move units.
 type UnitQuery<'w, 's> = Query<
     'w,
     's,
     (
         Entity,
         &'static Guid,
-        &'static Transform,
+        &'static GlobalTransform,
         Option<&'static ObjectStore>,
     ),
 >;
 
+/// The roster passes' input (`0x493b22`, `0x493ba7`): the party slots and the raid members, by the
+/// name the wire gave and whether the object manager holds them. Empty for the callers that
+/// select ([`Selection::target`] is an entity); a pick from it has a guid and no entity.
+#[derive(Default)]
+pub(super) struct Roster<'a> {
+    party: Vec<RosterEntry<'a>>,
+    raid: Vec<RosterEntry<'a>>,
+}
+
 /// The resolver's walk (`0x493aa0`): a name to a unit, logging one `by-name:` line per call,
-/// ungated since it runs per command: the candidates counted, the winner and on what. `keep` is
-/// the per-candidate filter mode; `origin` is the active player's position, without which the
-/// reference resolves nothing (`0x493ae0`).
+/// ungated since it runs per command: the candidates counted, the winner and on what. `filter` is
+/// the mode argument and `assistable` its mode-2 test; `origin` is the active player's position,
+/// without which the reference resolves nothing (`0x493ae0`).
+#[allow(clippy::too_many_arguments)] // the resolver's own arguments, one call per binding
 fn scan_units<'a>(
     units: impl Iterator<Item = (Entity, u64, Vec3, Option<&'a ObjectStore>)>,
     origin: Option<Vec3>,
     names: &NameCache,
     query: &str,
     search: NameSearch,
+    filter: Filter,
     mode: Match,
-    keep: impl Fn(Option<&ObjectStore>) -> bool,
-) -> Option<(Entity, u64, String)> {
+    roster: Roster<'_>,
+    assistable: impl Fn(Option<&ObjectStore>) -> bool,
+) -> Option<(Option<Entity>, u64, String)> {
     let query = query.trim();
     if query.is_empty() {
         return None;
@@ -301,40 +294,52 @@ fn scan_units<'a>(
         info!("by-name: \"{query}\" — no active player object; nothing resolves");
         return None;
     };
-    let mut considered = 0usize;
     let mut nameless = 0usize;
-    let mut best: Option<(Entity, u64, Rank, String)> = None;
+    let mut held = Vec::new();
     for (entity, guid, pos, store) in units {
-        if !search.accepts(guid) || !keep(store) {
-            continue;
-        }
-        let Some(name) = names.peek(guid) else {
-            nameless += 1;
-            continue;
-        };
-        considered += 1;
-        let dist2 = pos.distance_squared(origin);
-        let Some(r) = rank(query, name, dist2, mode) else {
-            continue;
-        };
-        if best.as_ref().is_none_or(|(_, _, b, _)| r.beats(*b)) {
-            best = Some((entity, guid, r, name.to_string()));
+        match search.candidacy(names, guid) {
+            Candidacy::Outside => {}
+            Candidacy::Nameless => nameless += 1,
+            Candidacy::Named(name) => held.push(Held {
+                id: entity,
+                name,
+                guid,
+                dist2: pos.distance_squared(origin),
+                is_player: guid::is_player(guid),
+                assistable_alive: filter == Filter::AssistableAlive && assistable(store),
+            }),
         }
     }
+    let considered = held.len();
+    let best = resolve(
+        Search {
+            query,
+            kinds: search.kinds(),
+            filter,
+            exact: mode,
+            // The `origin` test above is `0x493ae0`.
+            active_player: true,
+        },
+        roster.party,
+        roster.raid,
+        held,
+    );
     match &best {
-        Some((_, guid, r, name)) => info!(
-            "by-name: \"{query}\" ({search:?}) -> \"{name}\" guid {guid:#x} \
+        Some(pick) => info!(
+            "by-name: \"{query}\" ({search:?}) -> \"{}\" guid {:#x} \
              ({}, prefix {}, {:.1} yd) over {considered} named candidates ({nameless} unnamed)",
-            if r.exact { "exact" } else { "prefix" },
-            r.prefix,
-            r.dist2.sqrt(),
+            pick.name,
+            pick.guid,
+            if pick.rank.exact { "exact" } else { "prefix" },
+            pick.rank.prefix,
+            pick.rank.dist2.sqrt(),
         ),
         None => info!(
             "by-name: \"{query}\" ({search:?}) -> NO MATCH over {considered} named candidates \
              ({nameless} unnamed, {mode:?}); target left untouched"
         ),
     }
-    best.map(|(e, g, _, name)| (e, g, name))
+    best.map(|p| (p.object, p.guid, p.name.to_string()))
 }
 
 /// The player-only name search for a caller that holds the [`NameCache`] mutably and so cannot
@@ -349,9 +354,38 @@ pub(crate) struct PlayerLookup<'w, 's> {
 
 impl PlayerLookup<'_, '_> {
     /// `0x493aa0` with typemask `0x10`, filter mode 0 and no exact-only flag, as `/assist <name>`
-    /// calls it: any player in the object list, whole name or longest prefix. Selects nothing.
-    pub(crate) fn find(&self, names: &NameCache, name: &str) -> Option<(Entity, u64)> {
+    /// calls it: the party slots and the raid members with no object held, then any player in the
+    /// object list, whole name or longest prefix. Selects nothing, so the pick is only a guid.
+    /// `group` and `index` are the roster and the object manager's guids, which the chat drain
+    /// holds itself.
+    pub(crate) fn find(
+        &self,
+        names: &NameCache,
+        group: &crate::ui_party::GroupState,
+        index: &GuidIndex,
+        name: &str,
+    ) -> Option<u64> {
         let origin = self.self_q.single().ok().map(|tf| tf.translation());
+        fn entry<'a>(
+            m: &'a benilla_protocol::messages::GroupMemberEntry,
+            index: &GuidIndex,
+        ) -> RosterEntry<'a> {
+            RosterEntry {
+                name: &m.name,
+                guid: m.guid,
+                held: index.0.contains_key(&m.guid),
+            }
+        }
+        let in_raid = group.group_type == crate::ui_party::GROUPTYPE_RAID;
+        let roster = Roster {
+            party: group.party_slots().map(|m| entry(m, index)).collect(),
+            raid: group
+                .members
+                .iter()
+                .filter(|_| in_raid)
+                .map(|m| entry(m, index))
+                .collect(),
+        };
         scan_units(
             self.units
                 .iter()
@@ -360,10 +394,12 @@ impl PlayerLookup<'_, '_> {
             names,
             name,
             NameSearch::PlayerOnly,
+            Filter::AcceptAll,
             Match::PrefixOk,
+            roster,
             |_| true,
         )
-        .map(|(e, g, _)| (e, g))
+        .map(|(_, g, _)| g)
     }
 }
 
@@ -484,7 +520,11 @@ pub(super) fn follow_requests(
                 tok => crate::ui_unit::player_token_guid(tok, &selection, &group),
             }
             .map(|guid| {
-                let name = scan_params.names.peek(guid).unwrap_or_default().to_string();
+                let name = scan_params
+                    .names
+                    .resolve_unit(guid, None, Ask::Read)
+                    .unwrap_or_default()
+                    .to_string();
                 (guid, name)
             }),
         };
@@ -540,6 +580,8 @@ pub(crate) struct SelectCommit<'w, 's> {
     reputations: Res<'w, crate::net::Reputations>,
     /// `assistAttack`, the assist tail's second leg.
     assist_attack: Res<'w, super::AssistAttack>,
+    /// The returns ahead of every selection `SetSelection` makes: charmed, and the cursor's bind.
+    pub(super) front: super::front::SelectFront<'w, 's>,
 }
 
 impl SelectCommit<'_, '_> {
@@ -607,8 +649,13 @@ impl SelectCommit<'_, '_> {
         }
     }
 
-    /// Select a resolved guid, `0x489a40`'s arm 1, through [`scan::commit`].
+    /// Select a resolved guid, `0x489a40`'s arm 1, through [`scan::commit`], unless
+    /// `SelectTarget`'s front returns first ([`super::front`]): with the targeting cursor up the unit
+    /// is bound to the cast and the selection stays.
     pub(super) fn commit(&mut self, entity: Entity, guid: u64) {
+        if self.front.takes(entity, guid) {
+            return;
+        }
         let me = self.me.single().ok();
         // The re-swing's gate is `StartAttack`'s on the new target (`0x5ecc16`): alive, then
         // `CanAttack`, so a body is switched to and never swung at.
@@ -634,6 +681,7 @@ impl SelectCommit<'_, '_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use benilla_ui::script::by_name::{common_prefix_len, rank, Rank};
 
     fn exact(dist2: f32) -> Rank {
         Rank {
@@ -758,5 +806,102 @@ mod tests {
         assert!(!prefix(3, 4.0).beats(prefix(3, 4.0)));
         assert!(!exact(4.0).beats(exact(4.0)));
         assert!(!prefix(3, f32::NAN).beats(prefix(3, 4.0)));
+    }
+
+    /// Mode 2 (`0x493eca`) is `CanAssist` and health above 0: a dead friend and a living enemy are
+    /// both refused, a living friend (PvP-flagged, as a creature must be for the player to assist
+    /// it, `0x6067a7`) passes.
+    #[test]
+    fn the_follow_filter_wants_an_assistable_unit_with_health() {
+        use crate::spell::targeting::corpse_fixture as fx;
+        let factions = fx::factions();
+        let reps = crate::net::Reputations::default();
+        // UNIT_FIELD_FACTIONTEMPLATE, _FLAGS (player-controlled, PvP), _HEALTH and _MAXHEALTH.
+        let unit = |template: u32, flags: u32, health: u32| {
+            ObjectStore(benilla_protocol::ObjectFields::from_pairs(&[
+                (35, template),
+                (46, flags),
+                (22, health),
+                (28, 50),
+            ]))
+        };
+        let me = unit(1, 0x8, 50);
+        let ask = |u: &ObjectStore| {
+            assistable_alive(Some(u), Some(&factions), &reps, Some(&me), |_| None)
+        };
+        assert!(ask(&unit(1, 0x1000, 50)));
+        assert!(!ask(&unit(1, 0x1000, 0)), "dead");
+        assert!(!ask(&unit(2, 0x1000, 50)), "an enemy");
+        assert!(!assistable_alive(
+            None,
+            Some(&factions),
+            &reps,
+            Some(&me),
+            |_| None
+        ));
+    }
+
+    /// `DoEmote`'s search (`0x49fde9`, typemask 0x10, mode 0) runs the roster passes: a groupmate
+    /// with no object answers to a prefix, and a streamed player nearer than the roster's
+    /// placeholder distance with an equal prefix answers instead.
+    #[test]
+    fn the_emote_search_finds_a_groupmate_with_no_object() {
+        use benilla_protocol::messages::GroupMemberEntry;
+        use bevy::ecs::system::RunSystemOnce;
+        const ME: u64 = 0x10;
+        const BOB: u64 = 0x20;
+        const BOBBY: u64 = 0x30;
+        let mut world = World::new();
+        world.init_resource::<crate::ui_party::GroupState>();
+        world.init_resource::<GuidIndex>();
+        world.spawn((
+            SelfPlayer,
+            Guid(ME),
+            GlobalTransform::from_translation(Vec3::ZERO),
+        ));
+        world
+            .resource_mut::<crate::ui_party::GroupState>()
+            .members
+            .push(GroupMemberEntry {
+                name: "Bob".into(),
+                guid: BOB,
+                status: 1,
+                flags: 0,
+            });
+        world.init_resource::<NameCache>();
+        world
+            .resource_mut::<NameCache>()
+            .insert_player(ME, "Me".into(), None);
+        let find = |world: &mut World, query: &'static str| {
+            world
+                .run_system_once(
+                    move |lookup: PlayerLookup,
+                          names: Res<NameCache>,
+                          group: Res<crate::ui_party::GroupState>,
+                          index: Res<GuidIndex>| {
+                        lookup.find(&names, &group, &index, query)
+                    },
+                )
+                .expect("the lookup runs as a one-shot system")
+        };
+        assert_eq!(find(&mut world, "Bo"), Some(BOB));
+        assert_eq!(find(&mut world, "Zed"), None);
+        // Bobby is streamed and named: nearer than the placeholder, an equal prefix.
+        let bobby = world
+            .spawn((
+                Guid(BOBBY),
+                GlobalTransform::from_translation(Vec3::new(9.0, 0.0, 0.0)),
+            ))
+            .id();
+        world.resource_mut::<GuidIndex>().0.insert(BOBBY, bobby);
+        world
+            .resource_mut::<NameCache>()
+            .insert_player(BOBBY, "Bobby".into(), None);
+        assert_eq!(find(&mut world, "Bo"), Some(BOBBY));
+        // Once Bob is streamed too, the roster leaves him to the object pass; unnamed, he is
+        // nobody's candidate.
+        let bob = world.spawn((Guid(BOB), GlobalTransform::default())).id();
+        world.resource_mut::<GuidIndex>().0.insert(BOB, bob);
+        assert_eq!(find(&mut world, "Bob"), Some(BOBBY));
     }
 }

@@ -10,8 +10,10 @@
 
 use mlua::{Lua, MultiValue, Value};
 
-use super::binding_abi::number_arg;
+use super::binding_abi::{self, number_arg};
+use super::by_name::Filter;
 use super::Model;
+use crate::strings::{fill, global, Arg};
 
 /// One party member; everything else about them is the unit snapshot under their `partyN` token.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -117,14 +119,15 @@ pub enum PartyRequest {
     UninviteUnit(String),
     /// `PromoteToPartyLeader(unit)`, by unit token.
     PromoteUnit(String),
-    /// `SetLootMethod(method[, masterName][, threshold])`; the app resolves the master looter's
-    /// name to a roster member.
+    /// `SetLootMethod(method[, masterName][, threshold])` after the binding's own checks
+    /// (`0x4e92a0`): the wire's `CMSG_LOOT_METHOD` fields (`0x5e97e0`).
     LootMethod {
-        method: String,
-        master_name: Option<String>,
-        /// The reference reads it for every method (`0x4e92a0`, presence-checked by `0x6f34d0`),
-        /// the master looter's name only for `"master"`.
-        threshold: Option<u32>,
+        /// 0 `freeforall`, 1 `roundrobin`, 2 `master`, 3 `group`, 4 `needbeforegreed`.
+        method: u32,
+        /// The master looter's guid for `master`, else 0.
+        master: u64,
+        /// The binding's threshold, 2 when it is not a number (`0x4e946d`).
+        threshold: u32,
     },
     /// `SetLootThreshold(n)`.
     LootThreshold(u32),
@@ -140,10 +143,11 @@ pub enum PartyRequest {
     /// `SwapRaidSubgroup(index, other)`: trade two raid rows' subgroups
     /// (`CMSG_GROUP_SWAP_SUB_GROUP`, two names on the wire).
     SwapSubgroup { index: u32, other: u32 },
-    /// `PromoteByName(name)` (`CMSG_GROUP_SET_LEADER`, whose guid the app resolves).
-    PromoteName(String),
-    /// `PromoteToAssistant(name)` / `DemoteAssistant(name)` (`CMSG_GROUP_ASSISTANT_LEADER`).
-    AssistantLeader { name: String, grant: bool },
+    /// `PromoteByName(name)` after the resolver (`0x48a86a`): `CMSG_GROUP_SET_LEADER` with the guid.
+    PromoteGuid(u64),
+    /// `PromoteToAssistant(name)` / `DemoteAssistant(name)` after the resolver (`0x4bbd6b`,
+    /// `0x4bbe3b`): `CMSG_GROUP_ASSISTANT_LEADER` with the guid.
+    AssistantLeader { guid: u64, grant: bool },
     /// `UninviteFromRaid(index)`: a 1-based raid row the app resolves to the name
     /// `CMSG_GROUP_UNINVITE` takes.
     UninviteRaid(u32),
@@ -159,17 +163,22 @@ impl super::UiScript {
     /// Push the roster snapshot, replacing it, and run `SMSG_GROUP_LIST`'s ready-check leg over the
     /// new roster. The app fires the `PARTY_*` events.
     pub fn set_party(&mut self, state: PartyState) {
-        self.model_mut().party = state;
         // The ready-check leg (`0x4ba5f0`, from the `0x7d` handler): a member who left drops their
         // pending flag, and nobody left pending force-closes the check.
         let lua = self.lua();
-        let mut model = self.model_mut();
-        if model.ready_check.deadline.is_some() {
-            let roster: Vec<u64> = model.party.raid.iter().map(|m| m.guid).collect();
-            model.ready_check.unanswered.retain(|g| roster.contains(g));
-            if model.ready_check.unanswered.is_empty() {
-                ready_check_force_close(lua, &mut model);
+        let close = {
+            let mut model = self.model_mut();
+            model.party = state;
+            if model.ready_check.deadline.is_some() {
+                let roster: Vec<u64> = model.party.raid.iter().map(|m| m.guid).collect();
+                model.ready_check.unanswered.retain(|g| roster.contains(g));
+                model.ready_check.unanswered.is_empty()
+            } else {
+                false
             }
+        };
+        if close {
+            ready_check_force_close(lua);
         }
     }
 
@@ -179,13 +188,17 @@ impl super::UiScript {
     pub fn ready_check_request(&mut self, we_lead: bool) {
         let lua = self.lua();
         let now = clock(lua);
-        let mut model = self.model_mut();
-        if we_lead {
-            if model.ready_check.deadline.is_some() && !ready_check_pending_online(&model) {
-                ready_check_force_close(lua, &mut model);
+        let close = {
+            let mut model = self.model_mut();
+            if we_lead {
+                model.ready_check.deadline.is_some() && !ready_check_pending_online(&model)
+            } else {
+                model.ready_check.deadline = Some(now + READY_CHECK_SECONDS);
+                false
             }
-        } else {
-            model.ready_check.deadline = Some(now + READY_CHECK_SECONDS);
+        };
+        if close {
+            ready_check_force_close(lua);
         }
     }
 
@@ -194,26 +207,36 @@ impl super::UiScript {
     /// constant 0 whatever the status byte (`0x4ba40e`); a `0` also prints `RAID_MEMBER_NOT_READY`
     /// for them (`0x4ba414`). Once no member is both pending and online the check closes at once
     /// (`0x4ba4ce`), so an offline member never holds it open but is still listed as AFK.
+    ///
+    /// The string is read through `0x703bf0` (`lua_gettable` on the globals, `0x704373`), so a
+    /// `_G` `__index` may run and call any verb: the read is made with no Model borrow held.
     pub fn ready_check_answered(&mut self, guid: u64, ready: bool) {
         let lua = self.lua();
-        let mut model = self.model_mut();
-        let Some(member) = model.party.raid.iter().find(|m| m.guid == guid) else {
-            return; // an unmatched guid writes nothing (`0x4ba491`)
+        let name = {
+            let mut model = self.model_mut();
+            let Some(member) = model.party.raid.iter().find(|m| m.guid == guid) else {
+                return; // an unmatched guid writes nothing (`0x4ba491`)
+            };
+            let name = member.name.clone();
+            model.ready_check.unanswered.retain(|g| *g != guid);
+            name
         };
-        let name = member.name.clone();
-        model.ready_check.unanswered.retain(|g| *g != guid);
         if !ready {
             let template: String = lua
                 .globals()
                 .get::<String>("RAID_MEMBER_NOT_READY")
                 .unwrap_or_default();
-            model
+            self.model_mut()
                 .ready_check
                 .lines
                 .push(template.replacen("%s", &name, 1));
         }
-        if model.ready_check.deadline.is_some() && !ready_check_pending_online(&model) {
-            ready_check_force_close(lua, &mut model);
+        let close = {
+            let model = self.model_mut();
+            model.ready_check.deadline.is_some() && !ready_check_pending_online(&model)
+        };
+        if close {
+            ready_check_force_close(lua);
         }
     }
 
@@ -221,6 +244,11 @@ impl super::UiScript {
     /// `CHAT_MSG_SYSTEM` line (`0x49a870(text, 10)`).
     pub fn take_ready_check_lines(&mut self) -> Vec<String> {
         std::mem::take(&mut self.model_mut().ready_check.lines)
+    }
+
+    /// `PromoteByName(name)` for the app's Rust slash parser: the binding's own resolve and queue.
+    pub fn promote_by_name(&mut self, name: &str) {
+        promote_by_name(&mut self.model_mut(), name);
     }
 
     /// Drain the party/loot intents queued since the last call.
@@ -231,6 +259,73 @@ impl super::UiScript {
     /// Push the saved raid-lockout list, replacing it; the app fires `UPDATE_INSTANCE_INFO`.
     pub fn set_saved_instances(&mut self, saved: Vec<SavedInstanceInfo>) {
         self.model_mut().saved_instances = saved;
+    }
+}
+
+/// `SetLootMethod`'s usage line (`0x84c42c`).
+const USAGE_SET_LOOT_METHOD: &str = "Usage: SetLootMethod(\"method\" [,master][,threshold])";
+
+/// `PromoteByName`: `0x493aa0` with typemask 0x10 and mode 2 (`0x48a86a`), then
+/// `CMSG_GROUP_SET_LEADER` (`0x78`) for the guid it returns; a zero guid sends nothing, silently
+/// (`0x48a875`). No membership test: the server judges the guid.
+fn promote_by_name(model: &mut Model, name: &str) {
+    if let Some(guid) = model.closest_player(name, Filter::AssistableAlive) {
+        model.party_requests.push(PartyRequest::PromoteGuid(guid));
+    }
+}
+
+/// `PromoteToAssistant` (`0x4bbd6b`) and `DemoteAssistant` (`0x4bbe3b`): the same resolver call,
+/// then `CMSG_GROUP_ASSISTANT_LEADER` (`0x28f`) with the guid and a byte, 1 or 0.
+fn assistant_by_name(model: &mut Model, name: &str, grant: bool) {
+    if let Some(guid) = model.closest_player(name, Filter::AssistableAlive) {
+        model
+            .party_requests
+            .push(PartyRequest::AssistantLeader { guid, grant });
+    }
+}
+
+/// Whether `guid` is ourselves or on the party slots (`0x4e7f70`), or on the raid roster
+/// (`0x4baee0`); a zero guid is neither.
+fn is_group_member(lua: &Lua, guid: u64) -> bool {
+    let model = lua.app_data_ref::<Model>().expect("model app_data");
+    let party = &model.party;
+    guid != 0
+        && (guid == party.own_guid
+            || party.members.iter().take(4).any(|m| m.guid == guid)
+            || party.raid.iter().any(|m| m.guid == guid))
+}
+
+/// The checks both loot setters open with: not in a group (the first party guid and the raid
+/// count, `0x4e92a6`, `0x4e92b8`; `0x4e9500`, `0x4e9512`) shows game error 0x48, then not the
+/// group leader (`0x4e92d4`..`0x4e92eb`; `0x4e952b`..`0x4e9542`) 0x4b. `false` once one was shown.
+fn loot_gates(lua: &Lua) -> bool {
+    let (grouped, leads) = {
+        let model = lua.app_data_ref::<Model>().expect("model app_data");
+        let party = &model.party;
+        (
+            party.members.first().is_some_and(|m| m.guid != 0) || !party.raid.is_empty(),
+            party.own_guid != 0 && party.own_guid == party.leader_guid,
+        )
+    };
+    if !grouped {
+        chat_error(lua, "ERR_NOT_IN_GROUP", &[]);
+        return false;
+    }
+    if !leads {
+        chat_error(lua, "ERR_NOT_LEADER", &[]);
+        return false;
+    }
+    true
+}
+
+/// A catalog row of kind 0, game error `key` shown through `0x496720` from inside a verb: the
+/// template from the VM's globals filled with `args`, a chat line when it is not empty.
+fn chat_error(lua: &Lua, key: &'static str, args: &[Arg<'_>]) {
+    if let Some(template) = global(lua, key) {
+        let text = fill(&template, args);
+        if !text.is_empty() {
+            super::tick::show_chat_line_into(lua, key, text);
+        }
     }
 }
 
@@ -351,13 +446,20 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         })?,
     )?;
 
-    // GetPartyMember(id) → 1 for a filled 1-based slot, else nil.
+    // GetPartyMember(id) → 1 for a filled 1-based slot, else nil. A non-number, or an index
+    // whose `id - 1` is 4 or more unsigned, raises `Usage: GetPartyMember(1-4)` (`0x84c3c4`,
+    // `0x4e90b3`, `0x4e90e4`).
     g.set(
         "GetPartyMember",
-        lua.create_function(|lua, id: i64| {
+        lua.create_function(|lua, id: Value| {
+            const USAGE: &str = "Usage: GetPartyMember(1-4)";
+            let id = binding_abi::index_arg32(lua, id, USAGE)?;
+            if id.wrapping_sub(1) >= 4 {
+                return Err(mlua::Error::runtime(USAGE));
+            }
             let model = lua.app_data_ref::<Model>().expect("model app_data");
-            let n = model.party.members.len() as i64;
-            Ok(if id >= 1 && id <= n {
+            let (id, n) = (i64::from(id), model.party.members.len() as i64);
+            Ok(if id <= n {
                 Value::Integer(1)
             } else {
                 Value::Nil
@@ -473,24 +575,83 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
             Ok(())
         })?,
     )?;
-    // SetLootMethod("method" [,master] [,threshold]), the reference's usage string (`0x84c42c`).
+    // SetLootMethod("method" [,master] [,threshold]) (`0x4e92a0`), in the binding's own order:
+    // not in a group (the first party guid and the raid count, `0x4e92a6`, `0x4e92b8`) shows game
+    // error 0x48 and returns, then not the group leader (`0x4e92d4`..`0x4e92eb`) 0x4b. Argument 1
+    // must be a number or string (`0x6f3510`) else the usage line (`0x84c42c`); it is matched
+    // without case (`0x64a4c0`, a `strnicmp`) against `freeforall`, `roundrobin`, `master`,
+    // `group` and `needbeforegreed`, else `Invalid loot method` (`0x84c418`, `0x4e94c7`). Only
+    // "master" reads a name, as argument 2 (`0x4e93e3` moves the threshold to argument 3): empty or
+    // missing shows 0xed (`0x4e9453`), one that resolves to nobody in the party, the raid or
+    // ourselves (`0x4e7f70`, `0x4baee0`) shows 0x49 with the name (`0x4e9440`); each returns without
+    // a send. The threshold is `lua_isnumber`-gated (`0x4e9472`) and `_ftol`ed, 2 on a miss.
     g.set(
         "SetLootMethod",
-        lua.create_function(
-            |lua, (method, master_name, threshold): (String, Option<String>, Option<u32>)| {
-                let mut model = lua.app_data_mut::<Model>().expect("model app_data");
-                model.party_requests.push(PartyRequest::LootMethod {
-                    method,
-                    master_name,
+        lua.create_function(|lua, args: mlua::Variadic<Value>| {
+            if !loot_gates(lua) {
+                return Ok(());
+            }
+            let arg = |i: usize| args.get(i).cloned().unwrap_or(Value::Nil);
+            let Some(method) = binding_abi::optional_string(lua, &arg(0)) else {
+                return Err(mlua::Error::runtime(USAGE_SET_LOOT_METHOD));
+            };
+            let Some(method_id) = [
+                "freeforall",
+                "roundrobin",
+                "master",
+                "group",
+                "needbeforegreed",
+            ]
+            .iter()
+            .position(|m| m.eq_ignore_ascii_case(&method)) else {
+                return Err(mlua::Error::runtime("Invalid loot method"));
+            };
+            let master = method_id == 2;
+            let mut master_guid = 0;
+            if master {
+                let name = binding_abi::optional_string(lua, &arg(1)).filter(|n| !n.is_empty());
+                let Some(name) = name else {
+                    lua.app_data_mut::<Model>()
+                        .expect("model app_data")
+                        .push_ui_error("ERR_SPECIFY_MASTER_LOOTER");
+                    return Ok(());
+                };
+                let found = {
+                    let model = lua.app_data_ref::<Model>().expect("model app_data");
+                    model.closest_player(&name, Filter::AssistableAlive)
+                };
+                // The pick must be ourselves (`0x4e7f70`, which also tests the four party slots)
+                // or in the raid (`0x4baee0`); a stranger the resolver preferred is refused with
+                // the typed name, and no next-best member is tried.
+                let Some(guid) = found.filter(|g| is_group_member(lua, *g)) else {
+                    chat_error(lua, "ERR_TARGET_NOT_IN_GROUP_S", &[Arg::S(&name)]);
+                    return Ok(());
+                };
+                master_guid = guid;
+            }
+            let threshold = binding_abi::is_number(lua, arg(if master { 2 } else { 1 }))
+                .map_or(2, |n| binding_abi::ftol(n) as u32);
+            lua.app_data_mut::<Model>()
+                .expect("model app_data")
+                .party_requests
+                .push(PartyRequest::LootMethod {
+                    method: method_id as u32,
+                    master: master_guid,
                     threshold,
                 });
-                Ok(())
-            },
-        )?,
+            Ok(())
+        })?,
     )?;
+    // SetLootThreshold(threshold) (`0x4e9500`): the same group and leader checks as SetLootMethod
+    // (game errors 0x48 and 0x4b, `0x4e9505`..`0x4e9553`) before the argument is read.
     g.set(
         "SetLootThreshold",
-        lua.create_function(|lua, n: u32| {
+        lua.create_function(|lua, n: Value| {
+            if !loot_gates(lua) {
+                return Ok(());
+            }
+            // `is-number` else `Usage: SetLooThreshold(threshold)` (`0x84c464`, `0x4e9564`).
+            let n = binding_abi::index_arg32(lua, n, "Usage: SetLooThreshold(threshold)")?;
             let mut model = lua.app_data_mut::<Model>().expect("model app_data");
             model.party_requests.push(PartyRequest::LootThreshold(n));
             Ok(())
@@ -501,7 +662,12 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     // call it bare.
     g.set(
         "SetRaidTarget",
-        lua.create_function(|lua, (unit, index): (String, u8)| {
+        lua.create_function(|lua, (unit, index): (Value, Value)| {
+            // `is-number-or-string` on arg 1, `is-number` on arg 2 else `Usage: SetRaidTarget(unit,
+            // index)` (`0x847578`, `0x4bc066`); the index is `_ftol`'s low byte (`0x4bbf23`).
+            const USAGE: &str = "Usage: SetRaidTarget(unit, index)";
+            let unit = binding_abi::string_arg(lua, unit, USAGE)?;
+            let index = binding_abi::number_arg(lua, index, USAGE)? as u8;
             let mut model = lua.app_data_mut::<Model>().expect("model app_data");
             model
                 .party_requests
@@ -510,12 +676,23 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         })?,
     )?;
 
-    // IsRaidOfficer() → always nil: its reference body (`0x4bb910`) is untraced. So the RaidFrame
-    // enables its add-member button for the leader only, where the reference also enables it for
-    // an assistant.
+    // IsRaidOfficer() → 1 or nil (`0x4bb910`): it walks the raid roster (`0xb712a8`, count
+    // `[0xb713e0]`) for the row whose guid is the local player's (`0x468550`, `edx:eax`) and pushes
+    // 1 when that row's rank (`[row+0xc]`, `GetRaidRosterInfo`'s return 2) is above 0, so for an
+    // assistant and for the leader. Outside a raid, without a player or without our row: nil. This
+    // is what lets assistants set raid target icons (`UnitPopup.lua`) and invite to the raid.
     g.set(
         "IsRaidOfficer",
-        lua.create_function(|_, ()| Ok(Value::Nil))?,
+        lua.create_function(|lua, ()| {
+            let model = lua.app_data_ref::<Model>().expect("model app_data");
+            let me = model.unit("player").map_or(0, |u| u.guid);
+            let officer = me != 0 && model.party.raid.iter().any(|m| m.guid == me && m.rank > 0);
+            Ok(if officer {
+                Value::Integer(1)
+            } else {
+                Value::Nil
+            })
+        })?,
     )?;
 
     // ── The raid-management verbs ────────────────────────────────────────────
@@ -562,8 +739,10 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     g.set(
         "PromoteByName",
         lua.create_function(|lua, name: String| {
-            let mut model = lua.app_data_mut::<Model>().expect("model app_data");
-            model.party_requests.push(PartyRequest::PromoteName(name));
+            promote_by_name(
+                &mut lua.app_data_mut::<Model>().expect("model app_data"),
+                &name,
+            );
             Ok(())
         })?,
     )?;
@@ -572,9 +751,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
             binding,
             lua.create_function(move |lua, name: String| {
                 let mut model = lua.app_data_mut::<Model>().expect("model app_data");
-                model
-                    .party_requests
-                    .push(PartyRequest::AssistantLeader { name, grant });
+                assistant_by_name(&mut model, &name, grant);
                 Ok(())
             })?,
         )?;
@@ -614,14 +791,13 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     // CheckReadyCheckTime() (`0x4bc120` → `0x4bb310`), called every frame from stock
     // `UIParent.xml`'s `OnUpdate`, alone drives the 30 s expiry. Once an armed deadline passes, and
     // only on the leader's client, it disarms and prints `RAID_MEMBERS_AFK` with the pending names
-    // joined by `", "`, or `READY_CHECK_NO_AFK`, as a `CHAT_MSG_SYSTEM` line. Both strings are read
-    // raw from `_G` with an empty default (`0x704350`), not through `GetText`; nothing is sent.
+    // joined by `", "`, or `READY_CHECK_NO_AFK`, as a `CHAT_MSG_SYSTEM` line. The strings are read
+    // raw from `_G` with an empty default (`0x704350`), not through `GetText`, with no Model
+    // borrow held (see `ready_check_tick`); nothing is sent.
     g.set(
         "CheckReadyCheckTime",
         lua.create_function(|lua, ()| {
-            let now = clock(lua);
-            let mut model = lua.app_data_mut::<Model>().expect("model app_data");
-            ready_check_tick(lua, &mut model, now);
+            ready_check_tick(lua, clock(lua));
             Ok(())
         })?,
     )?;
@@ -706,7 +882,7 @@ const READY_CHECK_SECONDS: f64 = 30.0;
 /// The ready-check state: the armed deadline (`[0xb713f4]`), the members whose pending flag
 /// (`[entry+0x158]`) is set, and summary lines not yet pushed to chat. Outside [`PartyState`]
 /// because a roster push replaces that and this survives it.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct ReadyCheckState {
     pub(crate) deadline: Option<f64>,
     pub(crate) unanswered: Vec<u64>,
@@ -718,34 +894,48 @@ fn clock(lua: &Lua) -> f64 {
     crate::script::clock::now(lua)
 }
 
-/// The timeout worker `0x4bb310`.
-fn ready_check_tick(lua: &Lua, model: &mut Model, now: f64) {
-    let Some(deadline) = model.ready_check.deadline else {
-        return;
+/// The timeout worker `0x4bb310`. Past its gates it disarms (`0x4bb377`), then reads
+/// `RAID_MEMBERS_AFK` before it walks the roster (`0x4bb372`-`0x4bb381`), and `READY_CHECK_NO_AFK`
+/// as well when the walk finds no name (`0x4bb470`-`0x4bb48e`). Each read is `0x703bf0`, a
+/// `lua_gettable` on the globals (`0x704373`) that runs an `_G` `__index`, which may call any verb;
+/// so none is made while the Model is borrowed, and an `__index` that re-enters finds the check
+/// already disarmed, as the reference's does.
+fn ready_check_tick(lua: &Lua, now: f64) {
+    let names = {
+        let mut model = lua.app_data_mut::<Model>().expect("model app_data");
+        let Some(deadline) = model.ready_check.deadline else {
+            return;
+        };
+        if now < deadline {
+            return;
+        }
+        if model.party.own_guid != model.party.leader_guid {
+            return;
+        }
+        model.ready_check.deadline = None;
+        // A pending member the roster cannot name is skipped (`0x55f080`, its query arm off).
+        let names: Vec<String> = model
+            .ready_check
+            .unanswered
+            .iter()
+            .filter_map(|g| model.party.raid.iter().find(|m| m.guid == *g))
+            .map(|m| m.name.clone())
+            .filter(|n| !n.is_empty())
+            .collect();
+        names
     };
-    if now < deadline {
-        return;
-    }
-    if model.party.own_guid != model.party.leader_guid {
-        return;
-    }
-    model.ready_check.deadline = None;
-    // A pending member the roster cannot name is skipped (`0x55f080`, its query arm off).
-    let names: Vec<&str> = model
-        .ready_check
-        .unanswered
-        .iter()
-        .filter_map(|g| model.party.raid.iter().find(|m| m.guid == *g))
-        .map(|m| m.name.as_str())
-        .filter(|n| !n.is_empty())
-        .collect();
     let raw = |key: &str| lua.globals().get::<String>(key).unwrap_or_default();
+    let template = raw("RAID_MEMBERS_AFK");
     let text = if names.is_empty() {
         raw("READY_CHECK_NO_AFK")
     } else {
-        raw("RAID_MEMBERS_AFK").replacen("%s", &names.join(", "), 1)
+        template.replacen("%s", &names.join(", "), 1)
     };
-    model.ready_check.lines.push(text);
+    lua.app_data_mut::<Model>()
+        .expect("model app_data")
+        .ready_check
+        .lines
+        .push(text);
 }
 
 /// The `0x322` handler's close test (`0x4ba498`-`0x4ba4cc`): a member holds the check open only
@@ -761,13 +951,17 @@ fn ready_check_pending_online(model: &Model) -> bool {
 
 /// The force-close sites (`0x4ba4d4`, `0x4bacb4`): an armed deadline becomes `now - 1` and the
 /// worker runs at once.
-fn ready_check_force_close(lua: &Lua, model: &mut Model) {
-    if model.ready_check.deadline.is_none() {
-        return;
-    }
-    let now = model.now;
-    model.ready_check.deadline = Some(now - 1.0);
-    ready_check_tick(lua, model, now);
+fn ready_check_force_close(lua: &Lua) {
+    let now = {
+        let mut model = lua.app_data_mut::<Model>().expect("model app_data");
+        if model.ready_check.deadline.is_none() {
+            return;
+        }
+        let now = model.now;
+        model.ready_check.deadline = Some(now - 1.0);
+        now
+    };
+    ready_check_tick(lua, now);
 }
 
 #[cfg(test)]
@@ -796,6 +990,15 @@ mod tests {
         }
     }
 
+    /// The two-member party with the player leading it.
+    fn led_party() -> PartyState {
+        PartyState {
+            leader_index: 0,
+            leader_guid: 0x5E1F,
+            ..two_member_party()
+        }
+    }
+
     #[test]
     fn read_natives_report_the_pushed_roster() {
         let mut s = UiScript::new().unwrap();
@@ -806,7 +1009,8 @@ mod tests {
         assert_eq!(s.eval::<i64>("return GetPartyMember(1)").unwrap(), 1);
         assert_eq!(s.eval::<i64>("return GetPartyMember(2)").unwrap(), 1);
         assert!(s.eval::<bool>("return GetPartyMember(3) == nil").unwrap());
-        assert!(s.eval::<bool>("return GetPartyMember(0) == nil").unwrap());
+        let e = s.run("GetPartyMember(0)").unwrap_err().to_string();
+        assert!(e.contains("Usage: GetPartyMember(1-4)"), "{e}");
         assert_eq!(s.eval::<i64>("return GetPartyLeaderIndex()").unwrap(), 1);
         assert!(s.eval::<bool>("return IsPartyLeader() == nil").unwrap());
         let (method, master) = s
@@ -1064,6 +1268,8 @@ mod tests {
     #[test]
     fn intent_natives_queue_the_exact_request_sequence() {
         let mut s = UiScript::new().unwrap();
+        hold(&mut s, "player", 0x5E1F, "Me");
+        s.set_party(led_party());
         assert!(s.take_party_requests().is_empty());
 
         s.run("AcceptGroup()").unwrap();
@@ -1087,9 +1293,9 @@ mod tests {
                 PartyRequest::UninviteUnit("party2".into()),
                 PartyRequest::PromoteUnit("party2".into()),
                 PartyRequest::LootMethod {
-                    method: "master".into(),
-                    master_name: Some("Bob".into()),
-                    threshold: None,
+                    method: 2,
+                    master: 0xB0B,
+                    threshold: 2,
                 },
                 PartyRequest::LootThreshold(3),
             ]
@@ -1097,29 +1303,389 @@ mod tests {
         assert!(s.take_party_requests().is_empty());
     }
 
+    fn loot_vm(party: PartyState) -> UiScript {
+        let mut s = UiScript::new().unwrap();
+        // The active player object, without which the resolver finds nobody (`0x493ae0`).
+        hold(&mut s, "player", party.own_guid, "Me");
+        s.set_party(party);
+        s.run(
+            r#"
+            ERR_NOT_IN_GROUP = "You aren't in a group."
+            ERR_NOT_LEADER = "You are not the group leader."
+            ERR_TARGET_NOT_IN_GROUP_S = "%s is not in your group."
+        "#,
+        )
+        .unwrap();
+        s
+    }
+
+    fn loot_request(method: u32, master: u64, threshold: u32) -> PartyRequest {
+        PartyRequest::LootMethod {
+            method,
+            master,
+            threshold,
+        }
+    }
+
     #[test]
     fn set_loot_method_without_a_master_name_queues_none() {
-        let mut s = UiScript::new().unwrap();
+        let mut s = loot_vm(led_party());
         s.run(r#"SetLootMethod("freeforall")"#).unwrap();
-        assert_eq!(
-            s.take_party_requests(),
-            vec![PartyRequest::LootMethod {
-                method: "freeforall".into(),
-                master_name: None,
-                threshold: None,
-            }]
-        );
+        assert_eq!(s.take_party_requests(), vec![loot_request(0, 0, 2)]);
+    }
 
-        // The third argument is read for every method.
-        s.run(r#"SetLootMethod("group", nil, 4)"#).unwrap();
+    /// `0x4e92a0`: every method but "master" reads its threshold as argument 2 (`0x4e9469`); "master"
+    /// reads the name as argument 2 and the threshold as argument 3 (`0x4e93e3`). The threshold is
+    /// `lua_isnumber`-gated (`0x4e9472`) and a miss is 2 (`0x4e946d`), never a raise.
+    #[test]
+    fn the_threshold_is_argument_two_unless_the_method_is_master() {
+        let mut s = loot_vm(led_party());
+        for (call, want) in [
+            (r#"SetLootMethod("group", 4)"#, loot_request(3, 0, 4)),
+            (r#"SetLootMethod("roundrobin", "5")"#, loot_request(1, 0, 5)),
+            (r#"SetLootMethod("group", 3.9)"#, loot_request(3, 0, 3)),
+            (r#"SetLootMethod("group", nil, 4)"#, loot_request(3, 0, 2)),
+            (r#"SetLootMethod("group", "x")"#, loot_request(3, 0, 2)),
+            (r#"SetLootMethod("group", {})"#, loot_request(3, 0, 2)),
+            (
+                r#"SetLootMethod("master", "Bob", 3)"#,
+                loot_request(2, 0xB0B, 3),
+            ),
+            (
+                r#"SetLootMethod("MASTER", "bob", "x")"#,
+                loot_request(2, 0xB0B, 2),
+            ),
+            (
+                r#"SetLootMethod("master", "Bob")"#,
+                loot_request(2, 0xB0B, 2),
+            ),
+            (
+                r#"SetLootMethod("needbeforegreed", 3)"#,
+                loot_request(4, 0, 3),
+            ),
+        ] {
+            s.run(call).unwrap();
+            assert_eq!(s.take_party_requests(), vec![want], "{call}");
+        }
+    }
+
+    /// The group checks come first (`0x4e92a6`..`0x4e92eb`): game errors 0x48 and 0x4b, kind 0 chat
+    /// lines, and nothing is sent or raised, whatever the arguments.
+    #[test]
+    fn set_loot_method_needs_a_group_and_its_leader_before_it_reads_anything() {
+        let mut solo = loot_vm(PartyState::default());
+        solo.run("SetLootMethod(nil)").unwrap();
+        assert!(solo.take_party_requests().is_empty());
         assert_eq!(
-            s.take_party_requests(),
-            vec![PartyRequest::LootMethod {
-                method: "group".into(),
-                master_name: None,
-                threshold: Some(4),
-            }]
+            solo.take_shown_chat_lines(),
+            vec![("ERR_NOT_IN_GROUP", "You aren't in a group.".to_string())]
         );
+        let mut member = loot_vm(two_member_party());
+        member.run(r#"SetLootMethod("bogus")"#).unwrap();
+        assert!(member.take_party_requests().is_empty());
+        assert_eq!(
+            member.take_shown_chat_lines(),
+            vec![(
+                "ERR_NOT_LEADER",
+                "You are not the group leader.".to_string()
+            )]
+        );
+    }
+
+    /// Argument 1 must be a number or string, else the usage line (`0x6f3510`, `0x84c42c`); a
+    /// string that names no method is `Invalid loot method` (`0x84c418`, `0x4e94c7`).
+    #[test]
+    fn set_loot_method_raises_its_usage_line_and_the_invalid_method() {
+        let mut s = loot_vm(led_party());
+        for call in [
+            "SetLootMethod()",
+            "SetLootMethod(nil)",
+            "SetLootMethod({})",
+            "SetLootMethod(true)",
+        ] {
+            let e = s.run(call).unwrap_err().to_string();
+            assert!(
+                e.contains(r#"Usage: SetLootMethod("method" [,master][,threshold])"#),
+                "{call}: {e}"
+            );
+        }
+        for call in [
+            r#"SetLootMethod("bogus")"#,
+            "SetLootMethod(7)",
+            r#"SetLootMethod("")"#,
+        ] {
+            let e = s.run(call).unwrap_err().to_string();
+            assert!(e.contains("Invalid loot method"), "{call}: {e}");
+        }
+        assert!(s.take_party_requests().is_empty());
+    }
+
+    /// `SetLootThreshold` (`0x4e9500`) opens with the same two checks, then wants a number
+    /// (`0x84c464`, the reference's own spelling of its name).
+    #[test]
+    fn set_loot_threshold_needs_a_group_and_its_leader_then_a_number() {
+        let mut solo = loot_vm(PartyState::default());
+        solo.run("SetLootThreshold(nil)").unwrap();
+        assert!(solo.take_party_requests().is_empty());
+        assert_eq!(
+            solo.take_shown_chat_lines(),
+            vec![("ERR_NOT_IN_GROUP", "You aren't in a group.".to_string())]
+        );
+        let mut member = loot_vm(two_member_party());
+        member.run("SetLootThreshold(3)").unwrap();
+        assert!(member.take_party_requests().is_empty());
+        assert_eq!(
+            member.take_shown_chat_lines(),
+            vec![(
+                "ERR_NOT_LEADER",
+                "You are not the group leader.".to_string()
+            )]
+        );
+        let mut leader = loot_vm(led_party());
+        let e = leader.run("SetLootThreshold('x')").unwrap_err().to_string();
+        assert!(e.contains("Usage: SetLooThreshold(threshold)"), "{e}");
+        leader.run("SetLootThreshold('4')").unwrap();
+        assert_eq!(
+            leader.take_party_requests(),
+            vec![PartyRequest::LootThreshold(4)]
+        );
+    }
+
+    /// "master" with no name shows game error 0xed (`0x4e9453`); a name nobody in the party, the
+    /// raid or ourselves answers to shows 0x49 with it (`0x4e9440`); neither sends.
+    #[test]
+    fn set_loot_method_master_needs_a_name_in_the_group() {
+        let mut s = loot_vm(led_party());
+        for call in [
+            r#"SetLootMethod("master")"#,
+            r#"SetLootMethod("master", "")"#,
+            r#"SetLootMethod("master", nil, 3)"#,
+            r#"SetLootMethod("master", {})"#,
+        ] {
+            s.run(call).unwrap();
+            assert!(s.take_party_requests().is_empty(), "{call}");
+            let errors = s.take_ui_errors();
+            assert_eq!(errors, vec!["ERR_SPECIFY_MASTER_LOOTER"], "{call}");
+        }
+        s.run(r#"SetLootMethod("master", "Nobody")"#).unwrap();
+        assert!(s.take_party_requests().is_empty());
+        assert_eq!(
+            s.take_shown_chat_lines(),
+            vec![(
+                "ERR_TARGET_NOT_IN_GROUP_S",
+                "Nobody is not in your group.".to_string()
+            )]
+        );
+        // A raid member resolves too.
+        let mut raid = led_party();
+        raid.raid = vec![crate::script::RaidMemberInfo {
+            name: "Carol".into(),
+            guid: 0xCA401,
+            ..Default::default()
+        }];
+        let mut s = loot_vm(raid);
+        s.run(r#"SetLootMethod("master", "carol")"#).unwrap();
+        assert_eq!(s.take_party_requests(), vec![loot_request(2, 0xCA401, 2)]);
+    }
+
+    /// `0x493aa0` (mode 2) resolves the master's name over the group: an exact name, else the longest
+    /// case-folded prefix shared (at least one letter), the first of equal ones in roster order.
+    #[test]
+    fn the_master_name_resolves_by_closest_match() {
+        let party = |names: &[(&str, u64)]| PartyState {
+            members: names
+                .iter()
+                .map(|(n, g)| PartyMemberInfo {
+                    name: (*n).into(),
+                    guid: *g,
+                })
+                .collect(),
+            ..led_party()
+        };
+        let resolve = |names: &[(&str, u64)], call: &str| {
+            let mut s = loot_vm(party(names));
+            s.run(call).unwrap();
+            (s.take_party_requests(), s.take_shown_chat_lines())
+        };
+        let alice_bob = [("Alice", 0xA), ("Bob", 0xB)];
+        // Exact, in any case, and partial.
+        for (call, guid) in [
+            (r#"SetLootMethod("master", "Bob")"#, 0xB),
+            (r#"SetLootMethod("master", "bOB")"#, 0xB),
+            (r#"SetLootMethod("master", "Bo")"#, 0xB),
+            (r#"SetLootMethod("master", "B")"#, 0xB),
+            (r#"SetLootMethod("master", "al")"#, 0xA),
+            (r#"SetLootMethod("master", "Alicia")"#, 0xA),
+            (r#"SetLootMethod("master", "Bxx")"#, 0xB),
+        ] {
+            let (sent, chat) = resolve(&alice_bob, call);
+            assert_eq!(sent, vec![loot_request(2, guid, 2)], "{call}");
+            assert!(chat.is_empty(), "{call}: {chat:?}");
+        }
+        // No shared first letter finds nobody: game error 0x49 with the name, nothing sent.
+        for call in [
+            r#"SetLootMethod("master", "Zed")"#,
+            r#"SetLootMethod("master", "xob")"#,
+        ] {
+            let (sent, chat) = resolve(&alice_bob, call);
+            assert!(sent.is_empty(), "{call}");
+            assert_eq!(chat.len(), 1, "{call}");
+            assert_eq!(chat[0].0, "ERR_TARGET_NOT_IN_GROUP_S");
+        }
+        // A longer prefix beats a shorter one wherever it sits; equal ones keep roster order, and
+        // an exact name later in the roster does not displace an equal-length earlier prefix
+        // (its distance is not below the best, `0x493c93`).
+        let bobs = [("Bobby", 0x1), ("Bob", 0x2), ("Bo", 0x3)];
+        for (call, guid) in [
+            (r#"SetLootMethod("master", "Bo")"#, 0x1),
+            (r#"SetLootMethod("master", "Bob")"#, 0x1),
+            (r#"SetLootMethod("master", "Bobb")"#, 0x1),
+            (r#"SetLootMethod("master", "Bobx")"#, 0x1),
+        ] {
+            let (sent, _) = resolve(&bobs, call);
+            assert_eq!(sent, vec![loot_request(2, guid, 2)], "{call}");
+        }
+        let (sent, _) = resolve(
+            &[("Bo", 0x3), ("Bobby", 0x1)],
+            r#"SetLootMethod("master", "Bob")"#,
+        );
+        assert_eq!(
+            sent,
+            vec![loot_request(2, 0x1, 2)],
+            "the longer prefix wins"
+        );
+    }
+
+    /// A held player the app's candidate feed pushes: `name` at `dist2`, `assistable_alive` as the
+    /// mode-2 filter reads it.
+    fn held_player(
+        guid: u64,
+        name: &str,
+        dist2: f32,
+        assistable_alive: bool,
+    ) -> crate::script::NameCandidate {
+        crate::script::NameCandidate {
+            name: name.into(),
+            dist2,
+            state: crate::script::UnitState {
+                exists: true,
+                has_object: true,
+                guid,
+                name: Some(name.into()),
+                is_player: true,
+                ..Default::default()
+            },
+            selectable: true,
+            assistable_alive,
+        }
+    }
+
+    /// The party token `token` has an object, so the roster passes leave it to the object pass.
+    fn hold(s: &mut UiScript, token: &str, guid: u64, name: &str) {
+        s.set_unit(
+            token,
+            Some(crate::script::UnitState {
+                exists: true,
+                has_object: true,
+                guid,
+                name: Some(name.into()),
+                ..Default::default()
+            }),
+        );
+    }
+
+    /// `0x493aa0` runs the object pass after the roster passes (`0x493c2c`), so an assistable
+    /// player in range outranks a groupmate with no object at an equal prefix (the roster's
+    /// placeholder distance is the larger, `0x4f1502f9`); the pick is then no groupmate and the
+    /// binding prints game error 0x49 with the typed name (`0x4e9440`, `esi` the argument).
+    #[test]
+    fn a_held_stranger_outranks_an_unheld_groupmate_and_is_refused() {
+        let mut s = loot_vm(led_party());
+        s.set_name_candidate(0xB0B1, Some(held_player(0xB0B1, "Bobby", 25.0, true)));
+        s.run(r#"SetLootMethod("master", "Bo")"#).unwrap();
+        assert!(s.take_party_requests().is_empty(), "Bobby is no groupmate");
+        assert_eq!(
+            s.take_shown_chat_lines(),
+            vec![(
+                "ERR_TARGET_NOT_IN_GROUP_S",
+                "Bo is not in your group.".to_string()
+            )]
+        );
+        // A longer prefix still wins at any distance: the unheld Bob answers "Bob".
+        s.run(r#"SetLootMethod("master", "Bob")"#).unwrap();
+        assert_eq!(s.take_party_requests(), vec![loot_request(2, 0xB0B, 2)]);
+        // Only the matcher's best is tried: the stranger is not skipped for the next-best member.
+        let mut s = loot_vm(led_party());
+        s.set_name_candidate(0xA1, Some(held_player(0xA1, "Alicia", 4.0, true)));
+        s.run(r#"SetLootMethod("master", "Ali")"#).unwrap();
+        assert!(s.take_party_requests().is_empty());
+        assert_eq!(s.take_shown_chat_lines().len(), 1);
+    }
+
+    /// Mode 2's filter (`0x493eca`) is `CanAssist` and health above 0: a held groupmate who fails it
+    /// is not offered by the roster passes (they skip held members, `0x493b4d`) nor by the object
+    /// pass, so nobody resolves; and a creature is outside typemask 0x10.
+    #[test]
+    fn a_held_groupmate_who_is_dead_or_unassistable_is_not_resolved() {
+        let mut s = loot_vm(led_party());
+        hold(&mut s, "party2", 0xB0B, "Bob");
+        s.set_name_candidate(0xB0B, Some(held_player(0xB0B, "Bob", 9.0, false)));
+        s.run(r#"SetLootMethod("master", "Bob")"#).unwrap();
+        assert!(s.take_party_requests().is_empty());
+        assert_eq!(s.take_shown_chat_lines().len(), 1);
+        // Alive again, the same candidate resolves.
+        s.set_name_candidate(0xB0B, Some(held_player(0xB0B, "Bob", 9.0, true)));
+        s.run(r#"SetLootMethod("master", "Bob")"#).unwrap();
+        assert_eq!(s.take_party_requests(), vec![loot_request(2, 0xB0B, 2)]);
+        // A held creature is outside the typemask, so its longer prefix does not displace the
+        // unheld groupmate Bob's.
+        let mut s = loot_vm(led_party());
+        let mut cat = held_player(0xF130_0001, "Bobcat", 1.0, true);
+        cat.state.is_player = false;
+        s.set_name_candidate(0xF130_0001, Some(cat));
+        s.run(r#"SetLootMethod("master", "Bobc")"#).unwrap();
+        assert_eq!(s.take_party_requests(), vec![loot_request(2, 0xB0B, 2)]);
+    }
+
+    /// `0x493ae0`: with no active player object the resolver finds nobody, a groupmate with no
+    /// object included, so the binding shows game error 0x49.
+    #[test]
+    fn without_the_player_object_the_master_name_finds_nobody() {
+        let mut s = UiScript::new().unwrap();
+        s.set_party(led_party());
+        s.run(r#"ERR_NOT_LEADER = "x" ERR_TARGET_NOT_IN_GROUP_S = "%s is not in your group.""#)
+            .unwrap();
+        s.run(r#"SetLootMethod("master", "Bob")"#).unwrap();
+        assert!(s.take_party_requests().is_empty());
+        assert_eq!(s.take_shown_chat_lines().len(), 1);
+    }
+
+    /// Of two held groupmates with an equal prefix the nearer wins (`0x493cfc`, strictly below the
+    /// best); the roster order decides nothing once both are held.
+    #[test]
+    fn of_two_held_groupmates_the_nearer_wins() {
+        let party = PartyState {
+            members: vec![
+                PartyMemberInfo {
+                    name: "Bob".into(),
+                    guid: 0xB1,
+                },
+                PartyMemberInfo {
+                    name: "Bobby".into(),
+                    guid: 0xB2,
+                },
+            ],
+            ..led_party()
+        };
+        for (bob, bobby, guid) in [(400.0, 16.0, 0xB2), (16.0, 400.0, 0xB1)] {
+            let mut s = loot_vm(party.clone());
+            hold(&mut s, "party1", 0xB1, "Bob");
+            hold(&mut s, "party2", 0xB2, "Bobby");
+            s.set_name_candidate(0xB1, Some(held_player(0xB1, "Bob", bob, true)));
+            s.set_name_candidate(0xB2, Some(held_player(0xB2, "Bobby", bobby, true)));
+            s.run(r#"SetLootMethod("master", "Bo")"#).unwrap();
+            assert_eq!(s.take_party_requests(), vec![loot_request(2, guid, 2)]);
+        }
     }
 
     #[test]
@@ -1142,11 +1708,31 @@ mod tests {
         );
     }
 
-    /// Nil until `0x4bb910`'s body is traced; "rank >= 1" would be a guess.
+    /// `0x4bb910`: our own roster row, rank above 0 (assistant or leader); nil otherwise.
     #[test]
-    fn is_raid_officer_is_still_nil_and_that_is_a_missing_carve_not_a_missing_feature() {
-        let s = UiScript::new().unwrap();
-        assert!(s.eval::<bool>("return IsRaidOfficer() == nil").unwrap());
+    fn is_raid_officer_reads_our_own_roster_rank() {
+        let officer = |s: &UiScript| s.eval::<Option<i64>>("return IsRaidOfficer()").unwrap();
+        let mut s = UiScript::new().unwrap();
+        assert_eq!(officer(&s), None, "ungrouped");
+        let mut raid = ten_player_raid();
+        raid.raid[0].rank = 0; // we are a plain member
+        raid.raid[1].rank = 1; // someone else assists
+        s.set_party(raid.clone());
+        assert_eq!(officer(&s), None, "no player unit yet");
+        s.set_unit("player", Some(unit(true, 0x100)));
+        assert_eq!(
+            officer(&s),
+            None,
+            "a member, another row's rank does not count"
+        );
+        raid.raid[0].rank = 1;
+        s.set_party(raid.clone());
+        assert_eq!(officer(&s), Some(1), "assistant");
+        raid.raid[0].rank = 2;
+        s.set_party(raid);
+        assert_eq!(officer(&s), Some(1), "leader");
+        s.set_unit("player", Some(unit(true, 0x999)));
+        assert_eq!(officer(&s), None, "no row of ours");
     }
 
     // ── The identity predicates ─────────────────────────────────────────────
@@ -1287,6 +1873,8 @@ mod tests {
     #[test]
     fn the_raid_verbs_queue_what_they_name() {
         let mut s = UiScript::new().unwrap();
+        hold(&mut s, "player", 0x5E1F, "Me");
+        s.set_party(two_member_party());
         s.run(
             r#"
             ConvertToRaid()
@@ -1310,13 +1898,13 @@ mod tests {
                     index: 7,
                     other: 12
                 },
-                PartyRequest::PromoteName("Alice".into()),
+                PartyRequest::PromoteGuid(0xA11CE),
                 PartyRequest::AssistantLeader {
-                    name: "Bob".into(),
+                    guid: 0xB0B,
                     grant: true
                 },
                 PartyRequest::AssistantLeader {
-                    name: "Bob".into(),
+                    guid: 0xB0B,
                     grant: false
                 },
                 PartyRequest::UninviteRaid(9),
@@ -1325,6 +1913,57 @@ mod tests {
             ]
         );
         assert!(s.take_party_requests().is_empty(), "the drain empties");
+    }
+
+    /// `PromoteByName`, `PromoteToAssistant` and `DemoteAssistant` call `0x493aa0` with typemask
+    /// 0x10 and mode 2 (`0x48a86a`, `0x4bbd6b`, `0x4bbe3b`) and send the guid it returns: a prefix
+    /// finds a groupmate with no object, a held stranger nearer than the roster's placeholder is
+    /// sent too (the server judges the guid), a held groupmate who is dead is not found, and a miss
+    /// sends nothing and prints nothing.
+    #[test]
+    fn the_leader_verbs_send_the_resolvers_guid_whoever_it_is() {
+        let calls = [
+            (r#"PromoteByName("Ali")"#, false),
+            (r#"PromoteToAssistant("Ali")"#, true),
+            (r#"DemoteAssistant("Ali")"#, false),
+        ];
+        let sent = |guid: u64, call: &str, grant: bool| {
+            if call.starts_with("Promote") && !call.contains("Assistant") {
+                PartyRequest::PromoteGuid(guid)
+            } else {
+                PartyRequest::AssistantLeader { guid, grant }
+            }
+        };
+        for (call, grant) in calls {
+            // The prefix finds Alice, who has no object.
+            let mut s = loot_vm(two_member_party());
+            s.run(call).unwrap();
+            assert_eq!(
+                s.take_party_requests(),
+                vec![sent(0xA11CE, call, grant)],
+                "{call}"
+            );
+            // A held stranger "Alina" is nearer than the placeholder and an equal prefix.
+            s.set_name_candidate(0x57, Some(held_player(0x57, "Alina", 30.0, true)));
+            s.run(call).unwrap();
+            assert_eq!(
+                s.take_party_requests(),
+                vec![sent(0x57, call, grant)],
+                "{call}"
+            );
+            // The same stranger dead is no candidate (`0x493eca`), so Alice answers again.
+            s.set_name_candidate(0x57, Some(held_player(0x57, "Alina", 30.0, false)));
+            s.run(call).unwrap();
+            assert_eq!(
+                s.take_party_requests(),
+                vec![sent(0xA11CE, call, grant)],
+                "{call}"
+            );
+            // No shared first letter: nothing is sent.
+            s.run(&call.replace("Ali", "Zed")).unwrap();
+            assert!(s.take_party_requests().is_empty(), "{call}");
+            assert!(s.take_shown_chat_lines().is_empty(), "{call}");
+        }
     }
 
     /// The reference's No button passes no argument, Yes passes `1`.
@@ -1618,5 +2257,146 @@ mod tests {
         s.set_now(130.0);
         s.run("CheckReadyCheckTime()").unwrap();
         assert_eq!(s.take_ready_check_lines(), vec![String::new()]);
+    }
+
+    /// Make the three ready-check strings come from an `_G` `__index` that touches the Model, as a
+    /// strict-mode or global-tracking addon's does (`CreateFrame` borrows it mutably), and record
+    /// each key it is asked for in `reads`, in order. The globals are cleared so every read reaches
+    /// it: the reference's lookup is `lua_gettable` on the globals (`0x704373`).
+    fn model_touching_index(s: &UiScript) {
+        s.run(
+            r#"reads = ""
+               RAID_MEMBERS_AFK = nil
+               READY_CHECK_NO_AFK = nil
+               RAID_MEMBER_NOT_READY = nil
+               local text = {
+                   RAID_MEMBER_NOT_READY = "%s is not ready",
+                   RAID_MEMBERS_AFK = "AFK: %s",
+                   READY_CHECK_NO_AFK = "No players are AFK",
+               }
+               setmetatable(getfenv(0), { __index = function(t, k)
+                   if text[k] then
+                       reads = reads .. k .. ","
+                       CreateFrame("Frame"):SetWidth(10)
+                       return text[k]
+                   end
+               end })"#,
+        )
+        .unwrap();
+    }
+
+    fn reads(s: &UiScript) -> String {
+        s.eval::<String>("return reads").unwrap()
+    }
+
+    /// `0x4ba414` reads `RAID_MEMBER_NOT_READY` through `0x703bf0`, so a `_G` `__index` runs inside
+    /// the answer. It must find the Model free.
+    #[test]
+    fn a_not_ready_answer_reads_its_string_with_the_model_free() {
+        let mut s = UiScript::new().unwrap();
+        let party = raid_we_lead(&s);
+        s.set_party(party);
+        s.set_now(100.0);
+        s.run("DoReadyCheck()").unwrap();
+        model_touching_index(&s);
+        s.ready_check_answered(0xA11CE, false);
+        assert_eq!(
+            s.take_ready_check_lines(),
+            vec!["Alice is not ready".to_string()]
+        );
+        assert_eq!(reads(&s), "RAID_MEMBER_NOT_READY,");
+        assert!(s.take_errors().is_empty());
+    }
+
+    /// The last answer force-closes (`0x4ba4ce` → `0x4bb310`): the worker reads `RAID_MEMBERS_AFK`
+    /// first, before it walks the roster (`0x4bb381`), and `READY_CHECK_NO_AFK` when it finds no
+    /// name (`0x4bb48e`), so both lookups run for an empty list.
+    #[test]
+    fn the_force_close_from_the_last_answer_reads_its_strings_with_the_model_free() {
+        let mut s = UiScript::new().unwrap();
+        let party = raid_we_lead(&s);
+        s.set_party(party);
+        s.set_now(100.0);
+        s.run("DoReadyCheck()").unwrap();
+        model_touching_index(&s);
+        s.ready_check_answered(0xA11CE, true);
+        s.ready_check_answered(0xB0B, false);
+        assert_eq!(
+            s.take_ready_check_lines(),
+            vec![
+                "Bob is not ready".to_string(),
+                "No players are AFK".to_string()
+            ]
+        );
+        assert_eq!(
+            reads(&s),
+            "RAID_MEMBER_NOT_READY,RAID_MEMBERS_AFK,READY_CHECK_NO_AFK,"
+        );
+        assert!(s.take_errors().is_empty());
+    }
+
+    /// The deadline passing reads one string when a name is pending, and an `__index` that
+    /// re-enters the tick finds the check already disarmed (`0x4bb377` precedes `0x4bb381`), so the
+    /// summary prints once.
+    #[test]
+    fn the_timeout_reads_its_string_with_the_model_free_and_already_disarmed() {
+        let mut s = UiScript::new().unwrap();
+        let party = raid_we_lead(&s);
+        s.set_party(party);
+        s.set_now(100.0);
+        s.run("DoReadyCheck()").unwrap();
+        s.ready_check_answered(0xA11CE, true);
+        model_touching_index(&s);
+        s.run(
+            r#"local inner = getmetatable(getfenv(0)).__index
+               getmetatable(getfenv(0)).__index = function(t, k)
+                   if k == "RAID_MEMBERS_AFK" then CheckReadyCheckTime() end
+                   return inner(t, k)
+               end"#,
+        )
+        .unwrap();
+        s.set_now(130.0);
+        s.run("CheckReadyCheckTime()").unwrap();
+        assert_eq!(
+            s.take_ready_check_lines(),
+            vec!["AFK: Bob".to_string()],
+            "one summary"
+        );
+        assert_eq!(reads(&s), "RAID_MEMBERS_AFK,");
+        assert!(s.take_errors().is_empty());
+    }
+
+    /// The roster push and the request echo reach the same force-close.
+    #[test]
+    fn the_force_close_from_a_roster_push_and_from_the_echo_reads_with_the_model_free() {
+        let mut s = UiScript::new().unwrap();
+        let party = raid_we_lead(&s);
+        s.set_party(party.clone());
+        s.set_now(100.0);
+        s.run("DoReadyCheck()").unwrap();
+        s.ready_check_answered(0xA11CE, true);
+        model_touching_index(&s);
+        let mut without_bob = party;
+        without_bob.raid.retain(|m| m.guid != 0xB0B);
+        without_bob.members.retain(|m| m.guid != 0xB0B);
+        s.set_party(without_bob);
+        assert_eq!(
+            s.take_ready_check_lines(),
+            vec!["No players are AFK".to_string()]
+        );
+
+        let mut s = UiScript::new().unwrap();
+        let mut party = raid_we_lead(&s);
+        party.raid.clear();
+        s.set_party(party);
+        s.set_now(100.0);
+        s.run("DoReadyCheck()").unwrap();
+        model_touching_index(&s);
+        s.ready_check_request(true);
+        assert_eq!(
+            s.take_ready_check_lines(),
+            vec!["No players are AFK".to_string()]
+        );
+        assert!(s.take_errors().is_empty());
     }
 }

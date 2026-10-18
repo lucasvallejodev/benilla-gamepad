@@ -7,8 +7,9 @@
 
 use mlua::{Lua, MultiValue, Value};
 
+use super::binding_abi;
+use super::protected::{self, Tag};
 use super::Model;
-use crate::script::binding_abi::Idx32;
 
 // The slot-word values the one-shot orders synthesize, restated from
 // `benilla_protocol::messages::pet` because this crate does not depend on the protocol.
@@ -387,7 +388,9 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     // An out-of-range index answers seven nils (`0x4bdf3e`), which the Lua reads as an empty slot.
     g.set(
         "GetPetActionInfo",
-        lua.create_function(move |lua, Idx32(i): Idx32| {
+        lua.create_function(move |lua, i: Value| {
+            // `is-number` else `Usage: GetPetActionInfo(index)` (`0x8478b8`, `0x4bdc67`).
+            let i = binding_abi::index_arg32(lua, i, "Usage: GetPetActionInfo(index)")?;
             let model = lua.app_data_ref::<Model>().expect("model app_data");
             let Some(slot) = slot_at(&model, i) else {
                 return Ok(super::binding_abi::tuple(&[None; 7]));
@@ -412,13 +415,17 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     // An elapsed or absent cooldown answers (0, 0, 1), so a re-feed never replays the sweep.
     g.set(
         "GetPetActionCooldown",
-        lua.create_function(|lua, Idx32(i): Idx32| {
+        lua.create_function(|lua, i: Value| {
+            // `is-number` else `Usage: GetPetActionCooldown(index)` (`0x8478d8`, `0x4bdfb7`).
+            let i = binding_abi::index_arg32(lua, i, "Usage: GetPetActionCooldown(index)")?;
             let now = crate::script::clock::now(lua);
             let model = lua.app_data_ref::<Model>().expect("model app_data");
             Ok(match slot_at(&model, i).and_then(|s| s.cooldown) {
-                Some((start, duration, enabled)) if start + duration > now || !enabled => {
-                    (start, duration, i32::from(enabled))
-                }
+                Some((start, duration, enabled)) if start + duration > now || !enabled => (
+                    crate::script::clock::held_start(start, enabled, now),
+                    duration,
+                    i32::from(enabled),
+                ),
                 _ => (0.0, 0.0, 1),
             })
         })?,
@@ -427,7 +434,9 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     // The one pet binding that answers a real boolean (`0x6f39f0`), `false` even out of range.
     g.set(
         "IsPetAttackActive",
-        lua.create_function(move |lua, Idx32(i): Idx32| {
+        lua.create_function(move |lua, i: Value| {
+            // `is-number` else `Usage: IsPetAttackActive(index)` (`0x8478fc`, `0x4be0f1`).
+            let i = binding_abi::index_arg32(lua, i, "Usage: IsPetAttackActive(index)")?;
             let model = lua.app_data_ref::<Model>().expect("model app_data");
             Ok(slot_at(&model, i).is_some_and(|s| s.view.attack_active))
         })?,
@@ -438,7 +447,14 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     // (`PetHandler.cpp:178`).
     g.set(
         "CastPetAction",
-        lua.create_function(|lua, i: u32| {
+        lua.create_function(|lua, i: Value| {
+            // `is-number` else `Usage: CastPetAction(index)` (`0x8479d4`, `0x4be35b`).
+            let i = binding_abi::index_arg32(lua, i, "Usage: CastPetAction(index)")?;
+            // `PressPetAction 0x4bd1d0` opens on the gate's tag 2 (`0x4bd1e5`), ahead of its bar
+            // test and every effect; a refusal is silent.
+            if !protected::gate(lua, Tag::CAST) {
+                return Ok(());
+            }
             super::tick::verb(lua, |model| {
                 let Some(packed) = slot_at(model, i)
                     .filter(|s| s.view.name.is_some())
@@ -447,7 +463,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
                     return;
                 };
                 latch_press(model, packed);
-                model.script_calls.push(super::ScriptCall::PetAction(i));
+                model.queue_call(super::ScriptCall::PetAction(i));
             });
             Ok(())
         })?,
@@ -471,6 +487,10 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
                 ));
             }
             if super::cursor::pet::clear_and_drop(lua, i).is_some() {
+                return Ok(());
+            }
+            // `TogglePetSlotAutocast 0x4bcbb0` opens on the gate's tag 2 (`0x4bcbc2`).
+            if !protected::gate(lua, Tag::CAST) {
                 return Ok(());
             }
             super::tick::verb(lua, |model| {
@@ -647,10 +667,14 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         g.set(
             name,
             lua.create_function(move |lua, ()| {
+                // Each re-enters `PressPetAction`, whose gate (tag 2) opens it.
+                if !protected::gate(lua, Tag::CAST) {
+                    return Ok(());
+                }
                 super::tick::verb(lua, |model| {
                     if model.pet_bar.has_bar {
                         latch_press(model, packed);
-                        model.script_calls.push(super::ScriptCall::PetOrder(packed));
+                        model.queue_call(super::ScriptCall::PetOrder(packed));
                     }
                 });
                 Ok(())
@@ -689,8 +713,11 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     g.set(
         "PetAbandon",
         lua.create_function(|lua, ()| {
-            let mut model = lua.app_data_mut::<Model>().expect("model app_data");
-            model.pet_abandons += 1;
+            // `SendPetAbandon 0x4bd740` opens on the gate's tag 2 (`0x4bd74b`).
+            if protected::gate(lua, Tag::CAST) {
+                let mut model = lua.app_data_mut::<Model>().expect("model app_data");
+                model.pet_abandons += 1;
+            }
             Ok(())
         })?,
     )?;
@@ -699,8 +726,11 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     g.set(
         "PetDismiss",
         lua.create_function(|lua, ()| {
-            let mut model = lua.app_data_mut::<Model>().expect("model app_data");
-            model.pet_dismisses += 1;
+            // `PressPetDismiss 0x4bd6e0` re-enters `PressPetAction`, behind its tag-2 gate.
+            if protected::gate(lua, Tag::CAST) {
+                let mut model = lua.app_data_mut::<Model>().expect("model app_data");
+                model.pet_dismisses += 1;
+            }
             Ok(())
         })?,
     )?;
@@ -1356,5 +1386,24 @@ mod tests {
         );
         assert!(s.eval::<bool>("return GetPetLoyalty() == nil").unwrap());
         assert_eq!(s.arity("GetPetFoodTypes()").unwrap(), 0);
+    }
+
+    /// A held pet action answers the call's own now, whatever was pushed (`0x6e1517`).
+    #[test]
+    fn a_held_pet_action_answers_the_polls_now() {
+        let mut s = UiScript::new().unwrap();
+        s.tick(10.0);
+        let mut v = slots();
+        v[1].cooldown = Some((0, 1, false));
+        s.set_pet_actions(true, true, true, v);
+        let poll = |s: &UiScript| {
+            s.eval::<(f64, f64, i32)>("return GetPetActionCooldown(2)")
+                .unwrap()
+        };
+        assert_eq!(poll(&s), (10.0, 0.001, 0));
+        s.tick(0.02);
+        let (start, _, _) = poll(&s);
+        assert_eq!(start, s.eval::<f64>("return GetTime()").unwrap());
+        assert!((start - 10.02).abs() < 1e-9);
     }
 }

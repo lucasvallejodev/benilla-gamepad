@@ -12,7 +12,6 @@ use mlua::{Lua, MultiValue, Value, Variadic};
 use super::binding_abi::{self, number_arg};
 use super::item_stats::item_link;
 use super::Model;
-use crate::script::binding_abi::Idx;
 
 /// One reagent a recipe consumes (`GetCraftReagentInfo`); name and icon are `None` until the item
 /// template answer lands.
@@ -75,6 +74,9 @@ pub struct CraftRecipe {
     /// `Spell.dbc` `spellLevel` (`+0x74`), the Beast Training comparator's rank key. The
     /// reference's `requiredLevel` return comes from it; here that return is 0.
     pub spell_level: u32,
+    /// The name of the recipe's group key, the skill line of the spell's ability (row `+0x04`,
+    /// `0x4f61b1`), for `GetCraftSkillLine`; `None` when `SkillLine.dbc` has no such row.
+    pub skill_line: Option<String>,
 }
 
 /// The open craft window, pushed whole by the app.
@@ -201,6 +203,25 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         })?,
     )?;
 
+    // GetCraftSkillLine(index) (`0x4f7210`): the name of the skill line in the row's group field
+    // (`+0x04`), nil for a row outside the list (`dec`, then an unsigned compare against the row
+    // count, `ds:0xbdcfc0`) or a line `SkillLine.dbc` lacks. The list here is flat: the
+    // reference's header rows are not built, so an index counts recipes alone.
+    g.set(
+        "GetCraftSkillLine",
+        lua.create_function(|lua, index: Value| {
+            let row = binding_abi::number_arg(lua, index, "Usage: GetCraftSkillLine(index)")?
+                .wrapping_sub(1) as u32;
+            let model = lua.app_data_ref::<Model>().expect("model app_data");
+            let line = model
+                .craft
+                .as_ref()
+                .and_then(|c| c.recipes.get(row as usize))
+                .and_then(|r| r.skill_line.as_ref());
+            opt_str(lua, line)
+        })?,
+    )?;
+
     // GetCraftDisplaySkillLine() → name, rank, maxRank; the name is nil when closed, which hides
     // the rank bar (`Blizzard_CraftUI.lua:108-109`).
     g.set(
@@ -282,7 +303,9 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     // `isExpanded` is always nil; Beast Training's cost and level answer 0, not built.
     g.set(
         "GetCraftInfo",
-        lua.create_function(|lua, Idx(index): Idx| {
+        lua.create_function(|lua, index: Value| {
+            // `is-number` else `Usage: GetCraftInfo(index)` (`0x84d398`, `0x4f6ea9`).
+            let index = binding_abi::index_arg(lua, index, "Usage: GetCraftInfo(index)")?;
             let model = lua.app_data_ref::<Model>().expect("model app_data");
             let Some(r) = recipe(&model, index) else {
                 // `0x4f70a4`: nil, nil, nil, 0, nil, 0, 0.
@@ -311,7 +334,10 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     // GetCraftIcon(index) → the icon path, nil while in flight or past the end.
     g.set(
         "GetCraftIcon",
-        lua.create_function(|lua, Idx(index): Idx| {
+        lua.create_function(|lua, index: Value| {
+            // `is-number` else `Usage: GetTradeSkillIcon(index)` (`0x84d3d0`, `0x4f7171`), the
+            // client's own text naming `GetTradeSkillIcon`.
+            let index = binding_abi::index_arg(lua, index, "Usage: GetTradeSkillIcon(index)")?;
             let model = lua.app_data_ref::<Model>().expect("model app_data");
             opt_str(lua, recipe(&model, index).and_then(|r| r.icon.as_ref()))
         })?,
@@ -321,7 +347,9 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     // painting (`Blizzard_CraftUI.lua:312`).
     g.set(
         "GetCraftDescription",
-        lua.create_function(|lua, Idx(index): Idx| {
+        lua.create_function(|lua, index: Value| {
+            // `is-number` else `Usage: GetCraftDescription(index)` (`0x84d500`, `0x4f7aac`).
+            let index = binding_abi::index_arg(lua, index, "Usage: GetCraftDescription(index)")?;
             let model = lua.app_data_ref::<Model>().expect("model app_data");
             opt_str(
                 lua,
@@ -333,7 +361,9 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     // GetCraftNumReagents(index) → the reagent count, 0 past the end or when closed.
     g.set(
         "GetCraftNumReagents",
-        lua.create_function(|lua, Idx(index): Idx| {
+        lua.create_function(|lua, index: Value| {
+            // `is-number` else `Usage: GetCraftNumReagents(index)` (`0x84d454`, `0x4f7435`).
+            let index = binding_abi::index_arg(lua, index, "Usage: GetCraftNumReagents(index)")?;
             let model = lua.app_data_ref::<Model>().expect("model app_data");
             Ok(recipe(&model, index).map_or(0, |r| r.reagents.len()) as i64)
         })?,
@@ -343,7 +373,19 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     // (`0x4f759b`).
     g.set(
         "GetCraftReagentInfo",
-        lua.create_function(|lua, (Idx(index), Idx(reagent_index)): (Idx, Idx)| {
+        lua.create_function(|lua, (index, reagent_index): (Value, Value)| {
+            // Both `is-number` else `Usage: GetCraftReagentInfo(index, reagentIndex)` (`0x84d478`,
+            // `0x4f76ef`).
+            let index = binding_abi::index_arg(
+                lua,
+                index,
+                "Usage: GetCraftReagentInfo(index, reagentIndex)",
+            )?;
+            let reagent_index = binding_abi::index_arg(
+                lua,
+                reagent_index,
+                "Usage: GetCraftReagentInfo(index, reagentIndex)",
+            )?;
             let model = lua.app_data_ref::<Model>().expect("model app_data");
             let Some(reagent) = recipe(&model, index)
                 .and_then(|r| reagent_index.checked_sub(1).and_then(|n| r.reagents.get(n)))
@@ -363,7 +405,9 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     // `BuildColoredListString` takes (`Blizzard_CraftUI.lua:361`); nothing when there are none.
     g.set(
         "GetCraftSpellFocus",
-        lua.create_function(|lua, index: usize| {
+        lua.create_function(|lua, index: Value| {
+            // `is-number` else `Usage: GetCraftSpellFocus(index)` (`0x84d4dc`, `0x4f78db`).
+            let index = binding_abi::index_arg(lua, index, "Usage: GetCraftSpellFocus(index)")?;
             let model = lua.app_data_ref::<Model>().expect("model app_data");
             let mut out = Vec::new();
             if let Some(r) = recipe(&model, index) {
@@ -387,7 +431,9 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     // out-of-range select clears it, and the getter answers 0 past the recipe count.
     g.set(
         "SelectCraft",
-        lua.create_function(|lua, index: u32| {
+        lua.create_function(|lua, index: Value| {
+            // `is-number` else `Usage: SelectCraft(index)` (`0x84d3b4`, `0x4f7101`).
+            let index = binding_abi::index_arg32(lua, index, "Usage: SelectCraft(index)")?;
             let mut model = lua.app_data_mut::<Model>().expect("model app_data");
             let count = num_recipes(&model) as u32;
             model.craft_selection = if index >= 1 && index <= count {
@@ -411,9 +457,17 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     // DoCraft(index): queue the row's spell id; out of range is ignored.
     g.set(
         "DoCraft",
-        lua.create_function(|lua, index: usize| {
+        lua.create_function(|lua, index: Value| {
+            // `is-number` else `Usage: DoCraft(index)` (`0x84d5c4`, `0x4f7d21`).
+            let index = binding_abi::index_arg(lua, index, "Usage: DoCraft(index)")?;
+            // The recipe's cast is `TryCastSpell` (`0x4f7d64` → `0x6e5a90`), behind the gate's
+            // tag 2 (`0x6e4bc1`).
+            let may_cast = super::protected::gate(lua, super::protected::Tag::CAST);
             let mut model = lua.app_data_mut::<Model>().expect("model app_data");
-            if let Some(spell_id) = recipe(&model, index).map(|r| r.spell_id) {
+            if let Some(spell_id) = recipe(&model, index)
+                .map(|r| r.spell_id)
+                .filter(|_| may_cast)
+            {
                 model.craft_dos.push(spell_id);
             }
             Ok(())
@@ -481,6 +535,7 @@ mod tests {
             }],
             tools: vec![("Runed Copper Rod".into(), true)],
             spell_level: 0,
+            skill_line: None,
         }
     }
 
@@ -506,6 +561,59 @@ mod tests {
                 ),
             ],
         }
+    }
+
+    /// `GetCraftSkillLine` (`0x4f7210`): the usage text for a non-number, nil for a row outside
+    /// the list or a recipe whose line has no `SkillLine.dbc` row, else the line's name; rows
+    /// count in the sorted display order.
+    #[test]
+    fn craft_skill_line_answers_the_rows_group_name() {
+        let mut s = UiScript::new().unwrap();
+        for call in [
+            "GetCraftSkillLine()",
+            "GetCraftSkillLine(nil)",
+            "GetCraftSkillLine('x')",
+            "GetCraftSkillLine({})",
+        ] {
+            let err = s.run(call).expect_err(call).to_string();
+            assert!(
+                err.contains("Usage: GetCraftSkillLine(index)"),
+                "{call}: {err}"
+            );
+        }
+        // No window: nil.
+        assert!(s
+            .eval::<bool>("return GetCraftSkillLine(1) == nil")
+            .unwrap());
+        let mut st = state();
+        for r in &mut st.recipes {
+            // The second recipe's line has no row.
+            r.skill_line = (r.spell_id == 683).then(|| "Enchanting".to_string());
+        }
+        s.set_craft(Some(st));
+        let by_row = |s: &UiScript, i: i64| -> (String, Option<String>) {
+            s.eval(&format!("return GetCraftInfo({i}), GetCraftSkillLine({i})"))
+                .unwrap()
+        };
+        // Row 1 is the Optimal recipe (683); row 2 the Trivial one, with no line row.
+        let (name, line) = by_row(&s, 1);
+        assert!(name.contains("Minor Health"), "{name}");
+        assert_eq!(line.as_deref(), Some("Enchanting"));
+        assert_eq!(by_row(&s, 2).1, None);
+        for call in [
+            "GetCraftSkillLine(0)",
+            "GetCraftSkillLine(-1)",
+            "GetCraftSkillLine(3)",
+        ] {
+            assert!(
+                s.eval::<bool>(&format!("return {call} == nil")).unwrap(),
+                "{call}"
+            );
+        }
+        assert_eq!(
+            s.eval::<String>("return GetCraftSkillLine('1')").unwrap(),
+            "Enchanting"
+        );
     }
 
     #[test]
@@ -609,6 +717,21 @@ mod tests {
         without_7418.recipes.remove(0);
         s.set_craft(Some(without_7418));
         assert_eq!(s.eval::<i64>("return GetCraftSelectionIndex()").unwrap(), 0);
+    }
+
+    /// The recipe's cast is `TryCastSpell`'s, behind the gate's tag 2 (`0x4f7d64` → `0x6e4bc1`).
+    #[test]
+    fn do_craft_casts_only_inside_an_input_event() {
+        let mut s = UiScript::new().unwrap();
+        s.set_craft(Some(state()));
+
+        s.run(r#"RunScript("DoCraft(1)")"#).unwrap();
+        assert!(
+            s.take_craft_dos().is_empty(),
+            "a macro outside an input event"
+        );
+        s.run_binding(r#"RunScript("DoCraft(1)")"#).unwrap();
+        assert_eq!(s.take_craft_dos(), vec![683], "inside a key's body");
     }
 
     #[test]
@@ -725,6 +848,7 @@ mod tests {
             reagents: vec![],
             tools: vec![],
             spell_level: level,
+            skill_line: None,
         };
         // Shuffled on purpose.
         let recipes = vec![

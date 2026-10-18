@@ -7,7 +7,8 @@
 //! into its own cell of one shared atlas, through the sheet's one orthographic camera or a pooled
 //! perspective one, and [`compose_tiles`] draws each cell as a quad at the pane's callback rank.
 //! `PlayerModel`, `DressUpModel` and `TabardModel` are booths instead (`crate::portrait`): the
-//! reference frames them through camera 1 frozen at load.
+//! reference frames them through camera 1 frozen at load. They share this module's light pool
+//! ([`PaneLights`]).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -20,9 +21,9 @@ use bevy::render::render_resource::Buffer;
 use bevy::render::renderer::{RenderDevice, RenderQueue};
 
 use benilla_assets::materials::WowModelMaterial;
-use benilla_assets::{m2_url, quantize, M2Model, WorldAssets};
+use benilla_assets::{m2_url_on, quantize, M2Model, WorldAssets, MPQ_LOOSE_SOURCE};
 use benilla_formats::{SeqLoops, UvAnim};
-use benilla_ui::script::{ModelPaneFrame, UiScript};
+use benilla_ui::script::{ModelPaneFrame, ModelWanted, UiScript};
 use benilla_ui::widget::{FrameHandle, ModelFileFacts, ModelFog, ModelLight, SequenceFacts};
 use benilla_world::doodad_anim::spawn_anim_host;
 use benilla_world::lighting::LightBlob;
@@ -42,6 +43,9 @@ use crate::portrait::{
     UI_MODEL_CAM_LAYER_BASE,
 };
 use crate::ui_pass::{UiQuad, UiQuadAppend, UiQuads, UvRect};
+
+mod pane_light;
+pub(crate) use pane_light::{PaneLights, PaneScene, CHARACTER_SCENE_SLOT};
 
 /// `WOW_TILE_TRACE=1`: a `tile-trace:` line per pane per frame from the renderer and the
 /// extract's arm, naming the gate a listed pane that draws nothing stopped at.
@@ -73,9 +77,11 @@ pub(crate) struct TileRequest {
     pub root_scale: f32,
     /// The perspective leg's root translation: `SetPosition · layoutScale`, model units.
     pub root_pos: Vec3,
-    /// The installed camera index (ctor 0, `SetCamera(n)`); `None` is the NULL camera an index
-    /// past the file's cameras installs (`0x76cec0`), the orthographic leg of every shipped pane.
-    pub camera: Option<u32>,
+    /// The installed camera ([`benilla_ui::widget::InstalledCamera`]): a raw index into the camera
+    /// table of the file it was resolved from, which a later `SetModel` keeps; `None` is the NULL
+    /// camera an index past the file's cameras installs (`0x76cec0`), the orthographic leg of
+    /// every shipped pane.
+    pub camera: Option<benilla_ui::widget::InstalledCamera>,
     /// The pane's embedded `CGLight`, disabled on a fresh `<Model>`; it adds to the file's own lights.
     pub light: ModelLight,
     pub fog: Option<ModelFog>,
@@ -115,9 +121,10 @@ pub(crate) struct UiModelTiles {
 
 /// A pane's light input: its embedded `CGLight`, its armed fog and its M2's own lights. Panes
 /// with the same scene share one light buffer and twin cache; the default, a disabled light, no
-/// fog and a file with no lights, is slot 0.
+/// fog and a file with no lights, is slot 0, and the character panes' constructor scene is slot 1
+/// ([`CHARACTER_SCENE_SLOT`]).
 #[derive(Clone, PartialEq)]
-struct TileScene {
+pub(crate) struct TileScene {
     light: ModelLight,
     fog: Option<ModelFog>,
     /// The file's authored lights: `SetModel` (`0x76cce0`) loads the M2 into the widget's own
@@ -144,6 +151,16 @@ impl TileScene {
             light: req.light,
             fog: req.fog,
             rig: scene_rig(file_lights),
+        }
+    }
+
+    /// A character pane's scene: the pane's own light and fog. The copy's own M2 lights, which
+    /// `0x707400` builds into the pane's scene, are not gathered: the display cache keeps none.
+    pub(crate) fn of_character(light: ModelLight, fog: Option<ModelFog>) -> Self {
+        Self {
+            light,
+            fog,
+            rig: SceneRig::default(),
         }
     }
 
@@ -201,6 +218,8 @@ struct TileLight {
     scene: TileScene,
     buffer: Buffer,
     variants: HashMap<AssetId<WowModelMaterial>, Handle<WowModelMaterial>>,
+    /// The epoch a tile or pane last asked for this scene ([`TileRig::epoch`]).
+    used: u64,
 }
 
 /// A point light's candidacy range, unbounded: the reference's 4-nearest gather has none.
@@ -219,13 +238,66 @@ const LIGHT_MIRROR_KEYS: [&str; UI_MODEL_CAM_LAYERS] = [
     "ui_models_7",
 ];
 
-/// The ortho tiles' layer and the light pool, where a pane that arms `SetLight(1, …)` or
-/// `SetFogColor` takes a slot. A slot costs a whole shared-light buffer, so the pool is capped
-/// and a scene past the cap draws as slot 0, the default.
+/// The ortho tiles' layer and the light pool, one slot per distinct scene drawn. The reference
+/// gives each pane its own `CGLight` (`+0x324`); here a slot is a whole shared-light buffer, so
+/// the pool is capped and a slot no pane asked for through a whole frame is reused.
 #[derive(Resource)]
 struct TileRig {
     layer: RenderLayers,
     lights: Vec<TileLight>,
+    /// Advanced once a frame ([`advance_light_epoch`]), so a slot knows when it was last asked.
+    epoch: u64,
+    /// The pool ran out once; said once.
+    warned: bool,
+}
+
+/// The slots the pool never reuses: the `<Model>` and the character ctor scenes.
+const PINNED_SLOTS: usize = 2;
+
+/// Where a scene goes in the pool.
+#[derive(Debug, PartialEq, Eq)]
+enum SlotPick {
+    /// It has a slot.
+    Held(usize),
+    /// A slot no one asked for through the last whole frame, rewritten for it.
+    Reuse(usize),
+    /// A new slot.
+    Grow,
+    /// The pool is full of scenes in use.
+    Full,
+}
+
+/// [`TileRig::slot_or`]'s choice, apart from the buffers: `slots` holds each slot's scene and the
+/// epoch it was last asked at.
+fn pick_slot<'a>(
+    slots: impl Iterator<Item = (&'a TileScene, u64)>,
+    scene: &TileScene,
+    epoch: u64,
+    cap: usize,
+) -> SlotPick {
+    let mut len = 0;
+    let mut idle = None;
+    for (i, (s, used)) in slots.enumerate() {
+        if s == scene {
+            return SlotPick::Held(i);
+        }
+        if idle.is_none() && i >= PINNED_SLOTS && used + 1 < epoch {
+            idle = Some(i);
+        }
+        len = i + 1;
+    }
+    match (len < cap, idle) {
+        (true, _) => SlotPick::Grow,
+        (false, Some(i)) => SlotPick::Reuse(i),
+        (false, None) => SlotPick::Full,
+    }
+}
+
+/// Start a new epoch of the light pool's use.
+fn advance_light_epoch(rig: Option<ResMut<TileRig>>) {
+    if let Some(mut rig) = rig {
+        rig.epoch += 1;
+    }
 }
 
 impl TileRig {
@@ -238,25 +310,62 @@ impl TileRig {
         mirrors: &mut RigPaletteMirrors,
         anim_mirrors: &mut MatAnimMirrors,
     ) -> usize {
-        if let Some(i) = self.lights.iter().position(|l| l.scene == scene) {
-            return i;
-        }
-        if self.lights.len() >= UI_MODEL_CAM_LAYERS {
-            warn!("ui_models: the light pool is full — a pane's M2 lights, SetLight and fog are not applied");
-            return 0;
-        }
-        let key = LIGHT_MIRROR_KEYS[self.lights.len()];
-        let blob = scene.blob();
-        let buffer = blob.create(device, "wow_ui_model_light");
-        blob.write(queue, &buffer);
-        mirrors.0.insert(key, buffer.clone());
-        anim_mirrors.0.insert(key, buffer.clone());
-        self.lights.push(TileLight {
-            scene,
-            buffer,
-            variants: HashMap::new(),
-        });
-        self.lights.len() - 1
+        self.slot_or(scene, 0, device, queue, mirrors, anim_mirrors)
+    }
+
+    /// The pool slot for `scene`: its own, a new one, an idle one rewritten; else `fallback`, its
+    /// kind's constructor scene, while the pool is full of scenes in use.
+    fn slot_or(
+        &mut self,
+        scene: TileScene,
+        fallback: usize,
+        device: &RenderDevice,
+        queue: &RenderQueue,
+        mirrors: &mut RigPaletteMirrors,
+        anim_mirrors: &mut MatAnimMirrors,
+    ) -> usize {
+        let epoch = self.epoch;
+        let pick = pick_slot(
+            self.lights.iter().map(|l| (&l.scene, l.used)),
+            &scene,
+            epoch,
+            UI_MODEL_CAM_LAYERS,
+        );
+        let slot = match pick {
+            SlotPick::Held(i) => i,
+            SlotPick::Reuse(i) => {
+                // Its twins bound the old scene's light; a tile on this slot rebuilds on the move.
+                let light = &mut self.lights[i];
+                scene.blob().write(queue, &light.buffer);
+                light.scene = scene;
+                light.variants.clear();
+                i
+            }
+            SlotPick::Grow => {
+                let key = LIGHT_MIRROR_KEYS[self.lights.len()];
+                let blob = scene.blob();
+                let buffer = blob.create(device, "wow_ui_model_light");
+                blob.write(queue, &buffer);
+                mirrors.0.insert(key, buffer.clone());
+                anim_mirrors.0.insert(key, buffer.clone());
+                self.lights.push(TileLight {
+                    scene,
+                    buffer,
+                    variants: HashMap::new(),
+                    used: epoch,
+                });
+                self.lights.len() - 1
+            }
+            SlotPick::Full => {
+                if !self.warned {
+                    self.warned = true;
+                    warn!("ui_models: the light pool is full — a pane draws in its kind's default light");
+                }
+                fallback
+            }
+        };
+        self.lights[slot].used = epoch;
+        slot
     }
 }
 
@@ -417,28 +526,39 @@ struct TileState {
     /// Files whose facts are derived, beside the handle that keeps each resident. It records what
     /// the host has loaded, not what a VM has been told: every new VM is still owed the facts.
     loaded: HashMap<String, (Handle<M2Model>, ModelFileFacts)>,
+    /// Each pane's camera as its last paint on the camera's own file left it ([`pane_camera_rig`]).
+    frozen: HashMap<FrameHandle, FrozenCamera>,
     frame: u64,
 }
 
+/// The asset a wanted file loads. A model frame's `SetModel` creates the model with flags 5
+/// (`0x76ccf5`), so the `.m2` and its textures open loose-flagged. The pane's own path goes through
+/// the extension rule (`0x706a50`): `.mdx` and `.mdl` become `.m2`, and a name it refuses stands the
+/// error cube (`0x70737f`). The key is only the match key and names no file.
+fn facts_url(want: &ModelWanted) -> String {
+    m2_url_on(MPQ_LOOSE_SOURCE, &want.path)
+}
+
 impl TileState {
-    /// Hand the engine the facts it asked for and return the keys still to load. Every ask is
+    /// Hand the engine the facts it asked for and return the files still to load. Every ask is
     /// answered, whichever VM asks: `model_facts_wanted` drains and only `SetModel` re-pushes, so
     /// a skipped want keeps that VM's panes on the file off [`UiScript::visible_model_panes`].
-    fn answer_facts(&mut self, script: &mut UiScript) -> Vec<String> {
+    fn answer_facts(&mut self, script: &mut UiScript) -> Vec<ModelWanted> {
         let mut to_load = Vec::new();
-        for key in script.model_facts_wanted() {
-            if let Some((_, facts)) = self.loaded.get(&key) {
+        for want in script.model_facts_wanted() {
+            let key = &want.key;
+            if let Some((_, facts)) = self.loaded.get(key) {
                 if trace_on() {
                     info!("tile-trace: facts for {key} answered from residency");
                 }
-                script.set_model_facts(&key, facts.clone());
+                script.set_model_facts(key, facts.clone());
                 continue;
             }
             // Already in flight: its landing answers whichever VM is asking by then.
-            if self.pending_facts.contains_key(&key) {
+            if self.pending_facts.contains_key(key) {
                 continue;
             }
-            to_load.push(key);
+            to_load.push(want);
         }
         to_load
     }
@@ -461,6 +581,7 @@ impl TileState {
         for (_, tile) in self.tiles.drain() {
             tile.retire(commands, table);
         }
+        self.frozen.clear();
         bridge.requests.clear();
         bridge.cells.clear();
     }
@@ -488,7 +609,14 @@ impl Plugin for UiModelsPlugin {
             )
             // The composite, in the minimap fill's lane: after packing, before the mesh rebuild.
             .add_systems(Update, compose_tiles.in_set(UiQuadAppend).after(sync_tiles))
-            .add_systems(Update, reap_tile_variants)
+            .add_systems(Update, reap_tile_variants.before(crate::portrait::PaneSync))
+            // Before every asker: the tiles and the character panes' booths.
+            .add_systems(
+                Update,
+                advance_light_epoch
+                    .before(sync_tiles)
+                    .before(crate::ui_script::UiFeed),
+            )
             .add_systems(Update, dump_atlas.after(sync_tiles));
     }
 }
@@ -505,6 +633,8 @@ fn setup_tiles(
     let mut rig = TileRig {
         layer: layer.clone(),
         lights: Vec::new(),
+        epoch: 0,
+        warned: false,
     };
     // Slot 0, the `<Model>` ctor's scene (`0x76c8e0`). A twin binds its own light buffer, whose
     // palette and mat-anim rows the tiles read, so every pool buffer joins both mirror lists.
@@ -515,6 +645,16 @@ fn setup_tiles(
         &mut mirrors,
         &mut anim_mirrors,
     );
+    // Slot 1, the character panes' ctor scene (`0x505680`), held from the start so a full pool
+    // never leaves the stock windows without their light.
+    let character = rig.slot_for(
+        TileScene::of_character(ModelLight::character(), None),
+        &device,
+        &queue,
+        &mut mirrors,
+        &mut anim_mirrors,
+    );
+    debug_assert_eq!(character, CHARACTER_SCENE_SLOT);
     let light_buf = rig.lights[0].buffer.clone();
     commands.spawn((
         Name::new("ui model tiles camera"),
@@ -716,12 +856,16 @@ fn sync_tiles(
     };
 
     // ── 1. Facts: answered now if the file is resident, else when it lands ───────────────────
-    for key in state.answer_facts(&mut script) {
+    for want in state.answer_facts(&mut script) {
         if trace_on() {
-            info!("tile-trace: facts for {key} wanted — loading the file");
+            info!(
+                "tile-trace: facts for {} wanted — loading the file",
+                want.key
+            );
         }
-        let handle = assets.asset_server.load::<M2Model>(m2_url(&key));
-        state.pending_facts.insert(key, handle);
+        let url = facts_url(&want);
+        let handle = assets.asset_server.load::<M2Model>(url);
+        state.pending_facts.insert(want.key, handle);
     }
     let landed: Vec<(String, Handle<M2Model>)> = state
         .pending_facts
@@ -950,22 +1094,7 @@ fn sync_tiles(
                 .add(new_target_image_sized(atlas_size.x, atlas_size.y));
             for (_, mut target, mut proj, mut tf) in &mut cams {
                 *target = RenderTarget::Image(image.clone().into());
-                *proj = Projection::Orthographic(OrthographicProjection {
-                    near: 0.1,
-                    far: 2000.0,
-                    scaling_mode: ScalingMode::Fixed {
-                        width: atlas_size.x as f32,
-                        height: atlas_size.y as f32,
-                    },
-                    ..OrthographicProjection::default_3d()
-                });
-                // The camera looks down `−Z` at the atlas plane, centred; a tile at world
-                // `(x, y)` lands at texel `(x, H − y)`.
-                *tf = Transform::from_xyz(
-                    atlas_size.x as f32 * 0.5,
-                    atlas_size.y as f32 * 0.5,
-                    1000.0,
-                );
+                (*tf, *proj) = ortho_camera(atlas_size.as_vec2());
             }
             bridge.atlas = Some(image);
         }
@@ -975,6 +1104,8 @@ fn sync_tiles(
     let atlas_h = atlas_size.y as f32;
 
     // ── 5. Place every drawing tile: cell, unit ladder, facing, play head ───────────────
+    // Split the borrow: a tile is written while the residency map is read.
+    let state = &mut *state;
     let mut aimed = [false; UI_MODEL_CAM_LAYERS];
     for (i, (handle, req, pane)) in drawing.iter().enumerate() {
         let Some(cell) = cells.get(i).copied() else {
@@ -998,23 +1129,35 @@ fn sync_tiles(
 
         // ── The leg ────────────────────────────────────────────────────────────────────
         // Perspective (`0x7ac640`): the file's camera frames the pane from this tile's camera,
-        // viewport the cell, and the eye and target ride the model's root (`0x718960`).
-        // Orthographic: one model unit is `1280 · modelScale · layoutScale` FrameXML units.
-        let perspective = tile.cam_slot.zip(req.camera).and_then(|(slot, idx)| {
-            let cam = assets.m2s.get(&tile.m2)?.cameras.get(idx as usize)?;
-            Some((slot, cam.clone()))
-        });
+        // viewport the cell, and the eye and target ride the model's root (`0x718960`). The
+        // camera is the one installed from its own file, frozen once the pane holds another
+        // ([`pane_camera_rig`]). Orthographic: one model unit is `1280 · modelScale ·
+        // layoutScale` FrameXML units.
+        // Camera tracks read the file's absolute timeline and the play head is a cursor in the
+        // armed band, so the band's start is added.
+        let file_ms = seq_slot
+            .and_then(|slot| assets.m2s.get(&tile.m2)?.sequences.get(slot))
+            .map_or(0, |seq| seq.start_ms)
+            + pane.play.map_or(0, |ph| ph.cursor_ms);
+        let aspect = req.size_px.x as f32 / req.size_px.y.max(1) as f32;
+        let perspective = tile
+            .cam_slot
+            .zip(req.camera.as_ref())
+            .and_then(|(slot, c)| {
+                let live = || {
+                    let (src, _) = state.loaded.get(&benilla_ui::widget::model_key(&c.file))?;
+                    let cam = assets.m2s.get(src)?.cameras.get(c.index as usize)?;
+                    Some(cam.at(file_ms))
+                };
+                let mut frozen = state.frozen.remove(handle);
+                let rig = pane_camera_rig(c, &tile.key, &mut frozen, live, req, aspect);
+                if let Some(f) = frozen {
+                    state.frozen.insert(*handle, f);
+                }
+                Some((slot, rig?))
+            });
         let mut leg_trace = String::from("ortho");
-        if let Some((slot, cam)) = perspective {
-            // Camera tracks read the file's absolute timeline and the play head is a cursor in
-            // the armed band, so the band's start is added.
-            let file_ms = seq_slot
-                .and_then(|slot| assets.m2s.get(&tile.m2)?.sequences.get(slot))
-                .map_or(0, |seq| seq.start_ms)
-                + pane.play.map_or(0, |ph| ph.cursor_ms);
-            let record = cam.at(file_ms);
-            let aspect = req.size_px.x as f32 / req.size_px.y.max(1) as f32;
-            let leg = perspective_rig(&record, req, aspect);
+        if let Some((slot, (leg, record))) = perspective {
             *tf = leg.root;
             *vis = Visibility::Visible;
             for (mut c, mut target_ref, mut proj, mut ctf, marker) in &mut pane_cams {
@@ -1061,20 +1204,17 @@ fn sync_tiles(
                 );
             }
         } else {
-            // The root: the cell's bottom-left plus `SetPosition` (layout units), in camera space.
             let cell_bl = Vec2::new(
                 cell.origin.x as f32,
                 atlas_h - (cell.origin.y + cell.size.y) as f32,
             );
-            let pos = Vec2::new(req.position.x, req.position.y) * req.pos_px_per_unit;
-            let depth = req.position.z * req.pos_px_per_unit;
-            // `T(pos) · R(facing about WoW +Z) · S(px per unit)`: the facing turns about bevy
-            // `+Y` (WoW's `+Z`), then the axis fix, then the scale.
-            *tf = Transform {
-                translation: Vec3::new(cell_bl.x + pos.x, cell_bl.y + pos.y, depth),
-                rotation: wow_to_screen() * Quat::from_rotation_y(req.facing),
-                scale: Vec3::splat(req.px_per_unit),
-            };
+            *tf = ortho_root(
+                cell_bl,
+                req.position,
+                req.pos_px_per_unit,
+                req.facing,
+                req.px_per_unit,
+            );
             *vis = Visibility::Visible;
         }
         if let Some(mut player) = player {
@@ -1252,15 +1392,50 @@ fn sync_tiles(
     );
 }
 
+/// The orthographic leg's root in camera space, pixels, `y` up: the pane's bottom-left `origin`
+/// plus `SetPosition` (layout units), then `T(pos) · R(facing about WoW +Z) · S(px per unit)`;
+/// the facing turns about bevy `+Y` (WoW's `+Z`), then the axis fix, then the scale.
+pub(crate) fn ortho_root(
+    origin: Vec2,
+    position: Vec3,
+    pos_px_per_unit: f32,
+    facing: f32,
+    px_per_unit: f32,
+) -> Transform {
+    let pos = position * pos_px_per_unit;
+    Transform {
+        translation: Vec3::new(origin.x + pos.x, origin.y + pos.y, pos.z),
+        rotation: wow_to_screen() * Quat::from_rotation_y(facing),
+        scale: Vec3::splat(px_per_unit),
+    }
+}
+
+/// The orthographic leg's camera over a `size`-pixel target, looking down `−Z` from its centre,
+/// so a root at `(x, y)` lands at texel `(x, H − y)`.
+pub(crate) fn ortho_camera(size: Vec2) -> (Transform, Projection) {
+    (
+        Transform::from_xyz(size.x * 0.5, size.y * 0.5, 1000.0),
+        Projection::Orthographic(OrthographicProjection {
+            near: 0.1,
+            far: 2000.0,
+            scaling_mode: ScalingMode::Fixed {
+                width: size.x,
+                height: size.y,
+            },
+            ..OrthographicProjection::default_3d()
+        }),
+    )
+}
+
 /// The perspective leg's rig, pure so the reference's worked numbers test without a world.
-struct PerspectiveRig {
+pub(crate) struct PerspectiveRig {
     /// The model's root, `T(pos · layoutScale) · R(facing, +Z) · S(s)` in Bevy model space:
     /// `0x76d1a0`'s `model+0xbc` without the orthographic leg's pixel ladder.
-    root: Transform,
+    pub(crate) root: Transform,
     /// The camera, `lookAt(eye, target, up)`, with the eye as the view origin.
-    camera: Transform,
+    pub(crate) camera: Transform,
     /// The record's projection at the pane's own width/height.
-    projection: WowPortraitProjection,
+    pub(crate) projection: WowPortraitProjection,
 }
 
 /// Build the rig. The authored eye and target ride the root transform (`0x718960` publishes
@@ -1279,11 +1454,75 @@ fn perspective_rig(
     req: &TileRequest,
     aspect: f32,
 ) -> PerspectiveRig {
-    let root = Transform {
-        translation: benilla_assets::coords::wow_to_bevy(req.root_pos.to_array()),
-        rotation: Quat::from_rotation_y(req.facing),
-        scale: Vec3::splat(req.root_scale),
-    };
+    live_camera_rig(
+        record,
+        perspective_root(req.root_pos, req.facing, req.root_scale),
+        aspect,
+    )
+}
+
+/// A pane's camera as its last paint on the camera's own file published it: `CM2Model::
+/// UpdateAfterAnimate` (`0x718960`) writes the eye, target and roll into the camera each paint
+/// (`0x718bc7`, `0x718c21`, `0x718c35`), and once `SetModel` releases that model nothing
+/// republishes them (`modelview#stale-camera-after-setmodel`).
+#[derive(Clone)]
+struct FrozenCamera {
+    camera: benilla_ui::widget::InstalledCamera,
+    /// The view as that paint left it, eye and target on the old model's root.
+    view: Transform,
+    /// The record the projection comes from.
+    record: benilla_assets::PortraitCamera,
+}
+
+/// The perspective rig of `chosen` on this paint, with the record its projection came from. On
+/// the camera's own file (`tile_key`) it is live, `live` evaluating the record, and the paint is
+/// kept in `frozen`; on another file the pane draws the frozen camera until the next `SetCamera`.
+/// A camera never painted on its own file published nothing, so it is evaluated live there too.
+fn pane_camera_rig(
+    chosen: &benilla_ui::widget::InstalledCamera,
+    tile_key: &str,
+    frozen: &mut Option<FrozenCamera>,
+    live: impl FnOnce() -> Option<benilla_assets::PortraitCamera>,
+    req: &TileRequest,
+    aspect: f32,
+) -> Option<(PerspectiveRig, benilla_assets::PortraitCamera)> {
+    let own_file = benilla_ui::widget::model_key(&chosen.file) == tile_key;
+    if let Some(f) = frozen.as_ref().filter(|f| !own_file && f.camera == *chosen) {
+        let rig = PerspectiveRig {
+            root: perspective_root(req.root_pos, req.facing, req.root_scale),
+            camera: f.view,
+            projection: pane_projection(&f.record, aspect),
+        };
+        return Some((rig, f.record));
+    }
+    let record = live()?;
+    let rig = perspective_rig(&record, req, aspect);
+    if own_file {
+        *frozen = Some(FrozenCamera {
+            camera: chosen.clone(),
+            view: rig.camera,
+            record,
+        });
+    }
+    Some((rig, record))
+}
+
+/// The perspective leg's root, `T(root_pos) · R(facing about WoW +Z) · S(root_scale)`, with
+/// `root_pos` in WoW model units.
+pub(crate) fn perspective_root(root_pos: Vec3, facing: f32, root_scale: f32) -> Transform {
+    Transform {
+        translation: benilla_assets::coords::wow_to_bevy(root_pos.to_array()),
+        rotation: Quat::from_rotation_y(facing),
+        scale: Vec3::splat(root_scale),
+    }
+}
+
+/// [`perspective_rig`] on any root: a live camera, whose eye and target ride `root`.
+pub(crate) fn live_camera_rig(
+    record: &benilla_assets::PortraitCamera,
+    root: Transform,
+    aspect: f32,
+) -> PerspectiveRig {
     let m = root.to_matrix();
     let (eye, target) = (
         m.transform_point3(record.eye),
@@ -1813,6 +2052,44 @@ mod tests {
     }
 
     /// A file with no lights of its own is the default scene, so the pool keeps sharing slot 0.
+    /// A scene keeps its slot while asked for; a slot no one asked for through the last whole
+    /// frame is reused, so the pool never falls back for good, and the two ctor scenes stay.
+    #[test]
+    fn an_idle_light_slot_is_reused_and_the_ctor_scenes_stay() {
+        let lit = |r: f32| {
+            scene(
+                ModelLight {
+                    enabled: true,
+                    omni: false,
+                    ambient: [r; 3],
+                    diffuse: [r; 3],
+                    vector: [0.0, 0.0, -1.0],
+                },
+                SceneRig::default(),
+            )
+        };
+        let pool: Vec<(TileScene, u64)> = (0..4).map(|i| (lit(i as f32), 9)).collect();
+        let pick = |pool: &[(TileScene, u64)], s: &TileScene, epoch, cap| {
+            pick_slot(pool.iter().map(|(s, e)| (s, *e)), s, epoch, cap)
+        };
+        assert_eq!(pick(&pool, &lit(2.0), 10, 4), SlotPick::Held(2));
+        assert_eq!(
+            pick(&pool, &lit(7.0), 10, 8),
+            SlotPick::Grow,
+            "room to grow"
+        );
+        assert_eq!(
+            pick(&pool, &lit(7.0), 10, 4),
+            SlotPick::Full,
+            "every slot asked for last frame"
+        );
+        assert_eq!(
+            pick(&pool, &lit(7.0), 11, 4),
+            SlotPick::Reuse(2),
+            "idle a whole frame: the first past the pinned two"
+        );
+    }
+
     #[test]
     fn a_file_without_lights_is_the_default_scene() {
         assert!(scene(ModelLight::default(), scene_rig(&[])) == TileScene::default_scene());
@@ -2024,7 +2301,14 @@ mod tests {
             first.visible_model_panes().is_empty(),
             "no facts yet ⇒ the pane is not on the paint list (the reference's draw gate)"
         );
-        assert_eq!(state.answer_facts(&mut first), vec![key.clone()]);
+        let wanted = state.answer_facts(&mut first);
+        assert_eq!(
+            wanted,
+            vec![ModelWanted {
+                key: key.clone(),
+                path: COOLDOWN_FILE.into()
+            }]
+        );
         // …the asset lands: the facts are handed over and cached beside the handle.
         state
             .loaded
@@ -2151,6 +2435,62 @@ mod tests {
         );
     }
 
+    /// After `SetModel` the pane draws through the old file's camera frozen at its last paint
+    /// (`0x718960` publishes eye and target each paint; the released model publishes no more),
+    /// whatever the new file's timeline does, until a `SetCamera` installs on the new file.
+    #[test]
+    fn an_in_world_pane_after_a_swap_draws_the_frozen_old_camera() {
+        use benilla_ui::widget::InstalledCamera;
+        let rec = |x: f32| benilla_assets::PortraitCamera {
+            eye: Vec3::new(x, 1.0, 2.0),
+            target: Vec3::ZERO,
+            roll: 0.0,
+            fov: 0.7,
+            near: 0.1,
+            far: 50.0,
+        };
+        let on = |file: &str, index| InstalledCamera {
+            file: file.into(),
+            index,
+        };
+        let req = persp_req(UVec2::new(100, 100), 1.0, Vec3::ZERO, 0.0);
+        let eye = |rig: Option<(PerspectiveRig, benilla_assets::PortraitCamera)>| {
+            rig.map(|(r, _)| r.camera.translation)
+        };
+        let mut frozen = None;
+        // On a's own tile: live, and kept.
+        let last = eye(pane_camera_rig(
+            &on("a.mdx", 1),
+            "a.m2",
+            &mut frozen,
+            || Some(rec(3.0)),
+            &req,
+            1.0,
+        ));
+        assert!(last.is_some());
+        // b's tile, same camera: the frozen view, though a live evaluation would move it.
+        let swapped = pane_camera_rig(
+            &on("a.mdx", 1),
+            "b.m2",
+            &mut frozen,
+            || Some(rec(9.0)),
+            &req,
+            1.0,
+        );
+        assert_eq!(eye(swapped), last);
+        // `SetCamera` on b: live on b again.
+        let b = eye(pane_camera_rig(
+            &on("b.mdx", 0),
+            "b.m2",
+            &mut frozen,
+            || Some(rec(9.0)),
+            &req,
+            1.0,
+        ));
+        assert_ne!(b, last);
+        assert!(frozen.is_some_and(|f| f.camera == on("b.mdx", 0)));
+    }
+
     /// A perspective-leg `TileRequest` with only the terms the leg reads.
     fn persp_req(size: UVec2, root_scale: f32, root_pos: Vec3, facing: f32) -> TileRequest {
         TileRequest {
@@ -2163,7 +2503,10 @@ mod tests {
             position: Vec3::ZERO,
             root_scale,
             root_pos,
-            camera: Some(0),
+            camera: Some(benilla_ui::widget::InstalledCamera {
+                file: String::new(),
+                index: 0,
+            }),
             light: ModelLight::default(),
             fog: None,
             icon: None,
@@ -2362,5 +2705,76 @@ mod tests {
             * Quat::from_rotation_y(std::f32::consts::FRAC_PI_2)
             * benilla_assets::coords::wow_to_bevy([1.0, 0.0, 0.0]);
         assert!((turned - Vec3::Y).length() < 1e-5, "{turned}");
+    }
+    /// The host opens a pane's own path through the extension rule, never its match key: the
+    /// `.mdx`, `.mdl` and `.m2` spellings load one file, and a name the rule refuses stands the
+    /// error cube (#1873) whatever else shares its key.
+    #[test]
+    fn a_wanted_model_loads_through_the_extension_rule_not_the_key() {
+        let want = |path: &str| ModelWanted {
+            key: benilla_ui::widget::model_key(path),
+            path: path.into(),
+        };
+        let arrow = "mpq-loose://interface/minimap/minimaparrow.m2";
+        for path in [
+            r"Interface\Minimap\MinimapArrow.mdx",
+            r"Interface\Minimap\MinimapArrow.MDL",
+            r"Interface\Minimap\MinimapArrow.m2",
+        ] {
+            assert_eq!(facts_url(&want(path)), arrow, "{path}");
+        }
+        let cube = "mpq://spells/errorcube.m2";
+        for path in [r"Creature\Wolf\Wolf", "Foo.blp"] {
+            assert_eq!(facts_url(&want(path)), cube, "{path}");
+            assert_eq!(
+                want(path).key,
+                benilla_ui::widget::model_key(benilla_assets::ERROR_CUBE),
+                "a refused name keys as the cube it stands: {path}"
+            );
+        }
+        assert_ne!(
+            want(r"Creature\Wolf\Wolf").key,
+            want(r"Creature\Wolf\Wolf.mdx").key,
+            "a refused name never shares a key with its valid twin"
+        );
+    }
+
+    /// A pane's `SetModel` queues its own spelling beside the key, and the minimap's nine engine
+    /// children queue their stock models, each of which loads its `.m2`.
+    #[test]
+    fn the_queue_carries_the_original_path_and_the_minimap_children_load_their_models() {
+        let mut s = UiScript::new().unwrap();
+        s.set_screen_size(800.0, 600.0);
+        s.run(
+            r#"m = CreateFrame("Model", "Pane", UIParent)
+               m:SetModel("Interface\\Minimap\\MinimapArrow.mdx")
+               mm = CreateFrame("Minimap", "Mini")"#,
+        )
+        .unwrap();
+        s.resolve();
+        s.tick(0.0);
+        let mut state = TileState::default();
+        let wanted = state.answer_facts(&mut s);
+        let urls: Vec<(String, String)> = wanted
+            .iter()
+            .map(|w| (w.path.clone(), facts_url(w)))
+            .collect();
+        assert!(
+            urls.contains(&(
+                r"Interface\Minimap\MinimapArrow.mdx".to_string(),
+                "mpq-loose://interface/minimap/minimaparrow.m2".to_string()
+            )),
+            "{urls:?}"
+        );
+        assert!(
+            urls.contains(&(
+                r"Interface\Minimap\Rotating-MinimapArrow.mdx".to_string(),
+                "mpq-loose://interface/minimap/rotating-minimaparrow.m2".to_string()
+            )),
+            "{urls:?}"
+        );
+        assert!(urls
+            .iter()
+            .all(|(_, u)| u.ends_with(".m2") && !u.contains("errorcube")));
     }
 }
