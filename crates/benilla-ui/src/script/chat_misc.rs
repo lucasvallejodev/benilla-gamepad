@@ -103,11 +103,13 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
                 return Ok(());
             };
             let may_cast = super::protected::select_may_cast(lua);
-            let mut model = lua.app_data_mut::<Model>().expect("model app_data");
-            model.queue_call(super::ScriptCall::Select {
-                request: super::SelectionRequest::AssistByName(name),
-                may_cast,
-            });
+            super::calls::submit(
+                lua,
+                super::ScriptCall::Select {
+                    request: super::SelectionRequest::AssistByName(name),
+                    may_cast,
+                },
+            )?;
             Ok(())
         })?,
     )?;
@@ -213,6 +215,7 @@ mod tests {
     #[test]
     fn assist_and_uninvite_by_name_queue_their_names() {
         let mut s = UiScript::new().unwrap();
+        s.keep_calls();
         s.run("AssistByName('Alice') AssistByName('') UninviteByName('Carol') UninviteByName()")
             .unwrap();
         assert_eq!(
@@ -247,5 +250,18 @@ mod tests {
         assert_eq!(s.eval::<i64>("return LoggingChat(true)").unwrap(), 1);
         assert_eq!(s.arity("LoggingChat(nil)").unwrap(), 1);
         assert!(s.eval::<bool>("return LoggingChat(nil) == nil").unwrap());
+    }
+
+    /// `AssistByName` (`0x489c40`) selects inside its call with a host lent.
+    #[test]
+    fn assist_by_name_applies_in_the_call_with_a_host_lent() {
+        let mut s = UiScript::new().unwrap();
+        assert_eq!(
+            crate::script::host::test_support::applied_in_call(&mut s, "AssistByName('Alice')"),
+            vec![crate::script::ScriptCall::Select {
+                request: SelectionRequest::AssistByName("Alice".into()),
+                may_cast: true,
+            }]
+        );
     }
 }

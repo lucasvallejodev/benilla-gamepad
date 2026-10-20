@@ -114,6 +114,9 @@ impl HandlerArg {
 pub(crate) struct Model {
     /// Which FrameScript state this VM is: it picks the event table and the frame types.
     pub(crate) vm: super::glue::VmKind,
+    /// [`super::UiScript::session`], for a handle made inside a verb
+    /// ([`super::UiScript::reentrant`]).
+    pub(crate) session: u64,
     /// Every discovered addon in load order: the AddOn API's registry, filled at world entry.
     pub(crate) addons: Vec<super::addon::AddOnInfo>,
     /// The Lua index space into `addons`, a title-sorted, hidden-filtered list (`0x51da70`).
@@ -403,11 +406,11 @@ pub(crate) struct Model {
     /// `"target"` from the committed selection, whatever its memo holds.
     pub(crate) target_view_moved: bool,
     /// The player's auras in the reference cache's insertion order (`0xbc6040`), durations joined:
-    /// the `GetPlayerBuff` family's list, and any token naming the player's.
+    /// the `GetPlayerBuff` family's list.
     pub(crate) player_auras: Vec<AuraState>,
-    /// Every other unit's auras by guid, ascending aura slot: one list per unit, whatever token
-    /// names it.
-    pub(crate) unit_auras: HashMap<u64, Vec<AuraState>>,
+    /// Every unit's auras by guid, the player's too, ascending aura slot: one list per unit,
+    /// whatever token names it.
+    pub(crate) unit_auras: HashMap<u64, super::UnitAuraList>,
     /// The unit-token resolver's inputs (`0x515970`), which the aura bindings resolve through.
     pub(crate) unit_guids: super::UnitGuids,
     /// Spell ids the cancel verbs queued (`CancelPlayerBuff`, `CancelTrackingBuff`, …), one
@@ -415,8 +418,15 @@ pub(crate) struct Model {
     pub(crate) cancel_aura_requests: Vec<u32>,
     /// The player's active tracking aura, behind `GetTrackingTexture`.
     pub(crate) tracking: Option<super::aura::TrackingState>,
-    /// The calls that touch the selection, the cast or the targeting cursor, in call order.
+    /// The calls that touch the selection, the cast or the targeting cursor made while the host
+    /// was out, in call order, for it to apply as soon as it is back.
     pub(crate) script_calls: Vec<super::calls::QueuedCall>,
+    /// How many drains of [`Self::script_calls`] are running, each inside a call the one outside
+    /// it applied ([`super::calls::submit`]).
+    pub(crate) call_depth: u8,
+    /// A harness's VM keeps the calls made with no host lent here
+    /// ([`super::UiScript::keep_calls`]); `None` refuses them.
+    pub(crate) kept_calls: Option<Vec<super::ScriptCall>>,
     /// The binding functions' queue and mouselook state.
     pub(crate) input: super::input_verbs::InputState,
     /// The selection change a script call made and the input events it ran under, for the event
@@ -442,8 +452,9 @@ pub(crate) struct Model {
     /// `GetTime()`'s session seconds, which only the host moves ([`super::UiScript::tick`],
     /// [`super::UiScript::set_now`]); off `_G`, as the reference's clock is the OS tick count.
     pub(crate) now: f64,
-    /// `GetGameTime()`'s `(hour, minute)`, pushed by the host as the game clock ticks.
-    pub(crate) game_time: (u32, u32),
+    /// `GetGameTime()`'s `(hour, minute)`, pushed by the host as the game clock ticks; `None`
+    /// until the server sets it.
+    pub(crate) game_time: Option<(i32, i32)>,
     /// The zone caches the four zone-text getters and `GetZonePVPInfo` read.
     pub(crate) zone: super::ZoneTexts,
     /// The current map's `Map.dbc` `InstanceType`, all `IsInInstance()` reads; `None` for no row.
@@ -625,13 +636,18 @@ pub(crate) struct Model {
     pub(crate) spellbook: spellbook::SpellBookState,
     /// The pet's spellbook, a second array as in the reference (`0xb700f0`, `0xb6f098`).
     pub(crate) pet_book: spellbook::PetBookState,
+    /// Bumped when `set_pet_book` changes which spells the pet's book lists.
+    pub(crate) pet_book_generation: u64,
     /// The player's macros, owned here as 1.12 macros have no server side; the app persists them.
     pub(crate) macros: macros::MacroState,
     /// A script changed the macros: the save and `UPDATE_MACROS` cue.
     pub(crate) macros_dirty: bool,
     /// Bumped by every seed and change, for readers that must not drain `macros_dirty`.
     pub(crate) macros_generation: u64,
-    /// Each macro's cached cast by 1-based index, from the app; an absent macro reads unbound.
+    /// Bumped by every `EditMacro` that names a macro, whose worker `0x4f1280` ends in the action
+    /// bar's usable refresh (`0x4f132e`).
+    pub(crate) macro_edits: u64,
+    /// Each macro's cached cast by id, from the app; an absent macro reads unbound.
     pub(crate) macro_bindings: HashMap<u32, macros::MacroBinding>,
     /// The macro icon chooser's paths, behind `GetMacroIconInfo`: `0x4f0090`'s listing of
     /// `Interface\Icons\`, not `SpellIcon.dbc`.
@@ -640,9 +656,10 @@ pub(crate) struct Model {
     pub(crate) macro_icon_source: Option<MacroIconSource>,
     /// `ToggleSpellAutocast` ids for `CMSG_PET_SPELL_AUTOCAST` (`0x2F3`), which names a spell.
     pub(crate) pet_spell_autocasts: Vec<u32>,
-    /// An auto-repeat or cast that `SpellStopCasting()` can stop, not a channel (`0x6e6e80`). Its
-    /// 1 or nil matters: the ESC chain (`UIParent.lua:1489`) reaches `CloseAllWindows()` on nil.
-    pub(crate) casting: bool,
+    /// The player's cast state, which `IsCurrentAction`, `IsAutoRepeatAction` and
+    /// `SpellStopCasting()` (`0x6e6e80`) read: the last's 1 or nil matters, as the ESC chain
+    /// (`UIParent.lua:1489`) reaches `CloseAllWindows()` on nil.
+    pub(crate) cast_view: super::action::CastView,
     /// Spell targeting is on (`SpellIsTargeting`, `0x6e6cd0`); it gates `SpellStopTargeting()`,
     /// whose nil the ESC chain falls through on (`UIParent.lua:1490`).
     pub(crate) spell_targeting: bool,
@@ -1057,12 +1074,20 @@ pub(crate) struct Model {
     /// creator's and the giver's lookups pass a callback (`0x52e204`, `0x52e29d`) at every build,
     /// and a hovered bag or paper-doll slot's `OnUpdate` builds again each frame.
     pub(crate) item_name_asks: HashSet<u64>,
+    /// Guids `UnitName` read off a unit with no object and missed in the name cache, for the app
+    /// to ask: the no-object leg's lookup passes a callback (`0x5171eb`, `0x517205`).
+    pub(crate) unit_name_asks: HashSet<u64>,
     /// Charter item guids whose build missed the petition record or its owner's name, for the
     /// app to ask: both lookups pass a callback (`0x52b93b`, `0x52b9d2`) at every build.
     pub(crate) petition_asks: HashSet<u64>,
     /// `ItemRandomProperties` id to its view, pushed whole at startup: a clicked tooltip cannot
     /// repaint on a late answer. The reference reads its loaded store `0xc0dbd4` (`0x52c991`).
     pub(crate) random_properties: HashMap<u32, super::RandomPropertyView>,
+    /// `SpellItemEnchantment` id to the name a tooltip's enchant line prints, pushed whole at
+    /// startup for the sources that carry a bare id, as a link's block does (`0x52c9f2`).
+    pub(crate) enchant_names: HashMap<u32, String>,
+    /// Every spell the player knows, the set `0x60c740` tests for the active player.
+    pub(crate) known_spells: HashSet<u32>,
     /// The player's level, class, race and skills, for a tooltip's red requirement lines.
     pub(crate) player_req: PlayerReqState,
     /// `Lock.dbc` by lock id, pushed whole at startup, and what the active player opens locks with
@@ -1079,8 +1104,11 @@ pub(crate) struct Model {
     /// selector asks for (`0x52e610`'s fourth argument).
     pub(crate) pet_spell_tooltips: HashMap<u32, super::SpellTooltipView>,
     pub(crate) pet_spell_tooltip_asks: HashSet<u32>,
-    /// The tooltips whose spell render missed its view, re-rendered when the app answers.
-    pub(crate) spell_tooltip_waits: HashMap<FrameHandle, super::tooltip_spell::SpellWait>,
+    /// Each aura's view by the aura builder's arguments, and the misses asked for.
+    pub(crate) aura_tooltips: HashMap<super::AuraKey, super::AuraTooltipView>,
+    pub(crate) aura_tooltip_asks: HashSet<super::AuraKey>,
+    /// The tooltips whose spell or aura render missed its view, re-rendered when the app answers.
+    pub(crate) spell_tooltip_waits: HashMap<FrameHandle, super::tooltip_spell::ViewWait>,
     /// Each tooltip's last item build, kept until its next clear for the rebuild a cache answer
     /// runs (`+0x380`..`+0x440`, `0x52e530`).
     pub(crate) item_builds: HashMap<FrameHandle, super::tooltip_item::build::ItemBuild>,
@@ -1117,6 +1145,8 @@ pub(crate) struct Model {
 
     /// `GetNetStats`'s third return, the average round trip in ms; 0 before any sample.
     pub(crate) net_latency_ms: u32,
+    /// `GetNetStats`'s first two returns, the KB/s received and sent since the link connected.
+    pub(crate) net_bandwidth_kbps: (f32, f32),
 
     /// `UnitXP("player")` and `UnitXPMax("player")`, from the private `PLAYER_XP` fields.
     pub(crate) player_xp: u32,
@@ -1184,6 +1214,8 @@ pub(crate) struct Model {
     pub(crate) xml_creating: bool,
     /// Per live-unit guid, reach for `CanInspect`/`CheckInteractDistance`; absent: nil.
     pub(crate) unit_reach: HashMap<u64, super::UnitReach>,
+    /// The host's relation functions the six relation verbs ask; `None` holds no unit.
+    pub(crate) unit_relations: Option<std::rc::Rc<dyn super::UnitRelations>>,
 
     /// The skills pane's snapshot and the display tree built from it.
     pub(crate) skills: skills::SkillsState,
@@ -1296,6 +1328,23 @@ pub(crate) struct Model {
 }
 
 impl Model {
+    /// The profession windows open (`[0xbde040]`, `[0xbdcfb8]`): the trade skill's line and the
+    /// craft's type while each window is open, which a close zeroes (`0x4fc870`, `0x4f5fe0`).
+    pub(crate) fn open_professions(&self) -> super::OpenProfessions {
+        super::OpenProfessions {
+            trade_skill: self
+                .trade_skill
+                .as_ref()
+                .filter(|_| self.trade_skill_open)
+                .map(|t| t.line),
+            craft: self
+                .craft
+                .as_ref()
+                .filter(|_| self.craft_open)
+                .map(|c| c.craft_type),
+        }
+    }
+
     /// The charsets the character name check holds a name to: this client's `Region` and locale.
     pub(crate) fn name_charsets(&self) -> super::NameCharsets {
         super::NameCharsets::for_client(self.client_region, self.locale)
@@ -1370,14 +1419,24 @@ impl Model {
     }
 
     /// The unit a token with a `target` hop and no push of its own names: the resolver's guid
-    /// (`0x515970`, which the getters call before their own object lookup, `0x468460`), then that
-    /// guid's snapshot. A token without a hop is the app's to push, base by base, and reads
-    /// nothing here.
+    /// (`0x515970`, which the getters call before their own object lookup, `0x468460`), then what
+    /// each getter reads for that guid. A held unit's snapshot first; with no object, the group
+    /// row naming the guid, whose own token's push carries its records (`0x496400`, `0x496420`)
+    /// and the roster's `UnitExists` (`0x491900`); off the roster, the app's no-object entry, a
+    /// name from the name cache (`0x5171eb`) and nothing more. A token without a hop is the app's
+    /// to push, base by base, and reads nothing here.
     fn chained_unit(&self, token: &str) -> Option<&UnitState> {
         match parse_unit_token(token) {
             UnitTokenParse::Unit { base, hops } if hops > 0 => {
                 let guid = self.unit_guids.resolve_unit(base, hops)?;
-                self.units_by_guid.get(&guid)
+                match self.units_by_guid.get(&guid) {
+                    Some(held) if held.has_object => Some(held),
+                    unheld => self
+                        .unit_guids
+                        .roster_token(guid)
+                        .and_then(|t| self.pushed_unit(&t))
+                        .or(unheld),
+                }
             }
             _ => None,
         }
@@ -1386,6 +1445,7 @@ impl Model {
     pub(crate) fn new() -> Model {
         Model {
             vm: super::glue::VmKind::InGame,
+            session: 0,
             addons: Vec::new(),
             addon_index: Vec::new(),
             addon_reply: None,
@@ -1492,6 +1552,8 @@ impl Model {
             cancel_aura_requests: Vec::new(),
             tracking: None,
             script_calls: Vec::new(),
+            call_depth: 0,
+            kept_calls: None,
             input: Default::default(),
             protected: Default::default(),
             selection_cause: None,
@@ -1503,7 +1565,7 @@ impl Model {
             saved_instances: Vec::new(),
             raid_selection: 0,
             now: 0.0,
-            game_time: (0, 0),
+            game_time: None,
             zone: Default::default(),
             instance_type: None,
             can_reset_instances: false,
@@ -1584,14 +1646,16 @@ impl Model {
             ui_errors: Vec::new(),
             spellbook: spellbook::SpellBookState::default(),
             pet_book: spellbook::PetBookState::default(),
+            pet_book_generation: 0,
             macros: macros::MacroState::default(),
             macros_dirty: false,
             macros_generation: 0,
+            macro_edits: 0,
             macro_bindings: HashMap::new(),
             macro_icons: Vec::new(),
             macro_icon_source: None,
             pet_spell_autocasts: Vec::new(),
-            casting: false,
+            cast_view: Default::default(),
             spell_targeting: false,
             spell_targetable_units: HashSet::new(),
             talents: super::talent::TalentUiState::default(),
@@ -1790,8 +1854,11 @@ impl Model {
             item_sets: HashMap::new(),
             item_set_asks: HashSet::new(),
             item_name_asks: HashSet::new(),
+            unit_name_asks: HashSet::new(),
             petition_asks: HashSet::new(),
             random_properties: HashMap::new(),
+            enchant_names: HashMap::new(),
+            known_spells: HashSet::new(),
             item_stat_asks: HashSet::new(),
             item_stat_reads: HashSet::new(),
             player_req: PlayerReqState::default(),
@@ -1802,6 +1869,8 @@ impl Model {
             spell_tooltip_asks: HashSet::new(),
             pet_spell_tooltips: HashMap::new(),
             pet_spell_tooltip_asks: HashSet::new(),
+            aura_tooltips: HashMap::new(),
+            aura_tooltip_asks: HashSet::new(),
             spell_tooltip_waits: HashMap::new(),
             item_builds: HashMap::new(),
             item_cache_waits: HashMap::new(),
@@ -1845,6 +1914,7 @@ impl Model {
             modifiers: (false, false, false),
             money: 0,
             net_latency_ms: 0,
+            net_bandwidth_kbps: (0.0, 0.0),
             player_xp: 0,
             player_next_level_xp: 0,
             combo_points: 0,
@@ -1883,6 +1953,7 @@ impl Model {
             world_frame_made: false,
             xml_creating: false,
             unit_reach: HashMap::new(),
+            unit_relations: None,
             chat_input: Vec::new(),
             skills: skills::SkillsState::default(),
             skills_groups: Vec::new(),

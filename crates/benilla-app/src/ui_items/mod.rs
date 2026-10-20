@@ -16,7 +16,6 @@ use bevy::prelude::*;
 use crate::items::Items;
 use crate::net::{ObjectStore, Objects};
 use crate::query_cache::Ask;
-use crate::ui_script::UiInput;
 use crate::ui_unit::UnitFeed;
 
 mod drain;
@@ -716,14 +715,14 @@ pub(crate) fn send_item_use(
     gate: &mut crate::ui_bind_confirm::BindGate,
     suppress: bool,
     // Passed in, not carried on `CastLadder`, so no system reaches it twice.
-    ui_errors: &mut crate::ui_action::UiErrorKeys,
+    ui_errors: &crate::ui_action::UiErrorKeys,
 ) -> bool {
     // `0x5d8d00`'s requirement check (`0x5d8e0e`) and control gate (`0x5d8eaa`), past the
     // quest-starter arm (`0x5d8dcc`), which runs before them.
     if it.start_quest == 0 {
         if let Some(key) = script.item_use_refusal(it.entry, it.use_spell.unwrap_or(0)) {
             debug!("ui_items: item use refused — {key}");
-            ui_errors.0.push(crate::ui_action::UiError::key(key));
+            ui_errors.push(crate::ui_action::UiError::key(key));
             return false;
         }
     }
@@ -746,9 +745,7 @@ pub(crate) fn send_item_use(
                 "ui_items: item use refused — that hand is disarmed (slot {})",
                 it.slot
             );
-            ui_errors
-                .0
-                .push(crate::ui_action::UiError::key("ERR_CANT_USE_DISARMED"));
+            ui_errors.push(crate::ui_action::UiError::key("ERR_CANT_USE_DISARMED"));
             false
         }
         ItemUseRoute::ToggleCancel(spell) => {
@@ -801,6 +798,7 @@ pub(crate) fn send_item_use(
                     bag_index: it.bag_index,
                     slot: it.slot,
                     entry: it.entry,
+                    guid: it.guid,
                     spell_index: it.spell_index,
                     on_object: it.on_object,
                 },
@@ -993,6 +991,7 @@ impl Plugin for UiItemsPlugin {
         net::register(app);
         // The icons come from the equipment renderer's `ItemDisplays`.
         app.init_resource::<EquipErrors>()
+            .init_resource::<feed::BagUpdates>()
             .init_resource::<crate::ui_items::locks::ItemReleases>()
             .init_resource::<crate::ui_items::locks::HeldItemLocks>()
             .init_resource::<crate::ui_items::locks::LockWatch>()
@@ -1015,40 +1014,46 @@ impl Plugin for UiItemsPlugin {
                         .in_set(crate::ui_script::UiFeed)
                         .before(feed_containers)
                         .before(crate::ui_char::feed_char),
-                    // The slot cooldowns must be in the VM before `feed_action_state`'s
-                    // synchronous `BAG_UPDATE_COOLDOWN` makes the bag handlers re-read them.
+                    // The slot cooldowns must be in the VM before the action feed's
+                    // `BAG_UPDATE_COOLDOWN` makes the bag handlers re-read them, and the action
+                    // feed counts this feed's `BAG_UPDATE`s (`crate::ui_action`'s schedule).
                     feed_containers
                         .in_set(UnitFeed)
                         .before(crate::ui_action::CooldownEvents),
                     // The item-tooltip store answers before the input pass, so a re-hover the
-                    // next frame sees the answer, and seats a new VM before its world entry.
+                    // next frame sees the answer, and seats a new VM before its world entry; a
+                    // refused cast's item name reads the store it leaves.
                     feed_item_stats
                         .in_set(UnitFeed)
-                        .in_set(crate::ui_unit::WorldEnterSeats),
+                        .in_set(crate::ui_unit::WorldEnterSeats)
+                        .before(crate::ui_cast::feed_cast_reports),
                     feed_item_sets.in_set(UnitFeed),
                     ask_item_build_lookups.in_set(UnitFeed),
                     // The roll table, pushed whole once per VM, before the first hover.
                     feed_random_properties.in_set(UnitFeed),
-                    feed_player_req.in_set(UnitFeed),
+                    // After the latches, so a skinning spell learnt this frame colours the line now.
+                    feed_player_req
+                        .in_set(UnitFeed)
+                        .after(crate::ui_action::track_learned_abilities),
                     // The item tooltip's lock check: `Lock.dbc` once, the player's openers on change.
                     lock_openers::feed_lock_rows.in_set(UnitFeed),
                     lock_openers::feed_lock_openers.in_set(UnitFeed),
                     // After the input pass, so a repair-mode click goes out the same frame; a
                     // plain `UseContainerItem` is a script call.
-                    drain_container_repairs.after(UiInput),
+                    drain_container_repairs.in_set(crate::ui_script::UiDrain),
                     // Pick, place and split: `CMSG_SWAP_INV_ITEM`, `CMSG_SWAP_ITEM` or
                     // `CMSG_SPLIT_ITEM`.
-                    drain_container_moves.after(UiInput),
+                    drain_container_moves.in_set(crate::ui_script::UiDrain),
                     // The delete-confirm popup's accept: `CMSG_DESTROYITEM`.
-                    drain_container_destroys.after(UiInput),
+                    drain_container_destroys.in_set(crate::ui_script::UiDrain),
                     // `AutoEquipCursorItem`: `CMSG_AUTOEQUIP_ITEM`.
-                    drain_container_autoequips.after(UiInput),
-                    drain_bag_autostores.after(UiInput),
+                    drain_container_autoequips.in_set(crate::ui_script::UiDrain),
+                    drain_bag_autostores.in_set(crate::ui_script::UiDrain),
                     // The soulbind confirmations' answers (`EquipPendingItem`,
                     // `CancelPendingEquip`, `ConfirmBindOnUse`). A dialog is answered in a later
                     // frame than it was raised, so no order against the other drains is needed.
-                    drain::drain_bind_confirm_answers.after(UiInput),
-                    drain::drain_bind_on_use_confirms.after(UiInput),
+                    drain::drain_bind_confirm_answers.in_set(crate::ui_script::UiDrain),
+                    drain::drain_bind_on_use_confirms.in_set(crate::ui_script::UiDrain),
                 ),
             );
     }

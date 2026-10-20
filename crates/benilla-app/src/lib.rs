@@ -77,6 +77,7 @@ mod npc_text;
 mod perf;
 mod pipe_warm;
 mod player;
+mod player_commands;
 mod poi_marker;
 mod portrait;
 #[cfg(feature = "dev")]
@@ -184,6 +185,7 @@ mod ui_trainer;
 mod ui_unit;
 mod ui_world_map;
 mod video;
+mod vm_pass;
 mod vplates;
 mod weapon_trail;
 mod world_backdrop;

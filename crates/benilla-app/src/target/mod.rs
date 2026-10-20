@@ -5,8 +5,6 @@
 
 use bevy::prelude::*;
 
-use benilla_ui::script::UiScript;
-
 use crate::creature_anim::Engaged;
 use crate::net::{ClientCommand, Guid, NetCommands, ObjectStore, SelfPlayer};
 use crate::ui_script::InspectMode;
@@ -23,6 +21,8 @@ mod flash;
 mod front;
 #[cfg(test)]
 mod front_tests;
+#[cfg(test)]
+mod gate_tests;
 mod highlight;
 pub(crate) mod hover;
 mod hover_probe;
@@ -38,21 +38,13 @@ pub(crate) fn hover_probe_armed() -> bool {
 }
 pub(crate) mod lock;
 mod price_discount;
-mod relations;
+pub(crate) mod relations;
 mod reticle;
 // `pub(crate)` for the hover inspector too: its faction catalog feeds `go_highlightable`.
 pub(crate) mod ring;
 mod scan;
 mod script;
 pub(crate) use script::ScriptSelect;
-
-/// `Faction.dbc` and our reputation table as one [`SystemParam`], since every reaction function
-/// takes both; `factions` is `Option` so a UI-only harness runs without client data.
-#[derive(bevy::ecs::system::SystemParam)]
-pub(crate) struct ReactionInputs<'w> {
-    pub(crate) factions: Option<Res<'w, Factions>>,
-    pub(crate) reputations: Res<'w, crate::net::Reputations>,
-}
 
 pub(crate) use cursor_mode::{
     corpse_mouseover_eligible, CursorKind, WorldCursor, GO_TYPE_GENERIC, SERVICE_RANGE_SQ,
@@ -65,8 +57,9 @@ pub(crate) use flash::CombatFlash;
 pub(crate) use price_discount::vendor_price_discount;
 #[cfg(test)]
 pub(crate) use price_discount::{stormwind_fixture, HUMAN_WARRIOR};
+// The one relation model, two units in: reaction, attack, assist, cooperation, interaction.
 pub(crate) use relations::{
-    can_assist, can_attack, can_interact, corpse_friendly, is_possessed_by, is_selectable, Assist,
+    corpse_friendly, is_possessed_by, is_selectable, RelUnit, RelationWorld, Relations, UnitLookup,
     UNIT_FLAG_POSSESSED,
 };
 // The attack validator's target half, run in the call that asks, for the player's Attack and the
@@ -81,14 +74,10 @@ pub(crate) use by_name::{
 };
 // The one SetSelection path, for the loot response's select (`0x48f3a0`).
 pub(crate) use by_name::SelectCommit;
-// The reaction decode and its faction catalog, which also tint the target frame
-// (`TargetFrame_CheckFaction`); `duel_rung` is the same walk, for `/reaction`.
-pub(crate) use ring::{
-    both_reactions_at_least_neutral, duel_rung, ring_reaction, selection_variant, Factions,
-    RingVariant,
-};
+// The selector's colour and the faction catalog it and the model read.
 #[cfg(test)]
 pub(crate) use ring::{ring_variant, PlayerPath, SelectorInput};
+pub(crate) use ring::{selection_variant, Factions, RingVariant};
 
 pub use click::Interact;
 pub(crate) use click::{clear_selection_on_world_teardown, deselect_on_ui_shutdown, DeselectGuid};
@@ -96,7 +85,7 @@ pub(crate) use click::{clear_selection_on_world_teardown, deselect_on_ui_shutdow
 /// Our target, set the instant we click, as the 1.12 client does without waiting for the server,
 /// and cleared on deselect or when it streams out. `CMSG_SET_SELECTION` carries the guid, which the
 /// server records in our `UNIT_FIELD_TARGET`.
-#[derive(Resource, Default)]
+#[derive(Resource, Default, Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Selection {
     pub(crate) target: Option<Entity>,
     pub(crate) guid: Option<u64>,
@@ -196,6 +185,13 @@ pub(crate) struct PressPick {
 }
 
 impl PressPick {
+    /// The router's pick state is an object (`[this+0x350]` 2, `0x481fb8`): a unit, a corpse, a
+    /// unit the `IsSelectable` grader refused (an object hit that selects nothing) or a
+    /// GameObject. Anything else is the ground or the sky.
+    pub(crate) fn over_object(&self) -> bool {
+        self.hovered.any().is_some() || self.hovered.refused || self.object.target.is_some()
+    }
+
     /// Whether the press was an Attack-cursor press, for `0x5ecb70`'s new-target validation.
     pub(crate) fn attack(&self) -> bool {
         self.cursor.kind == cursor_mode::CursorKind::Attack
@@ -309,6 +305,7 @@ impl Plugin for TargetPlugin {
             .add_message::<TargetByNameRequest>()
             .add_message::<AssistRequest>()
             .add_message::<click::DeselectGuid>()
+            .add_message::<click::PlateRightClick>()
             .add_message::<Interact>()
             .add_systems(
                 Startup,
@@ -351,19 +348,16 @@ impl Plugin for TargetPlugin {
                     crate::spell::targeting::commit_ground_cast_on_click,
                     crate::spell::targeting::commit_object_cast_on_click,
                     // The verb a walk owes runs at its stop, ahead of this frame's click.
-                    (
-                        click::act_on_arrival,
-                        click::act_on_right_click,
-                        click::act_on_interact,
-                    )
-                        .chain(),
+                    (click::act_on_arrival, click::act_on_right_click).chain(),
                     // The loot close's guid-scoped deselect.
                     click::clear_target_requests,
-                    // The script calls that touch the selection, the cast or the targeting cursor
-                    // (`TargetUnit`, `/target`, `ClearTarget`, `/cast`, `UseAction`, …), applied
-                    // in the order the script made them; then `DropItemOnUnit`'s pet leg.
+                    // The units the writers above parked with the targeting cursor up, bound to its
+                    // cast; then the unit interact of a nameplate's right-click and a crate's
+                    // `Interact`, so the cast goes out ahead of the interact it came with; then
+                    // `DropItemOnUnit`'s pet leg.
                     (
-                        crate::script_calls::apply_script_calls,
+                        crate::script_calls::bind_parked_picks,
+                        click::act_on_interact,
                         crate::ui_action::drop_item::drop_item_on_unit,
                     )
                         .chain(),
@@ -372,7 +366,14 @@ impl Plugin for TargetPlugin {
                     (
                         by_name::target_by_name_requests,
                         by_name::assist_requests,
-                        by_name::follow_requests,
+                        // After the pet bar's and pet book's drains, which write `PetBar`. The
+                        // two commute: the `FollowUnit` resolver reads only the pet's guid
+                        // (`spells.pet_guid`), which neither writes; the order keeps them declared.
+                        // After the follow drain, so a `FollowUnit` starts the frame it is made.
+                        by_name::follow_requests
+                            .after(crate::ui_pet::drain_pet_actions)
+                            .after(crate::ui_pet_book::drain_pet_book)
+                            .after(crate::ui_follow::drain_follow),
                     )
                         .chain(),
                     scan::auto_acquire_attacker,

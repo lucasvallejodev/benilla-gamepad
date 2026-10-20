@@ -438,6 +438,7 @@ const VERBS: &[Verb] = &[
 /// and book, a cast in flight, a targeting cursor and a Down-and-Up button for the events.
 fn verbs_world(security: AddonSecurity) -> UiScript {
     let mut s = walker(security);
+    s.keep_calls();
     event_frames(&mut s);
     s.set_spellbook(SpellBookState {
         tabs: vec![SpellTabView {
@@ -504,7 +505,10 @@ fn verbs_world(security: AddonSecurity) -> UiScript {
             ..Default::default()
         }),
     );
-    s.set_casting(true);
+    s.set_cast_view(crate::script::CastView {
+        slot: Some(133),
+        ..Default::default()
+    });
     s.set_spell_targeting(true);
     s
 }

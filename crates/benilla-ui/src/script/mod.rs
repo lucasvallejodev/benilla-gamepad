@@ -85,8 +85,8 @@ pub use glue::{glue_events, VmKind};
 pub use glue_core::scanf_d;
 pub use glue_core::{
     glue_status_key, launch_addon_url, launch_addon_url_allowed, launch_url_allowed, GlueCall,
-    GlueCredentials, GlueHost, GlueNotice, GlueRequest, GlueSignal, GlueText, NoticeState,
-    GLUE_STATUS_KEYS,
+    GlueCredentials, GlueHost, GlueNotice, GlueNotices, GlueRequest, GlueSignal, GlueText,
+    NoticeState, GLUE_STATUS_KEYS,
 };
 pub use glue_create::{
     GlueCreateCatalog, GlueCreateClass, GlueCreateCounts, GlueCreateLook, GlueCreateRace,
@@ -103,6 +103,7 @@ mod gm_ticket;
 mod gossip;
 mod guild;
 mod handler_prof;
+mod host;
 mod hyperlink;
 mod lfg;
 mod lottery;
@@ -181,13 +182,17 @@ mod taxi;
 mod tick;
 pub use tick::system_chat_args;
 mod tooltip;
+mod tooltip_aura;
 mod tooltip_item;
 mod tooltip_spell;
+mod tooltip_studied;
+mod tooltip_text;
 mod tooltip_unit;
 mod ui_errors;
 mod ui_scale;
 mod update_walk;
-pub use tooltip_unit::TooltipTint;
+pub use tooltip_studied::{PetAbility, StudiedCreature};
+pub use tooltip_unit::{OwnerTitle, OwnerTitleKind, PartyRecord, TooltipTint, UnitTooltipFacts};
 mod trade;
 mod tradeskill;
 mod trainer;
@@ -203,7 +208,10 @@ mod worn_display;
 pub(crate) mod xml_layout;
 mod zone_text;
 
-pub use action::{ActionSlot, ActionState, ActionUse};
+pub use action::{
+    macro_slot_id, macro_slot_word, ActionSlot, ActionState, ActionUse, CastView, OpenProfessions,
+    Profession,
+};
 pub use addon::{addon_load_context, AddOnInfo, AddonLoad, AddonReply, AddonSecurity};
 pub use addon_enable::{AddonStateFiles, EnableHash, EnableStore};
 pub use addon_message::{AddonDistribution, AddonSend};
@@ -211,7 +219,7 @@ pub use auction::{
     AuctionBid, AuctionCategory, AuctionHighBidder, AuctionItemRow, AuctionListState, AuctionQuery,
     AuctionStartRequest, AuctionState, AuctionSubCategory, BIDDER, LIST, OWNER, SORT_KEYS,
 };
-pub use aura::{AuraState, TrackingState};
+pub use aura::{AuraState, TrackingState, UnitAuraList};
 pub use backdrop::{Backdrop, Insets};
 pub use bank::BankState;
 pub use battlefield_positions::{BattlefieldFlagView, BattlefieldPositionView};
@@ -230,6 +238,7 @@ pub use chat_misc::EmoteRequest;
 pub use chat_send::{ChatGroup, ChatSend, SEND_CHAT_TOKENS};
 pub use chat_types::ChatTypeColor;
 pub use chat_window::{message_group_index, ChatWindowLook, MESSAGE_GROUPS};
+pub use console_exec::s_str_tokenize;
 pub use console_exec::{console_word, cvar_name_arg, no_such_cvar, set_args};
 pub use container::{
     BagAutoStore, ContainerMove, ContainerSlot, ContainerState, ContainerUse, EnchantView,
@@ -272,6 +281,7 @@ pub use guild::{
     GuildMemberInfo, GuildRankEdit, GuildRankInfo, GuildRequest, GuildState, LastOnline, UnitGuild,
     MAX_RANKS, MIN_RANKS, RANK_RIGHT_BITS,
 };
+pub use host::{CallHost, CallTail};
 pub use input_verbs::{BindingInput, FiredInput, HeldInput};
 pub use lfg::LfgDungeon;
 pub use lottery::UnservedSend;
@@ -291,13 +301,19 @@ pub use worldmap_arrow::ARROW_MODEL;
 pub(crate) use button::{refresh_label_lua, state_font_lua, LabelFont};
 pub(crate) use font_block::{face_loads, own_font_lua, SAME_FONT_HEIGHT};
 pub use inspect::{InspectView, UnitReach};
-pub use item_stats::{item_usable, ItemSetView, ItemTemplateView, PlayerReqState};
+pub use item_stats::{
+    item_usable, ItemRecipe, ItemSetView, ItemSpellLine, ItemTemplateView, PlayerReqState,
+    TaughtSpell,
+};
 pub use item_text::ItemTextState;
 pub use layout_cache::{AnchorLayout, FrameLayout, LayoutPoint};
 pub use lock_check::{check_lock, LockCheck, LockOpener, LockOpeners, LockSlotView};
 pub use loot::{LootRow, LootState, LOOT_PORTRAIT_UNIT};
 pub use loot_roll::{LootRollEntry, LootRollsState};
-pub use macros::{MacroBinding, MacroState, MacroView, MAX_MACROS, MAX_MACRO_BODY, MAX_MACRO_NAME};
+pub use macros::{
+    MacroBinding, MacroState, MacroView, CHARACTER_ID_BASE, MAX_MACROS, MAX_MACRO_BODY,
+    MAX_MACRO_NAME,
+};
 pub use mail::{
     MailInboxRow, MailInvoice, MailSendRequest, MailState, PackageView, StationeryView,
 };
@@ -336,13 +352,16 @@ pub use skills::{SkillEntry, SkillsState};
 pub use social::{FriendInfo, SocialRequest, SocialState, WhoInfo};
 pub use sound::{MusicRequest, SoundRequest};
 pub use spellbook::{
-    resolve_spell_by_name, PetBookState, SpellBookState, SpellSlotView, SpellTabView,
+    resolve_spell_by_name, resolve_spell_in_books, NamedSpell, PetBookState, SpellBookState,
+    SpellSlotView, SpellTabName, SpellTabView,
 };
 pub use stable::{StableIntent, StablePetSlot, StableState, NUM_STABLE_SLOTS};
 pub use summon::SummonConfirmUiState;
 pub use talent::{TalentPrereqView, TalentTabView, TalentUiState, TalentView};
 pub use taxi::{TaxiNodeType, TaxiUiNode, TaxiUiState};
-pub use tooltip_spell::SpellTooltipView;
+pub use tooltip_aura::{AuraKey, AuraTooltipView};
+pub use tooltip_spell::{ReputationRequirement, SpellTooltipView};
+pub use tooltip_text::{KeyedArg, TextPart, TooltipText};
 pub use trade::{TradeSideState, TradeSlotItem, TradeState, TRADE_SLOTS};
 pub use tradeskill::{TradeSkillDifficulty, TradeSkillReagent, TradeSkillRecipe, TradeSkillState};
 pub use trainer::{
@@ -358,7 +377,7 @@ pub use types::{
 pub use unit::by_name::{self, NameCandidate};
 pub use unit::{
     grey_band, level_reads_unknown, parse_unit_token, power_token, unit_is_grey, PlayerRecord,
-    SelectionRequest, UnitBase, UnitGuids, UnitState, UnitTokenParse,
+    SelectionRequest, UnitBase, UnitGuids, UnitRelations, UnitState, UnitTokenParse,
 };
 pub use weapon_enchant::WeaponEnchant;
 pub use who_sort::{WhoSortChain, WhoSortKey};
@@ -614,9 +633,10 @@ fn open_state(vm: VmKind) -> mlua::Result<Lua> {
     let mut model = Model::new();
     model.vm = vm;
     lua.set_app_data(model);
-    // Before anything can fire a handler and while no app-data borrow is held, as the
-    // profiler's slot requires.
+    // Before anything can fire a handler: every VM carries the profiler's slot and the call
+    // host's.
     handler_prof::install(&lua);
+    host::install(&lua);
 
     // `0x7039e0`: the base array `0x811e28`, the four libraries and the compat chunk `0x8722e8`.
     stdlib::sandbox(&lua)?;
@@ -776,10 +796,26 @@ impl UiScript {
     }
 
     fn host(lua: Lua) -> UiScript {
+        let session = NEXT_SESSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Some(mut model) = lua.app_data_mut::<Model>() {
+            model.session = session;
+        }
         UiScript {
             lua,
             instructions: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            session: NEXT_SESSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            session,
+        }
+    }
+
+    /// A handle on the VM `lua` belongs to, for engine code a verb reaches while the entry that
+    /// ran the script holds the VM ([`host::CallHost::apply`]). It is the same session; an
+    /// instruction budget is the entry's own.
+    pub(crate) fn reentrant(lua: &Lua) -> UiScript {
+        let session = lua.app_data_ref::<Model>().expect("model app_data").session;
+        UiScript {
+            lua: lua.clone(),
+            instructions: Default::default(),
+            session,
         }
     }
 
@@ -810,12 +846,15 @@ impl UiScript {
     pub fn fork(&self) -> UiScript {
         let lua = self.lua.fork();
         lua.remove_hook();
-        lua.set_app_data(self.model_ref().clone());
+        let session = NEXT_SESSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut model = self.model_ref().clone();
+        model.session = session;
+        lua.set_app_data(model);
         handler_prof::install(&lua);
         UiScript {
             lua,
             instructions: Default::default(),
-            session: NEXT_SESSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            session,
         }
     }
 
