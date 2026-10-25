@@ -322,12 +322,6 @@ const NOT_YET_ON_A_LANE: &[(Row, &str, &str)] = &[
     ),
     (
         Row::Edge,
-        "::ui_party::feed::feed_party",
-        "the ready check, the saved instances and the members' presence, found by comparing \
-         the group's state",
-    ),
-    (
-        Row::Edge,
         "::ui_items::locks::apply_item_releases",
         "the item source's two unlocks a loot close owes (`0x48f2bd`, `0x4c1d36`) and the copier's \
          ending's (`0x5ebc35` → `0x4c1d36`), taken off the loot session, a lane's type the queue \
@@ -362,9 +356,6 @@ const HOST_HELD_UNREAD: &[&str] = &[
     "::creature_anim::PlaySeq",
     "::items::Items",
     "::net::GuidIndex",
-    // Read, and quiet: the feeds that hold it fire nothing off it, as the reputation messages'
-    // `UPDATE_FACTION` and `UNIT_FACTION` go on the notice lane at their packets.
-    "::net::reputations::Reputations",
     "::net::SelfGuid",
     "::net::game_time::ServerTime",
     "::spell::cast_send::HeldForPick",
@@ -438,9 +429,10 @@ pub(super) const READS_FRAME_FINAL: &[(&str, &[&str])] = &[
         "net::ObjectStore", "net::SelfGuid", "net::reputations::Reputations"]),
     ("::ui_unit::feed_default_language", &["net::ObjectStore"]),
     ("::ui_unit::feed_known_languages", &["net::ObjectStore", "ui_action::PlayerActions"]),
-    // The party and raid tokens read the members' stores and records as of the drain's place
-    // (`ui_unit::views`); the roster `GetRaidRosterInfo` reads, the slots' presence edges and
-    // every snapshot's names, relations and roster read as the frame left them.
+    // The party and raid tokens read the members' stores, records and the roster's cells as of
+    // the drain's place (`ui_unit::views`), and the group getters read the cells through the host;
+    // the roster push is their no-host fallback, and every snapshot's names and relations read as
+    // the frame left them.
     ("::ui_party::feed::feed_party", &["names::NameCache", "net::GuidIndex", "net::ObjectStore",
         "net::SelfGuid", "net::reputations::Reputations", "ui_guild::GuildState",
         "ui_party::GroupState"]),
@@ -484,7 +476,6 @@ pub(super) const READS_FRAME_FINAL: &[(&str, &[&str])] = &[
     ("::ui_char::feed_char", &["items::Countdowns", "items::Items", "names::NameCache",
         "net::GuidIndex", "net::ObjectStore", "ui_char::AmmoRecordHits"]),
     ("::ui_char::feed_skills", &["net::ObjectStore"]),
-    ("::ui_reputation::feed_reputation", &["net::ObjectStore", "net::reputations::Reputations"]),
     ("::ui_inspect::feed_inspect", &["items::Items", "names::NameCache", "net::GuidIndex",
         "net::ObjectStore", "net::SelfGuid"]),
     ("::ui_honor::feed_honor", &["net::ObjectStore", "target::Selection", "ui_honor::InspectHonor",
@@ -680,10 +671,6 @@ const READ_ONLY_TO_HANDLERS: &[&str] = &[
     // The bag cache the open-container handler numbers its `BAG_OPEN`s from.
     "::BagCache",
     "::NetCommands",
-    // Read-only to the handlers that only judge relations (the combat log's, the cast result's
-    // and the loot response's): the reputation handlers write it, and so does every handler that
-    // lends the call host, whose reputation verbs write the slots.
-    "::Reputations",
     "::SelfGuid",
     "::OwnControlLost",
     "::Player",
@@ -750,6 +737,8 @@ const READ_ONLY_TO_HANDLERS: &[&str] = &[
     "bevy_time::time::Time<bevy_time::real::Real>",
     // The stores as of the drain's place, which the call host's token lookups read.
     "::ui_unit::views::UnitViews",
+    // The area under the player, which the host's raid rows read for our own zone (`0xb4e314`).
+    "::CurrentArea",
     // The `raidFilter` books the call host's aura walk reads (`0x4b3870`, `0x4b3920`), which
     // only the aura feed writes.
     "::ui_aura::AuraFeedMemory",
@@ -759,7 +748,7 @@ const READ_ONLY_TO_HANDLERS: &[&str] = &[
 ];
 
 /// Every lane's queue, by type: what a handler fills there fires in the packets' order.
-fn lane_types() -> [TypeId; 18] {
+fn lane_types() -> [TypeId; 19] {
     [
         TypeId::of::<crate::ui_items::feed::BagView>(),
         // The views lane: what each packet changed in the stores.
@@ -785,6 +774,8 @@ fn lane_types() -> [TypeId; 18] {
         // at their places.
         TypeId::of::<crate::spell::Cooldowns>(),
         TypeId::of::<crate::ui_pet::PetBar>(),
+        // The reputation lane: the store's writes and the pane's list operations, at their places.
+        TypeId::of::<crate::net::Reputations>(),
         // The cast views lane: the view each packet left, stamped ahead of the packet.
         TypeId::of::<crate::ui_cast::CastViews>(),
         // The guild lane: the roster, event and invitation packets' signals, each with the
@@ -795,7 +786,7 @@ fn lane_types() -> [TypeId; 18] {
 
 /// [`lane_types`] by the lane that drains each: a queue is stripped only from its own lane's row,
 /// so another lane's read of the same type shows as the state it is.
-fn lane_queue_owners() -> [(&'static str, TypeId); 18] {
+fn lane_queue_owners() -> [(&'static str, TypeId); 19] {
     [
         ("bag view", TypeId::of::<crate::ui_items::feed::BagView>()),
         ("unit views", TypeId::of::<crate::ui_unit::views::ViewLog>()),
@@ -825,6 +816,7 @@ fn lane_queue_owners() -> [(&'static str, TypeId); 18] {
         ),
         ("cooldowns", TypeId::of::<crate::spell::Cooldowns>()),
         ("pet cooldowns", TypeId::of::<crate::ui_pet::PetBar>()),
+        ("reputation", TypeId::of::<crate::net::Reputations>()),
         ("cast views", TypeId::of::<crate::ui_cast::CastViews>()),
         ("guild", TypeId::of::<crate::ui_guild::GuildState>()),
     ]
@@ -994,6 +986,7 @@ fn the_drain_runs_after_the_feeds_and_before_the_tick() {
             "loot",
             "party",
             "pet cooldowns",
+            "reputation",
             "unit views"
         ]
     );
@@ -1642,6 +1635,12 @@ fn every_view_push_of_what_a_handler_writes_is_listed() {
     assert!(stale.is_empty(), "stale rows: {stale:?}");
 }
 
+/// The lanes' own state that every firing of the drain reads as of its place, not as the frame left
+/// it: the lane replays it packet by packet in stamp order among the others, so a firing between
+/// two of its writes sees the first alone. A feed, which runs ahead of the drain, still reads it
+/// as the frame left it, and its row says so.
+const VERSIONED_FOR_THE_DRAIN: &[&str] = &["net::reputations::Reputations"];
+
 /// The lane firings that read what a handler writes as the frame left it, by lane, beside
 /// [`READS_FRAME_FINAL`]'s feeds: what a firing reads past the call host's own reads and its own
 /// lane's queues ([`lane_queue_owners`]), the field watchers' callbacks among them (the notice lane's). A listener fired
@@ -1650,22 +1649,21 @@ fn every_view_push_of_what_a_handler_writes_is_listed() {
 /// longer matches its firing fails.
 #[rustfmt::skip]
 const LANE_READS_FRAME_FINAL: &[(&str, &[&str])] = &[
-    // The watchers' callbacks: the drunk line's name, the quest log's slots, the skill line's race
-    // and class and the bonus bar's form off our live descriptor, and the aura watcher's join of
-    // the durations the duration packet writes (`0x4e4390` into `0xbc5f68`), as the frame left them
-    // (#2217); the aura watcher's own store is the one its packet left. `SetPetGuid`'s trainer
-    // refresh reads the open trainer, and its `PET_UI_CLOSE` the new pet's object and ours, as
-    // the frame left them.
-    ("field notices", &["names::NameCache", "net::GuidIndex", "net::ObjectStore",
+    // The watchers' callbacks: the quest log's slots, the skill line's race and class and the
+    // bonus bar's form off our live descriptor, and the aura watcher's join of the durations the
+    // duration packet writes (`0x4e4390` into `0xbc5f68`), as the frame left them (#2217); the
+    // aura watcher's own store is the one its packet left. The drunk line's name is read through
+    // the host. `SetPetGuid`'s trainer refresh reads the open trainer, and its `PET_UI_CLOSE` the
+    // new pet's object and ours, as the frame left them.
+    ("field notices", &["net::GuidIndex", "net::ObjectStore",
         "ui_aura::AuraDurations", "ui_trainer::TrainerOpen"]),
-    // The views lane reads the stores and records it rewinds as of each packet; the names, the
-    // relations' stores and reputations, the selection and the guild as the frame left them
-    // (#2217).
-    // The roster too: the members its party and raid tokens and readable guids come from, past
-    // the records it rewinds, as the frame left it (#2217).
+    // The views lane reads the stores, records and roster cells it rewinds as of each packet, and
+    // the reputations as the reputation lane replays them; the names, the relations' stores, the
+    // selection and the guild as the frame left them (#2217).
+    // The roster's cells and records it rewinds and seats while it builds; the rest as the frame
+    // left it.
     ("unit views", &["names::NameCache", "net::GuidIndex", "net::ObjectStore", "net::SelfGuid",
-        "net::reputations::Reputations", "target::Selection", "ui_guild::GuildState",
-        "ui_party::GroupState"]),
+        "target::Selection", "ui_guild::GuildState", "ui_party::GroupState"]),
     ("cast reports", &["items::Countdowns", "items::Items", "net::GuidIndex", "net::ObjectStore",
         "ui_action::cast_lines::CastFailRedisplays"]),
     ("item watchers", &["items::Countdowns", "items::Items", "names::NameCache", "net::GuidIndex",
@@ -1787,6 +1785,7 @@ fn every_lane_reads_of_what_a_handler_writes_is_listed() {
         }
         inputs.retain(|n| {
             !QUEUES_NOT_VIEWS.contains(&n.as_str())
+                && !VERSIONED_FOR_THE_DRAIN.contains(&n.as_str())
                 && !lane_queues.iter().any(|(l, q)| *l == lane && q == n)
         });
         found.push((lane, inputs));

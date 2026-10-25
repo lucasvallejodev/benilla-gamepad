@@ -26,8 +26,6 @@ pub(crate) struct FieldEventPushes;
 #[derive(bevy::ecs::system::SystemParam)]
 pub(crate) struct NoticeFiring<'w, 's> {
     sink: crate::ui_action::MessageSink<'w>,
-    // The drunk watcher names the player it runs on (`0x609210`).
-    names: Res<'w, crate::names::NameCache>,
     // The quest log's watcher reads the slots.
     me: Query<'w, 's, &'static crate::net::ObjectStore, With<crate::net::SelfPlayer>>,
     tutorials: Option<Res<'w, crate::tutorial::Tutorials>>,
@@ -82,7 +80,7 @@ impl NoticeFiring<'_, '_> {
             return false;
         }
         if let FieldNotice::Drunk { guid, old, new } = notice {
-            drunk(script, &mut self.sink, &self.names, guid, old, new);
+            drunk(script, &mut self.sink, guid, old, new);
             return false;
         }
         if notice == FieldNotice::SkillLines {
@@ -349,7 +347,6 @@ pub(crate) fn fire_field_notices(
 fn drunk(
     script: &mut UiScript,
     sink: &mut crate::ui_action::MessageSink,
-    names: &crate::names::NameCache,
     guid: u64,
     old: u8,
     new: u8,
@@ -358,10 +355,11 @@ fn drunk(
     if me && script.player_can_attack_target() {
         script.fire_event("UNIT_LEVEL", vec![ScriptValue::Str("target".to_string())]);
     }
+    // The name cache as the watcher runs, through the lent host (`0x609210`).
     let name = (!me).then(|| {
-        names
-            .resolve_player(guid, crate::query_cache::Ask::Read)
-            .map_or_else(|| script.unknown_object_text(), str::to_string)
+        benilla_ui::script::live::ask(script.lua(), &benilla_ui::script::PlayerNameQuery(guid))
+            .flatten()
+            .unwrap_or_else(|| script.unknown_object_text())
     });
     let lines: Vec<_> = drunk_messages(old, new)
         .into_iter()
@@ -731,6 +729,20 @@ mod tests {
             .init_resource::<crate::ui_chat::ChatLog>()
             .init_resource::<crate::sound::MessageSounds>()
             .init_resource::<crate::names::NameCache>();
+        spy(&mut app, guids);
+        app
+    }
+
+    /// [`world`] in the whole client's, whose notices fire with the call host lent, as a getter
+    /// reads the name caches through it.
+    fn hosted_world(guids: benilla_ui::script::UnitGuids) -> App {
+        let mut app = crate::game_plugins::schedule_tests::headless_client_unrun();
+        spy(&mut app, guids);
+        app
+    }
+
+    /// The VM that records every event the notices fire, with `guids` seated.
+    fn spy(app: &mut App, guids: benilla_ui::script::UnitGuids) {
         let mut script = UiScript::new().unwrap();
         script
             .run(
@@ -746,7 +758,6 @@ mod tests {
             .unwrap();
         script.set_unit_guids(&guids);
         app.insert_non_send_resource(script);
-        app
     }
 
     fn fired(app: &mut App, notices: &[FieldNotice]) -> Vec<String> {
@@ -1037,7 +1048,7 @@ mod tests {
                 None
             }
         }
-        let mut app = world(benilla_ui::script::UnitGuids {
+        let mut app = hosted_world(benilla_ui::script::UnitGuids {
             target: MOB,
             ..seated()
         });
@@ -1486,11 +1497,6 @@ mod tests {
             ),
             crate::test_support::runs_before(
                 &mut headless,
-                crate::ui_reputation::feed_reputation,
-                crate::lanes::fire_in_order,
-            ),
-            crate::test_support::runs_before(
-                &mut headless,
                 crate::ui_party::feed_party,
                 crate::lanes::fire_in_order,
             ),
@@ -1512,8 +1518,8 @@ mod tests {
             ),
         ];
         assert_eq!(
-            ahead, [true; 8],
-            "feed_units, char, honor, reputation, party, pet, pet stats, inspect"
+            ahead, [true; 7],
+            "feed_units, char, honor, party, pet, pet stats, inspect"
         );
 
         // In that order: the block lands, the push, the firing.
@@ -1680,7 +1686,7 @@ mod tests {
     }
 
     /// The login in the server's order: the faction list lands before the player's create (vmangos
-    /// `SendInitialPacketsBeforeAddToMap`, `Player.cpp:19256`), so the list's first push and the
+    /// `SendInitialPacketsBeforeAddToMap`, `Player.cpp:19256`), so the list's first build and the
     /// world-enter cascade share the create's frame. The cascade's rebuild signals
     /// `UPDATE_FACTION` after `PLAYER_ENTERING_WORLD` (`0x4909d3`), the player seated, so
     /// `ReputationWatchBar_Update` reads the level and a 60 trades the XP bar for the max-level art
@@ -1690,13 +1696,6 @@ mod tests {
         benilla_formats::wow_data_or_skip!();
         const WATCHED: u16 = 1261;
         const XP: u16 = 716;
-        let mut headless = crate::game_plugins::schedule_tests::headless_client();
-        assert!(crate::test_support::runs_before(
-            &mut headless,
-            crate::ui_reputation::feed_reputation,
-            super::super::feed_units
-        ));
-
         for (level, xp_bar) in [(60, false), (59, true)] {
             let (mut app, _) = feed_world(
                 &[
@@ -1743,9 +1742,6 @@ mod tests {
                     crate::ui_script::test_ui::load_ui(s, file);
                 }
             }
-            app.world_mut()
-                .run_system_once(crate::ui_reputation::feed_reputation)
-                .unwrap();
             app.world_mut()
                 .run_system_once(super::super::feed_units)
                 .unwrap();

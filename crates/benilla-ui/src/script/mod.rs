@@ -77,6 +77,7 @@ mod follow;
 pub(crate) mod font;
 mod font_block;
 mod frame_enum;
+mod roster_read;
 pub use char_name::{check_char_name, NameCharsets, NameLists, NoNameLists, CHAR_NAME_SUCCESS};
 mod glue;
 mod glue_addons;
@@ -319,6 +320,10 @@ pub use petition::{
     PETITION_TYPE_PETITION,
 };
 pub use protected::InputEvents;
+pub use roster_read::{
+    GroupCells, GroupCellsQuery, GroupRow, MemberOrPetQuery, MemberQuery, Membership, RaidRowQuery,
+    RowQuery,
+};
 pub use stat_read::{CombatRead, NoPlayer, SelfRead, UnitCombatStats};
 pub use tabard::{
     emblem_mask_path, TabardCall, TabardHost, EMBLEM_MASK_TOKEN, TABARD_COUNTS,
@@ -377,7 +382,10 @@ pub(crate) use region::{
     load_blend_mode, load_texture_file, load_texture_name, load_xml_font_file,
     texture_name_verdict, FileLoad,
 };
-pub use reputation::{FactionEntry, ReputationCall, ReputationListOp, ReputationState};
+pub use reputation::{
+    Book, FactionEntry, FactionQuery, FactionRead, ReputationBook, ReputationCall,
+    ReputationListOp, ReputationState,
+};
 pub use session::SessionRequest;
 pub use shapeshift::ShapeshiftFormView;
 pub(crate) use simplehtml::{
@@ -418,8 +426,9 @@ pub use types::{
 pub use unit::by_name::{self, NameCandidate, SeatedSelection};
 pub use unit::{
     grey_band, level_reads_unknown, parse_unit_token, power_token, resolve_unit_in, unit_is_grey,
-    PlayerRecord, SelectionRequest, UnitBase, UnitGuids, UnitIdentityRead, UnitObject,
-    UnitObjectRead, UnitRelations, UnitState, UnitTokenGlobals, UnitTokenObjects, UnitTokenParse,
+    PlayerNameQuery, PlayerRecord, SelectionRequest, UnitBase, UnitGuids, UnitIdentityRead,
+    UnitObject, UnitObjectRead, UnitRecord, UnitRecordQuery, UnitRelations, UnitState,
+    UnitTokenGlobals, UnitTokenObjects, UnitTokenParse,
 };
 pub use weapon_enchant::WeaponEnchant;
 pub use who_sort::{WhoSortChain, WhoSortKey};
