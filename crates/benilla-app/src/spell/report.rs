@@ -4,23 +4,33 @@
 //! reaches them, so what they signal is queued in order on [`CastReports`] and signalled inside
 //! that call ([`crate::script_calls`]), or by the frame's feed for a packet's.
 
-use std::time::Instant;
-
 use bevy::prelude::*;
 
-use super::inflight::{inflight, Inflight};
+use super::inflight::{inflight, inflight_item, Inflight};
 use super::{PendingCast, QueuedMeleeSpell, SpellTargeting};
 use crate::net::{ClientCommand, NetCommands};
 use crate::ui_action::CastFail;
 use crate::ui_cast::{CastBarEdge, CastReports};
+
+/// `AttributesEx & 0x4`: `CancelCast`'s tail leaves the record's cast unreaped (`0x6e4aad`).
+const ATTR_EX_NOT_REAPED: u32 = 0x4;
 
 /// The reason `TryCast`'s supersede, `StopSpellTargeting`, `SpellStopCasting` and
 /// `CancelQueuedCast` pass the cancel: `SPELL_FAILED_ERROR` (`0x6e4d6d`, `0x6e490b`, `0x6e6ec3`,
 /// `0x6e6f62`).
 pub(crate) const REASON_ERROR: u8 = 0x1c;
 
+/// The reason the inventory refusal's cancel passes (`0x5e3aad`): `SPELL_FAILED_DONT_REPORT`.
+pub(crate) const REASON_DONT_REPORT: u8 = 0x17;
+
+/// The reason a unit's death cancels the cast bound to it with (`0x6058dc`):
+/// `SPELL_FAILED_TARGETS_DEAD`.
+pub(crate) const REASON_TARGETS_DEAD: u8 = 0x65;
+
 /// The failure the reporter fires no event for: `SPELL_FAILED_SPELL_IN_PROGRESS` (`0x6e2234`).
 const REASON_IN_PROGRESS: u8 = 0x61;
+/// `SPELL_FAILED_NEED_AMMO`.
+const REASON_NEED_AMMO: u8 = 0x2f;
 
 /// The edge a failure signals: `SPELLCAST_INTERRUPTED` (340) for `SPELL_FAILED_INTERRUPTED` and
 /// `_INTERRUPTED_COMBAT`, `SPELLCAST_FAILED` (339) for every other (`0x6e2238`, `0x6e4a24`).
@@ -54,18 +64,33 @@ pub(crate) struct CastCore<'a> {
     pub(crate) ground: &'a mut SpellTargeting,
     pub(crate) reports: &'a mut CastReports,
     pub(crate) net: &'a NetCommands,
+    /// The tutorial bank the reporter and StopAttack trigger into (`0x4b5390`); absent in a
+    /// harness without it.
+    pub(crate) tutorials: Option<&'a crate::tutorial::Tutorials>,
 }
 
 impl CastCore<'_> {
+    /// `TriggerTutorial(id, 0)` (`0x4b5390`) from the reporter's or StopAttack's site.
+    pub(crate) fn trigger_tutorial(&self, id: u32) {
+        if let Some(tutorials) = self.tutorials {
+            tutorials.trigger_now(id);
+        }
+    }
+
     /// What the in-flight slot `0xceca88` holds.
     pub(crate) fn slot(&self) -> Option<Inflight> {
         inflight(self.pending, self.queued_melee, self.ground)
     }
 
+    /// The guid of the item the in-flight cast came from (`0x6e3d20` → `0xcecab0`).
+    pub(crate) fn slot_item(&self) -> Option<u64> {
+        inflight_item(self.pending, self.queued_melee, self.ground)
+    }
+
     /// `SetInFlightSpell(spell)` as the attempt calls it (`0x6e5026`): the same spell leaves the
     /// slot as it is, unsignalled (`0x6e4ad7`); another saves what the slot held (`0x6e4adf`, of
     /// which only a strike is kept), takes its place and signals (`0x6e4b13` → `0x4b3250`).
-    pub(crate) fn push(&mut self, spell_id: u32, held: Held, now: Instant) {
+    pub(crate) fn push(&mut self, spell_id: u32, held: Held) {
         let slot = self.slot();
         if slot.map(Inflight::spell_id) == Some(spell_id) {
             return;
@@ -78,7 +103,7 @@ impl CastCore<'_> {
             Held::Strike => self.queued_melee.push(strike, Some(spell_id)),
             Held::Cast { item_flags, item } => {
                 self.queued_melee.push(strike, None);
-                self.pending.push_cast(spell_id, item_flags, item, now);
+                self.pending.push_cast(spell_id, item_flags, item);
             }
             Held::Cursor => self.queued_melee.push(strike, None),
         }
@@ -100,26 +125,11 @@ impl CastCore<'_> {
         self.reports.changed();
     }
 
-    /// A cast whose deadline passed with no result ([`PendingCast::lapsed`]) leaves the slot as
-    /// its result's pop takes it (`0x6e4b2c`): the save copied back, a strike under it included,
-    /// and signalled. The deadline is benilla's own net for a lost result, which the reference
-    /// waits on.
-    pub(crate) fn reap_lapsed(&mut self, now: Instant) {
-        let Some(spell_id) = self.pending.lapsed(now) else {
-            return;
-        };
-        let slot = self.slot();
-        if slot == Some(Inflight::Cast(spell_id)) {
-            self.pop(slot);
-        } else {
-            self.pending.clear_if(spell_id);
-        }
-    }
-
-    /// The send's pop of an auto-repeat spell once its packet is out (`0x6e597d`-`0x6e5989`): only
-    /// while the slot holds it, so a ranged shot that is not auto-repeat (Aimed Shot, Arcane Shot,
-    /// Throw) stays in flight until its result. The send's other pop (`0x6e58a2`-`0x6e58bd`) is for
-    /// a record the push did not make or another caster's (the pet bar), neither in this slot.
+    /// The pop of an auto-repeat spell while the slot holds it: the send's once its packet is out
+    /// (`0x6e597d`-`0x6e5989`), so a ranged shot that is not auto-repeat (Aimed Shot, Arcane Shot,
+    /// Throw) stays in flight until its result, and the repeat stop's (`0x6ea154`-`0x6ea160`). The
+    /// send's other pop (`0x6e58a2`-`0x6e58bd`) is for a record the push did not make or another
+    /// caster's (the pet bar), neither in this slot.
     pub(crate) fn pop_if(&mut self, spell_id: u32) {
         let slot = self.slot();
         if slot.map(Inflight::spell_id) == Some(spell_id) {
@@ -137,6 +147,17 @@ impl CastCore<'_> {
     /// `StartMeleeAttack`'s reads the caster's precast spell (`0x5ecc56`-`0x5ecc85`). What it
     /// popped is returned for the caller's local teardown.
     pub(crate) fn cancel(&mut self, failed: bool, send: bool, reason: u8) -> Option<Inflight> {
+        self.cancel_for_caster(failed, send, reason).0
+    }
+
+    /// [`Self::cancel`], and whether the record's caster was the active player
+    /// (`0x6e4a04`-`0x6e4a1e`), the gate of its events and of its reap.
+    fn cancel_for_caster(
+        &mut self,
+        failed: bool,
+        send: bool,
+        reason: u8,
+    ) -> (Option<Inflight>, bool) {
         let slot = self.slot();
         if self.ground.active() {
             self.ground.clear();
@@ -147,7 +168,8 @@ impl CastCore<'_> {
             });
         }
         self.pop(slot);
-        if self.pending.take_caster_event() {
+        let caster = self.pending.take_caster_event();
+        if caster {
             self.reports.bar(if failed {
                 failure_edge(reason)
             } else {
@@ -156,6 +178,36 @@ impl CastCore<'_> {
         }
         if failed {
             self.reports.trade_skill_disarm();
+        }
+        (slot, caster)
+    }
+
+    /// [`Self::cancel`] with its tail's reap of the player's cast (`0x614150` at `0x6e4ab7`),
+    /// queued on `edits` for `player`, the active player's object (`0x6e4a77`-`0x6e4a8c`): the
+    /// record's spell `[0xceac58]` (`0x6e4a8e`), whatever was popped, while the record's caster
+    /// was the active player (`0x6e4a11`), and not for a record with `AttributesEx & 0x4`
+    /// (`0x6e4aad`); a spell with no record is reaped (`0x6e4ab3`). Every caller that tears its
+    /// cast down locally takes this one tail: StartAttack's (`0x5ecc85`), the self cancel's and the
+    /// inventory refusal's (`0x5e3ab3`).
+    pub(crate) fn cancel_reaping(
+        &mut self,
+        failed: bool,
+        send: bool,
+        reason: u8,
+        spells: Option<&crate::ui_action::Spells>,
+        player: Option<Entity>,
+        edits: &crate::creature_anim::UnitEdits,
+    ) -> Option<Inflight> {
+        let record = self.pending.record_spell();
+        let (slot, caster) = self.cancel_for_caster(failed, send, reason);
+        let kept = spells
+            .and_then(|s| s.catalog.get(record))
+            .is_some_and(|d| d.attributes_ex & ATTR_EX_NOT_REAPED != 0);
+        if let (true, Some(entity)) = (caster && !kept && record != 0, player) {
+            edits.push(crate::creature_anim::UnitEdit::AbortCasting {
+                entity,
+                spell_id: record,
+            });
         }
         slot
     }
@@ -211,12 +263,22 @@ impl CastCore<'_> {
     /// "Another action is in progress" (`0x6e2234`); anything else fires the failure's edge.
     pub(crate) fn report(&mut self, fail: CastFail, from_server: bool, reaches_tail: bool) {
         let (spell_id, reason) = (fail.spell_id, fail.reason);
+        // The player cleanup's switch, ahead of the line: `NEED_AMMO` triggers Ammunition
+        // (`0x6e1cc3`-`0x6e1cca`).
+        if reason == REASON_NEED_AMMO {
+            self.trigger_tutorial(crate::tutorial::id::AMMUNITION);
+        }
         self.reports.refused(fail);
         if !reaches_tail {
             return;
         }
         match self.slot() {
             Some(slot) if slot.spell_id() == spell_id => {
+                // The server's report pops the slot here (`0x6e2218`), after the GCD clear's pair
+                // its packet signalled (`0x6e167d`), which reads the cast still in flight.
+                if from_server {
+                    crate::ui_cast::slot_moves_here();
+                }
                 self.cancel(true, !from_server, reason);
             }
             Some(_) => {}
@@ -234,6 +296,7 @@ pub(crate) struct CastSlots<'w> {
     queued_melee: ResMut<'w, QueuedMeleeSpell>,
     ground: ResMut<'w, SpellTargeting>,
     reports: ResMut<'w, CastReports>,
+    tutorials: Option<Res<'w, crate::tutorial::Tutorials>>,
 }
 
 impl CastSlots<'_> {
@@ -245,12 +308,18 @@ impl CastSlots<'_> {
             ground: &mut self.ground,
             reports: &mut self.reports,
             net,
+            tutorials: self.tutorials.as_deref(),
         }
     }
 
     /// The targeting word, which `SelectTarget` tests first (`0x4935ca`).
     pub(crate) fn targeting(&self) -> &SpellTargeting {
         &self.ground
+    }
+
+    /// The tutorial bank, for the attack seams' other sites (`0x4b5390`).
+    pub(crate) fn tutorials(&self) -> Option<&crate::tutorial::Tutorials> {
+        self.tutorials.as_deref()
     }
 }
 
@@ -300,6 +369,7 @@ mod tests {
         queued_melee: QueuedMeleeSpell,
         ground: SpellTargeting,
         reports: CastReports,
+        tutorials: crate::tutorial::Tutorials,
     }
 
     impl Slots {
@@ -310,6 +380,7 @@ mod tests {
                 ground: &mut self.ground,
                 reports: &mut self.reports,
                 net,
+                tutorials: Some(&self.tutorials),
             }
         }
 
@@ -317,8 +388,8 @@ mod tests {
         /// by its reason.
         fn stream(&mut self) -> Vec<String> {
             self.reports
-                .0
-                .drain(..)
+                .take()
+                .into_iter()
                 .map(|r| match r {
                     CastReport::Changed => "CHANGED".into(),
                     CastReport::Bar(CastBarEdge::Stop) => "STOP".into(),
@@ -327,6 +398,10 @@ mod tests {
                     CastReport::Bar(_) => "BAR".into(),
                     CastReport::Refused(f) => format!("REFUSED {:#04x}", f.reason),
                     CastReport::TradeSkillDisarm => "DISARM".into(),
+                    CastReport::AutoRepeat(true) => "START_AUTOREPEAT".into(),
+                    CastReport::AutoRepeat(false) => "STOP_AUTOREPEAT".into(),
+                    CastReport::Redisplay => "REDISPLAY".into(),
+                    CastReport::Line(e) => e.key.into(),
                 })
                 .collect()
         }
@@ -354,14 +429,12 @@ mod tests {
         let (net, _rx) = wire();
         let mut s = Slots::default();
         s.queued_melee.arm(HEROIC_STRIKE);
-        let now = Instant::now();
         s.core(&net).push(
             FIREBALL,
             Held::Cast {
                 item_flags: None,
                 item: None,
             },
-            now,
         );
         s.core(&net).push(
             FIREBALL,
@@ -369,7 +442,6 @@ mod tests {
                 item_flags: None,
                 item: None,
             },
-            now,
         );
         assert_eq!(s.core(&net).slot(), Some(Inflight::Cast(FIREBALL)));
         assert_eq!(s.queued_melee.saved(), Some(HEROIC_STRIKE));
@@ -413,7 +485,6 @@ mod tests {
                 item_flags: None,
                 item: None,
             },
-            Instant::now(),
         );
         s.stream();
         s.core(&net).cancel_queued();
@@ -437,7 +508,6 @@ mod tests {
                 item_flags: None,
                 item: None,
             },
-            Instant::now(),
         );
         s.core(&net).cancel(false, false, REASON_ERROR);
         s.stream();
@@ -504,5 +574,20 @@ mod tests {
         assert_eq!(s.stream(), ["REFUSED 0x59", "FAILED"]);
         assert!(s.ground.active());
         assert!(cancels(&rx).is_empty());
+    }
+
+    /// The reporter's player cleanup: reason 0x2f `NEED_AMMO` triggers Ammunition (`0x2c`,
+    /// `0x6e1cc3`-`0x6e1cca`), whatever the slot holds; every other reason triggers nothing.
+    #[test]
+    fn a_need_ammo_refusal_triggers_the_ammunition_tutorial() {
+        let (net, _rx) = wire();
+        let mut s = Slots::default();
+        s.tutorials.lock().apply_flags(&[0u8; 32]);
+        s.core(&net)
+            .report(CastFail::local(AUTO_SHOT, 0x59), false, true);
+        assert!(s.tutorials.take_fired().is_empty(), "another reason");
+        s.core(&net)
+            .report(CastFail::local(AUTO_SHOT, 0x2f), true, false);
+        assert_eq!(s.tutorials.take_fired(), [0x2d], "published as 0x2c + 1");
     }
 }

@@ -78,6 +78,10 @@ pub const SMSG_SET_FACTION_STANDING: u16 = 0x0124;
 /// (`ReputationMgr::SendForceReactions`): a `u32` count, then `(faction id, reaction rank)` pairs
 /// of two `u32`s.
 pub const SMSG_SET_FORCED_REACTIONS: u16 = 0x02A5;
+/// A slot's at-war bit from the server: a `u32` slot and a `u8` whose bit `0x02` is the new bit
+/// (`0x4d56b0`). vmangos sends it when a creature of an unwarred faction enters combat with the
+/// player, and clears it as the player leaves combat (`Player::SendFactionAtWar`).
+pub const SMSG_SET_FACTION_ATWAR: u16 = 0x0313; // 787
 /// Set a faction's at-war flag from the reputation pane; none of the pane's three verbs is acked.
 pub const CMSG_SET_FACTION_ATWAR: u16 = 0x0125; // 293
 pub const CMSG_SET_FACTION_INACTIVE: u16 = 0x0317; // 791
@@ -110,6 +114,8 @@ pub const SMSG_PLAY_OBJECT_SOUND: u16 = 0x0278;
 pub const SMSG_PLAY_SOUND: u16 = 0x02D2;
 /// The zone's weather, pushed by the server.
 pub const SMSG_WEATHER: u16 = 0x02F4;
+/// One `u32` emote, the placed bid's wave (`0x4cc5dd`).
+pub const CMSG_EMOTE: u16 = 0x0102;
 pub const SMSG_EMOTE: u16 = 0x0103;
 pub const CMSG_TEXT_EMOTE: u16 = 0x0104;
 pub const SMSG_TEXT_EMOTE: u16 = 0x0105;
@@ -312,6 +318,9 @@ pub const CMSG_PET_NAME_QUERY: u16 = 0x0052; // 82
 
 /// A pet bar press: the slot's packed word and a target guid, dispatched on its type byte.
 pub const CMSG_PET_ACTION: u16 = 0x0175; // 373
+/// A cast whose caster is the pet or a possessed unit (`SendCast`, `0x6e5816`): the caster's guid,
+/// the spell and the targets block.
+pub const CMSG_PET_CAST_SPELL: u16 = 0x01F0; // 496
 /// A pet bar drag: one or two `(position, packed)` pairs, told apart by body size alone.
 pub const CMSG_PET_SET_ACTION: u16 = 0x0174; // 372
 /// Set a pet spell's autocast bit to a given value (the right-click).
@@ -327,12 +336,20 @@ pub const CMSG_PET_ABANDON: u16 = 0x0176; // 374
 /// Rename the pet (`PetRename`, `0x4be4e0`). One-shot: the server clears `UNIT_FLAG_PET_RENAME`
 /// on success (`PetHandler.cpp:302-345`); a refusal is [`SMSG_PET_NAME_INVALID`].
 pub const CMSG_PET_RENAME: u16 = 0x0177; // 375
+/// Ask the server to resend our pet's or charm's bar, empty body (`0x4bc738`); answered by
+/// `SMSG_PET_SPELLS` (`MiscHandler.cpp:1168`).
+pub const CMSG_REQUEST_PET_INFO: u16 = 0x0279; // 633
 
 /// The ask-once GameObject template lookup, shaped like `CMSG_CREATURE_QUERY`.
 pub const CMSG_GAMEOBJECT_QUERY: u16 = 0x005E; // 94
 /// Ask for a quest's template; answered by [`SMSG_QUEST_QUERY_RESPONSE`].
 pub const CMSG_QUEST_QUERY: u16 = 0x005C; // 92
 pub const CMSG_ITEM_QUERY_SINGLE: u16 = 0x0056; // 86
+/// Ask for an item's name alone, the item-name store's query (`0x559fe0`); answered by
+/// [`SMSG_ITEM_NAME_QUERY_RESPONSE`].
+pub const CMSG_ITEM_NAME_QUERY: u16 = 0x02C4; // 708
+/// Answers `CMSG_ITEM_NAME_QUERY`; vmangos sends nothing for an unknown item.
+pub const SMSG_ITEM_NAME_QUERY_RESPONSE: u16 = 0x02C5; // 709
 pub const CMSG_USE_ITEM: u16 = 0x00AB; // 171
 /// Open an openable item (a clam, a lockbox, a gift) by bag position; the loot that answers names
 /// the item's own guid (`HandleOpenItemOpcode`).
@@ -349,6 +366,9 @@ pub const SMSG_GAMEOBJECT_CUSTOM_ANIM: u16 = 0x00B3; // 179
 /// The client arms substate 12 (AnimationData 157) and the object outlives its
 /// `SMSG_DESTROY_OBJECT` for that play.
 pub const SMSG_GAMEOBJECT_DESPAWN_ANIM: u16 = 0x0215; // 533
+/// A used GameObject's page: a bare `u64` guid (vmangos `GameObject.cpp:1549-1554`). The client
+/// opens the item-text reader on the object (`0x5f88c0` → `0x4e32e0`).
+pub const SMSG_GAMEOBJECT_PAGETEXT: u16 = 0x01DF; // 479
 /// We walked into an area trigger: its `AreaTrigger.dbc` id (reference `0x5e2110`).
 pub const CMSG_AREATRIGGER: u16 = 0x00B4; // 180
 /// An area trigger's refusal (level, ghost, faction), shown like `SMSG_NOTIFICATION` (`0x4945b0`).
@@ -448,6 +468,9 @@ pub const CMSG_MOVE_NOT_ACTIVE_MOVER: u16 = 0x02D1; // 721
 /// body (`MiscHandler.cpp:1138-1155`). Sending 0 moves visibility home while the camera stays on
 /// the object, so it must be deliberate; the server expects no reply.
 pub const CMSG_FAR_SIGHT: u16 = 0x027A; // 634
+/// End far sight now: empty body, the view back on the player (`0x5e43f8`). vmangos never sends
+/// it; it clears `PLAYER_FARSIGHT` instead.
+pub const SMSG_CLEAR_FAR_SIGHT_IMMEDIATE: u16 = 0x020D; // 525
 /// Stop auto-repeat: empty body, sent from the local cancel (`0x6ea080`), so on every cancel.
 pub const CMSG_CANCEL_AUTO_REPEAT_SPELL: u16 = 0x026D; // 621
 

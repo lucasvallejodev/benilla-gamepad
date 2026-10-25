@@ -300,7 +300,7 @@ fn the_mail_and_auction_item_setters_answer_one_value() {
         name: Some("Linen Cloth".into()),
         ..Default::default()
     });
-    s.set_auction(Some(auction));
+    s.set_auction(auction);
     {
         let mut model = s.model_mut();
         let item = CursorItem {
@@ -337,6 +337,7 @@ fn the_mail_and_auction_item_setters_answer_one_value() {
 #[test]
 fn live_objects_and_blocks_reach_the_flag() {
     let mut s = fixture();
+    s.keep_calls();
     s.run(r#"ITEM_DURATION_HOURS = "[DURATION %d h]" LOCKED = "[LOCKED]""#)
         .unwrap();
     s.set_lock_rows(std::collections::HashMap::from([
@@ -445,7 +446,7 @@ fn live_objects_and_blocks_reach_the_flag() {
     }
     // The player's slots are the live item objects their guids name (`0x5342ed`): the flags
     // decide LOCKED, and the block's lock id is zeroed (`0x534341`).
-    s.open_trade_window();
+    s.open_trade_window(0x7);
     s.set_trade(Some(st));
     s.run("PickupContainerItem(0, 1) ClickTradeButton(1) PickupContainerItem(0, 2) ClickTradeButton(2)")
         .unwrap();

@@ -59,6 +59,11 @@ pub(crate) fn route(
     }) {
         windows.logs.record(kind.is_combat_log(), &line);
     }
+    // A received whisper, type 6, triggers Replying to Tells ahead of its event (`0x49b0fb`-
+    // `0x49b107`).
+    if kind == ChatEventKind::Whisper {
+        script.queue_tutorial_trigger(crate::tutorial::id::REPLYING_TO_TELLS);
+    }
     script.fire_event(event_name(kind), event.script_args());
 }
 
@@ -91,6 +96,8 @@ pub(crate) fn compose(
             &get("CHAT_IGNORED").unwrap_or_default(),
             &[Arg::S(&event.sender)],
         ),
+        // With no channel, `ListChannels`' line, arg1 alone (`:1411`).
+        K::ChannelList if event.channel.is_empty() => event.text.clone(),
         // `format(CHAT_CHANNEL_LIST_GET .. arg1, arg4)` (`:1409`): arg4 whole, arg1 unescaped.
         K::ChannelList => fill(
             &format!(

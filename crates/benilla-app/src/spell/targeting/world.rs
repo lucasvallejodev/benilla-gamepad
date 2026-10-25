@@ -65,10 +65,7 @@ pub(crate) fn commit_ground_cast_on_click(
     let at = bevy_to_wow(point);
     // `BindLocation 0x6e60f0`: SOURCE (`0x20`) first, then DEST (`0x40`), from a word in
     // `TargetingWantsLocation 0x6e6320`.
-    let (Some((spell_id, commit)), Some(bound)) = (
-        ladder.ground.pending_for(TargetingWants::Location),
-        ladder.ground.location_bind(at),
-    ) else {
+    let Some((spell_id, commit, bound)) = ladder.ground.location_commit(at) else {
         debug!("ui_action: a terrain click binds nothing the word wants — the cursor stays");
         return;
     };
@@ -85,7 +82,8 @@ pub(crate) fn commit_ground_cast_on_click(
 /// never changes the player's target and never reaches the GameObject's unselectable check.
 ///
 /// `BindTarget` picks its arm by the clicked object's typemask. The GameObject arm, when a word in
-/// `0x4800` puts GameObjects in the pick and one is the nearest hit ([`go_is_nearest`]), writes
+/// `0x4800` puts GameObjects in the pick (only those whose lock the spell passes, `0x6e62e0`,
+/// [`super::GoPickChecks`]) and one is the nearest hit ([`go_is_nearest`]), writes
 /// wire bit `TARGET_FLAG_GAMEOBJECT` (`0x800`), clears those `0x4800` word bits, parks the guid
 /// (`0xceac60`), and the zero word lets it call `SendCast 0x6e54f0`, with no gate before the send,
 /// not range nor the lock: the refusal is the server's `SMSG_CAST_RESULT`. The right-click path
@@ -165,6 +163,7 @@ mod tests {
         world.init_resource::<crate::ui_cast::CastReports>();
         world.init_resource::<crate::ui_action::UiErrorKeys>();
         world.init_resource::<crate::spell::AutoRepeatActive>();
+        world.init_resource::<crate::creature_anim::AttackStopInFlight>();
         world.init_resource::<crate::creature_anim::UnitEdits>();
         world.init_resource::<bevy::ecs::message::Messages<crate::player::StandStateRequest>>();
         world.init_resource::<crate::ui_tradeskill::TradeSkillOpens>();
@@ -282,8 +281,7 @@ mod tests {
         const HEAL: u32 = 2050;
         let commit = crate::spell::cast_send::CastCommit::Spell;
         let changes = |world: &mut World| {
-            let reports =
-                std::mem::take(&mut world.resource_mut::<crate::ui_cast::CastReports>().0);
+            let reports = world.resource_mut::<crate::ui_cast::CastReports>().take();
             reports
                 .iter()
                 .filter(|r| matches!(r, crate::ui_cast::CastReport::Changed))

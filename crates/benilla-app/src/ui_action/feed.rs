@@ -21,19 +21,30 @@ use crate::net::{NetCommands, ObjectStore, SelfPlayer};
 use super::errors::mount_result_key;
 use super::weapon_icon::{auto_attack_icon, substitutes_weapon_icon};
 use super::{
-    show_messages, ui_error_text, MessageSink, MountErrors, PetTameFailures, PlayerActions, Shown,
-    Spells, UiError, UiErrorKeys, UiErrorTexts,
+    show_messages, ui_error_text, ActionSlots, MessageSink, MountErrors, PetTameFailures,
+    PlayerActions, Shown, Spells, UiError, UiErrorKeys, UiErrorTexts,
 };
 
 /// An item action's icon when its template has not answered or its display id has no
 /// `ItemDisplayInfo` row: the reference's literal `0x847fe4`, from the resolver's `0x5d8927`.
 pub(crate) const MISSING_ITEM_ICON: &str = "Interface\\Icons\\INV_Misc_QuestionMark";
 
+/// `0x4e4fc0`'s offset: the second field of the `SpellShapeshiftForm` row of the player's form
+/// byte, 0 with no player or row (`0x4e4fc5`, `0x4e500f`). It is set, and `UPDATE_BONUS_ACTIONBAR`
+/// signalled, at each world entry (`0x490979` → `0x4e4f90`) and each form change (`0x5de01b`),
+/// nowhere else.
+pub(crate) fn bonus_bar_offset(store: Option<&ObjectStore>, spells: Option<&Spells>) -> u8 {
+    let form = store.map(|s| s.0.unit_shapeshift_form()).unwrap_or(0);
+    spells
+        .and_then(|s| s.forms.get(&u32::from(form)))
+        .map(|f| f.bonus_bar)
+        .unwrap_or(0) as u8
+}
+
 /// The feed's memory of what it last pushed, for per-slot change events.
 #[derive(Default)]
 pub(super) struct FeedMemory {
     pushed: HashMap<u32, ActionSlot>,
-    bonus_offset: u8,
     /// Whether the identity resolve has run against this VM: a new VM resets this memory, while
     /// every other input to the gate is host-side and may still match.
     resolved: bool,
@@ -45,8 +56,12 @@ pub(super) struct FeedMemory {
 }
 
 pub(super) fn feed_actions(
-    // The bar the identity resolve reads, which the host's action presses also read.
-    mut vm: crate::script_calls::VmWith<ResMut<'static, PlayerActions>>,
+    // The book and the bar the identity resolve reads, which the host's action presses also
+    // read and its bar verbs write.
+    mut vm: crate::script_calls::VmWith<(
+        ResMut<'static, PlayerActions>,
+        ResMut<'static, ActionSlots>,
+    )>,
     mut mount_errors: ResMut<MountErrors>,
     mut pet_tame_failures: ResMut<PetTameFailures>,
     // The by-key and resolved-text queues and the cover that holds the latter, as one parameter,
@@ -65,14 +80,12 @@ pub(super) fn feed_actions(
     mut memory: Local<crate::ui_script::VmMemo<FeedMemory>>,
     mut sink: MessageSink,
 ) {
-    // The messages and the bonus bar's page, with the host lent: `UI_ERROR_MESSAGE`'s handlers and
-    // `UPDATE_BONUS_ACTIONBAR`'s may make calls.
+    // The messages, with the host lent: `UI_ERROR_MESSAGE`'s handlers may make calls.
     vm.run(|script| {
         let Some(script) = script else {
             return;
         };
         let (ui_error_keys, mut ui_error_texts, cover) = ui_errors;
-        let memory = memory.get(script);
 
         // (Dis)mount refusals by key ([`mount_result_key`]); none of these strings takes arguments.
         let mount_texts: Vec<(&'static str, String)> = mount_errors
@@ -142,27 +155,11 @@ pub(super) fn feed_actions(
             })
             .collect();
         show_messages(script, &mut sink, "ui_action", engine_lines);
-
-        let store = self_q.iter().next();
-
-        // Stance page: our form's bonus bar offset, with `UPDATE_BONUS_ACTIONBAR` on change.
-        let form = store.map(|s| s.0.unit_shapeshift_form()).unwrap_or(0);
-        let offset = spells
-            .as_ref()
-            .and_then(|s| s.forms.get(&u32::from(form)))
-            .map(|f| f.bonus_bar)
-            .unwrap_or(0) as u8;
-        if offset != memory.bonus_offset {
-            debug!("ui_action: bonus bar offset {} (form {form})", offset);
-            memory.bonus_offset = offset;
-            script.set_bonus_bar_offset(offset);
-            script.fire_event("UPDATE_BONUS_ACTIONBAR", vec![]);
-        }
     });
 
     // The identity resolve reads the bar, which a press the host applies reads too: an engine
     // turn, whose slot changes signal once it has pushed them all.
-    let signals: Vec<u32> = vm.turn(|script, mut actions| {
+    let signals: Vec<u32> = vm.turn(|script, (mut actions, mut slots)| {
         let Some(script) = script else {
             return Vec::new();
         };
@@ -177,10 +174,12 @@ pub(super) fn feed_actions(
         let macros_moved = macro_generation != memory.macro_generation;
         if !memory.resolved
             || actions.dirty
+            || slots.dirty
             || template_epoch != memory.template_epoch
             || macros_moved
         {
             actions.dirty = false;
+            slots.dirty = false;
             memory.resolved = true;
             memory.template_epoch = template_epoch;
             memory.macro_generation = macro_generation;
@@ -189,7 +188,7 @@ pub(super) fn feed_actions(
             // Each occupied slot's display, diffed against what the VM holds; a changed slot is
             // pushed and fires `ACTIONBAR_SLOT_CHANGED` with its Lua action id.
             let mut fresh: HashMap<u32, ActionSlot> = HashMap::new();
-            for (slot, button) in &actions.buttons {
+            for (slot, button) in &slots.buttons {
                 let (texture, count, consumable, use_spell) = match button.kind {
                     // A macro slot shows the macro's own icon (`0x4e6bf9` calls `0x4f0fd0`), never
                     // its bound spell's, though its state follows the bound spell.
@@ -262,12 +261,13 @@ pub(super) fn feed_actions(
             }
             // A slot is pushed only when this feed's own source moved since its last push, so a
             // verb's write (`PickupAction`, `PlaceAction`, an addon's from a handler this frame) is
-            // never rolled back by a store that has not caught up; it fires
+            // never rolled back by a resolve of a store it has not reached; it fires
             // `ACTIONBAR_SLOT_CHANGED` only when what it pushes differs visibly from what the VM
-            // shows, so the store catching up with a verb is no change. The item's ON_USE spell is
+            // shows, so resolving the slot a verb stored is no change. The item's ON_USE spell is
             // pushed but never signalled: the place leaves it to this re-feed, and no handler
-            // paints it. A macro rename changes the name line (`GetActionText`) but not the slot
-            // value, so a macro edit re-fires every macro slot.
+            // paints it. A macro slot whose word stands is signalled by `EditMacro` alone, inside
+            // its call (`0x4f1329` into `0x4e5cc0`), and reads its macro's icon and name live, so
+            // a load, a create or an edit pushes it silently.
             let held = script.action_slots();
             let shown = |s: Option<&ActionSlot>| {
                 s.map(|s| ActionSlot {
@@ -282,14 +282,15 @@ pub(super) fn feed_actions(
                 .collect::<HashSet<_>>()
                 .into_iter()
                 .filter_map(|a| {
-                    let macro_moved = macros_moved
-                        && fresh
-                            .get(&a)
-                            .is_some_and(|s| macro_slot_id(s.kind, s.action).is_some());
+                    let word = |s: Option<&ActionSlot>| s.map(|s| (s.kind, s.action));
+                    let macro_stands = fresh
+                        .get(&a)
+                        .is_some_and(|s| macro_slot_id(s.kind, s.action).is_some())
+                        && word(fresh.get(&a)) == word(memory.pushed.get(&a));
                     let moved = fresh.get(&a) != memory.pushed.get(&a);
                     let signal =
-                        macro_moved || (moved && shown(fresh.get(&a)) != shown(held.get(&a)));
-                    (moved || macro_moved).then_some((a, signal))
+                        moved && !macro_stands && shown(fresh.get(&a)) != shown(held.get(&a));
+                    moved.then_some((a, signal))
                 })
                 .collect();
             for &(action, _) in &changed {

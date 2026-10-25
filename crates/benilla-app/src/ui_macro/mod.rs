@@ -34,6 +34,10 @@ pub(crate) struct MacroBoundSpells(pub(crate) std::collections::HashMap<u32, Bou
 
 pub(crate) use run::{Bound, BoundSpell};
 
+/// The bound spells' derivation, which the action-state feed reads after ([`crate::ui_action`]).
+#[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct MacroBindings;
+
 pub(crate) struct UiMacroPlugin;
 
 impl Plugin for UiMacroPlugin {
@@ -43,11 +47,13 @@ impl Plugin for UiMacroPlugin {
             .add_systems(
                 Update,
                 (
-                    // Before the action feeds read it (they run in `UnitFeed`), so a macro edited
-                    // this frame reports its new spell's cooldown the same frame.
+                    // After the book's feed, which a derivation reads; the action-state feed
+                    // follows it ([`crate::ui_action`]).
                     rebind_macro_spells
-                        .in_set(crate::ui_script::UiFeed)
-                        .before(crate::ui_unit::UnitFeed),
+                        .in_set(crate::ui_unit::UnitFeed)
+                        .in_set(MacroBindings)
+                        .after(crate::ui_spellbook::BookFeed)
+                        .after(crate::ui_pet_book::feed_pet_book),
                     // In-world only: the per-character file needs the character. Ahead of the
                     // rank pass, which rewrites the bar's words too, as the one-time move of a
                     // character's old buttons does.
@@ -111,12 +117,12 @@ pub(crate) fn identity(roster: &crate::glue_session::roster::Roster) -> Option<(
 
 /// Seed the engine's macro table from disk, once per character per VM.
 fn load_macros(
-    mut hosted_vm: crate::script_calls::HostedVm,
+    // The bar's verbs, whose slots the call host's own bar verbs write too: an engine turn.
+    mut vm: crate::script_calls::VmWith<crate::ui_action::ActionBarSteps<'static>>,
     roster: Res<crate::glue_session::roster::Roster>,
-    actions: Res<crate::ui_action::PlayerActions>,
     mut files: ResMut<MacroFiles>,
 ) {
-    hosted_vm.run(|script| {
+    vm.feed(|script, mut bar, fires| {
         let Some(script) = script else { return };
         let Some(id) = identity(&roster) else { return };
         if files.identity.get(script).as_ref() == Some(&id) {
@@ -127,10 +133,12 @@ fn load_macros(
         files.character = crate::local_state::macros_character_path(realm, character);
         *files.identity.get(script) = Some(id.clone());
 
-        let read = |path: &Option<std::path::PathBuf>| -> Vec<benilla_ui::script::MacroView> {
+        let read = |path: &Option<std::path::PathBuf>,
+                    per_character: bool|
+         -> Vec<benilla_ui::script::MacroView> {
             let Some(path) = path else { return Vec::new() };
             match std::fs::read_to_string(path) {
-                Ok(text) => store::parse(&text),
+                Ok(text) => store::parse(&text, per_character),
                 // Absent is the first run, not a failure.
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
                 Err(e) => {
@@ -139,20 +147,20 @@ fn load_macros(
                 }
             }
         };
-        let character_records = read(&files.character);
+        let character_records = read(&files.character, true);
         let moves = store::legacy_character_words(&character_records);
-        let state = MacroState::from_scopes(read(&files.account), character_records);
+        let state = MacroState::from_scopes(read(&files.account, false), character_records);
         info!(
             "ui_macro: {} account + {} character macros for {character} on {realm}",
             state.count(false),
             state.count(true)
         );
         if !moves.is_empty() {
-            migrate_character_bar(script, &actions, &state, &files, &moves);
+            migrate_character_bar(&mut bar, &state, &files, &moves);
         }
         script.set_macros(state);
         // `UPDATE_MACROS` (string at `0x852460`): the macro frame redraws on it, as after an edit.
-        script.fire_event("UPDATE_MACROS", vec![]);
+        fires.post("UPDATE_MACROS", vec![]);
     })
 }
 
@@ -166,12 +174,11 @@ fn load_macros(
 /// The file goes first, rewritten in this build's numbering, so the next load finds no old ids and
 /// the buttons move once: afterwards a word in 19 to 36 can be an account macro's. If the write
 /// fails nothing moves and the next load tries again. Each button then goes out as a placement's
-/// does, through the VM's queue to `drain_action_sets`, which stores it and sends
-/// `CMSG_SET_ACTION_BUTTON`. A button whose old place holds no macro is cleared the same way: its
+/// does ([`crate::ui_action::ActionBarSteps::set`]): `CMSG_SET_ACTION_BUTTON` sent and the slot
+/// stored. A button whose old place holds no macro is cleared the same way: its
 /// word would read as an account macro of that id, and misbind once one takes it.
 fn migrate_character_bar(
-    script: &mut UiScript,
-    actions: &crate::ui_action::PlayerActions,
+    bar: &mut crate::ui_action::ActionBarSteps,
     state: &MacroState,
     files: &MacroFiles,
     moves: &[(u32, u32)],
@@ -182,10 +189,10 @@ fn migrate_character_bar(
         warn!("ui_macro: renumbering {}: {e}", path.display());
         return;
     }
-    let mut writes: Vec<(u32, u32)> = actions
-        .buttons
-        .iter()
-        .filter_map(|(&slot, b)| {
+    let mut writes: Vec<(u32, u32)> = bar
+        .buttons()
+        .filter_map(|b| {
+            let slot = b.slot;
             let word = (u32::from(b.kind) << 24) | b.action;
             let old_numbering = b.kind == ACTION_KIND_MACRO
                 && (MAX_MACROS as u32 + 1..=2 * MAX_MACROS as u32).contains(&b.action);
@@ -200,10 +207,13 @@ fn migrate_character_bar(
         "ui_macro: {} character macro button(s) moved to macro ids or cleared",
         writes.len()
     );
-    script.queue_action_sets(writes);
+    for (id, packed) in writes {
+        bar.set(id, packed);
+    }
 }
 
-/// Persist on the engine's dirty edge, and fire `UPDATE_MACROS`.
+/// Persist on the engine's dirty edge. The verbs signal `UPDATE_MACROS` themselves, inside their
+/// calls.
 fn save_dirty_macros(mut hosted_vm: crate::script_calls::HostedVm, files: Res<MacroFiles>) {
     hosted_vm.run(|script| {
         let Some(script) = script else { return };
@@ -211,8 +221,6 @@ fn save_dirty_macros(mut hosted_vm: crate::script_calls::HostedVm, files: Res<Ma
             return;
         }
         let state = script.macros();
-        // Fire first: the redraw must not depend on the write landing.
-        script.fire_event("UPDATE_MACROS", vec![]);
         for (path, per_character) in [(&files.account, false), (&files.character, true)] {
             let Some(path) = path else { continue };
             let text = store::write(state.saved(per_character).into_iter());
@@ -223,83 +231,90 @@ fn save_dirty_macros(mut hosted_vm: crate::script_calls::HostedVm, files: Res<Ma
     })
 }
 
-/// What [`rebind_macro_spells`] last saw, per VM: a fresh VM restarts both counters at 0, which a
-/// bare memo would gate off for good.
+/// What [`rebind_macro_spells`] last saw, per VM: a fresh VM restarts the table's counter at 0,
+/// which a bare memo would gate off for good.
 #[derive(Default)]
 struct BindingsSeen {
     macros: Option<u64>,
-    pet_book: Option<u64>,
+    pet_book: Option<u32>,
 }
 
-/// Derive every macro's bound spell again on any change to the macro table (the engine's macro
-/// generation) or to the action store (change detection), as the first pass of a VM does. When only
-/// the pet's spell list changes, derive the records that follow the pet's book alone, as `0x4f0ce0`
-/// does: a `/cast` that did not resolve and any record whose book selector is the pet's
-/// (`0x4f0cfb`-`0x4f0d11`). A `CastSpellByName` that missed keeps its 0 through that alone; the
-/// reference keeps it until the macro is edited, where the next table or bar change here derives
-/// it again.
+/// Derive the bound spells the engine's verbs do not (they derive the record a create or an edit
+/// touches inside the call, `0x4f123c`, `0x4f1313`), where the reference's other callers of
+/// `0x4efe00` do, and nowhere else:
+/// - every record after the macro files load (`0x4f0a55` into `0x4f0ca0`) and after our player's
+///   arrival learns its initial spells (`0x5deacc`);
+/// - at each pet spell list (`0x4bdae0` into `0x4f0ce0`), the same list again included, the
+///   records that follow the pet's book: a `/cast` that did not resolve and any record whose
+///   selector is the pet's (`0x4f0cfb`-`0x4f0d11`). The frame's lists derive once, after the
+///   last, off the book the pet book's feed pushed.
+///
+/// A learned spell derives nothing, so a `/cast` of a spell not yet known stays -1 until its macro
+/// is edited, loaded again or the player arrives again. A superseded rank rewrites the cached
+/// spell of each macro on the bar that holds the old one (`0x4e5e60`'s macro arm, `0x4e5ec4`),
+/// derived from nothing. Runs after the book's feed, so a derivation reads the book as it stands,
+/// and copies the engine's records out for the action bar.
+#[allow(clippy::type_complexity)] // the bar, the records and the pet book's sorts, as one param
 fn rebind_macro_spells(
-    mut hosted_vm: crate::script_calls::HostedVm,
-    actions: Res<crate::ui_action::PlayerActions>,
-    table: Option<Res<crate::ui_chat::commands::SlashCommands>>,
-    mut bound: ResMut<MacroBoundSpells>,
-    mut seen: Local<crate::ui_script::VmMemo<BindingsSeen>>,
+    // The bar, whose supersede queue this drains, and the records, which the call host's presses
+    // and usable refresh read, so a turn: no Lua runs here.
+    mut vm: crate::script_calls::VmWith<(
+        ResMut<'static, crate::ui_action::PlayerActions>,
+        Res<'static, crate::ui_action::ActionSlots>,
+        ResMut<'static, MacroBoundSpells>,
+        Option<Res<'static, crate::ui_pet::PetBar>>,
+    )>,
+    arrivals: Query<(), Added<crate::net::SelfPlayer>>,
+    mut owed: Local<(bool, crate::ui_script::VmMemo<BindingsSeen>)>,
 ) {
-    hosted_vm.run(|script| {
-        let (Some(script), Some(table)) = (script, table) else {
+    let (arrived, seen) = &mut *owed;
+    *arrived |= !arrivals.is_empty();
+    vm.turn(|script, (mut actions, slots, mut bound, pet_bar)| {
+        // With no VM the supersede pairs wait for the first pass that can apply them.
+        let Some(script) = script else {
             return;
         };
         let seen = seen.get(script);
-        let first = seen.macros.is_none();
         let generation = script.macros_generation();
-        let pet_generation = script.pet_book_generation();
-        let table_moved = seen.macros != Some(generation) || actions.is_changed();
-        let pet_moved = seen.pet_book != Some(pet_generation);
-        if !table_moved && !pet_moved {
+        let book_sorts = pet_bar.map_or(0, |b| b.book_sorts);
+        let table_moved = seen.macros != Some(generation);
+        let pet_moved = seen.pet_book != Some(book_sorts);
+        if !table_moved && !pet_moved && !*arrived && actions.superseded.is_empty() {
             return;
         }
         seen.macros = Some(generation);
-        seen.pet_book = Some(pet_generation);
+        seen.pet_book = Some(book_sorts);
+        // Both taken, so neither stays owed to the next pass.
+        let (arrival, load) = (std::mem::take(arrived), script.take_macro_derives().loaded);
+        let every = arrival || load;
 
-        let (macros, book, pet_book) =
-            (script.macros(), script.spellbook(), script.pet_spellbook());
-        let mut fresh = std::collections::HashMap::new();
-        for m in macros.views() {
-            // The records are new on a VM's first pass, with no book selector to keep.
-            let was = bound
-                .0
-                .get(&m.id)
-                .copied()
-                .filter(|_| !first)
-                .unwrap_or_default();
-            let next = if table_moved || was.follows_the_pet_book() {
-                run::bound_spell(&table, &m.body, &book, &pet_book, was)
-            } else {
-                was
-            };
-            fresh.insert(m.id, next);
+        // The queue empties without marking the bar changed: the supersede marked it already.
+        let superseded = std::mem::take(&mut actions.bypass_change_detection().superseded);
+        if !superseded.is_empty() {
+            // The macros the bar holds are the ones a supersede reaches (`0x4e5e70`-`0x4e5ece`).
+            let on_bar: std::collections::HashSet<u32> = slots
+                .buttons
+                .values()
+                .filter_map(|b| benilla_ui::script::macro_slot_id(b.kind, b.action))
+                .collect();
+            let mut records = script.macro_bindings();
+            for (_, b) in records.iter_mut().filter(|(id, _)| on_bar.contains(id)) {
+                for &(old, new) in &superseded {
+                    if b.spell == old as i32 {
+                        b.spell = new as i32;
+                    }
+                }
+            }
+            script.set_macro_bindings(records);
         }
-        // The engine's copy, for `GetActionAutocast`, re-pushed on every recompute so a fresh VM
-        // has it.
-        script.set_macro_bindings(
-            fresh
-                .iter()
-                .map(|(&id, b)| {
-                    let spell = match b.spell {
-                        BoundSpell::None => 0,
-                        BoundSpell::Unresolved => -1,
-                        BoundSpell::Spell(id) => id as i32,
-                    };
-                    (
-                        id,
-                        benilla_ui::script::MacroBinding {
-                            spell,
-                            pet_book: b.pet_book,
-                        },
-                    )
-                })
-                .collect(),
-        );
+        script.derive_macro_bindings(|_, b| every || (pet_moved && b.follows_the_pet_book()));
+
+        let records = script.macro_bindings();
+        let fresh: std::collections::HashMap<u32, Bound> = script
+            .macros()
+            .views()
+            .map(|m| (m.id, records.get(&m.id).copied().unwrap_or_default().into()))
+            .collect();
         if fresh != bound.0 {
             let spells = fresh
                 .values()

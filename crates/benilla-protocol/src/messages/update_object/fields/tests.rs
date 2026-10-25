@@ -251,6 +251,14 @@ fn player_skill_unpacks_the_three_dword_triplet() {
 }
 
 #[test]
+fn item_contained_reads_the_guid_after_the_owner() {
+    // `ITEM_FIELD_OWNER` 6-7 set too, so a wrong index reads the owner.
+    let f = ObjectFields::from_pairs(&[(6, 0x07), (7, 0), (8, 0xabc), (9, 0x4000_0000)]);
+    assert_eq!(f.item_contained(), Some(0x4000_0000_0000_0abc));
+    assert_eq!(ObjectFields::default().item_contained(), None);
+}
+
+#[test]
 fn player_ammo_id_reads_the_field() {
     let f = ObjectFields::from_pairs(&[(1223, 2512)]);
     assert_eq!(f.player_ammo_id(), Some(2512));
@@ -314,6 +322,10 @@ fn player_field_bytes_splits_into_combo_points_toggles_and_honor_rank() {
     assert_eq!(ObjectFields::default().player_honor_rank(), None);
     assert_eq!(ObjectFields::default().player_action_bar_toggles(), None);
     assert_eq!(ObjectFields::default().player_combo_points(), None);
+    // Byte 0's flags: 0x4 is the logging-out bit the cast validator reads (`0x60982b`).
+    assert!(ObjectFields::from_pairs(&[(1222, 0x04)]).player_logging_out());
+    assert!(!f.player_logging_out(), "0x01 alone is not logging out");
+    assert!(!ObjectFields::from_pairs(&[(1222, 0x0400)]).player_logging_out());
 }
 
 /// The nonzero drunk byte catches a wrong shift; the current rank (field 195) and the highest
@@ -795,6 +807,14 @@ fn dead_or_ghost_is_health_zero_or_the_ghost_flag() {
     assert!(!alive.is_dead_or_ghost());
     assert!(corpse.is_dead_or_ghost());
     assert!(!ghost.unit_is_dead(), "a ghost has health");
+    // The health test is signed and alone (`0x605f3b jle`): no maximum, or a health past
+    // `i32::MAX`, reads dead.
+    assert!(unit(&[(FIELD_UNIT_HEALTH, 0)]).unit_is_dead());
+    assert!(unit(&[
+        (FIELD_UNIT_HEALTH, 0x8000_0000),
+        (FIELD_UNIT_MAXHEALTH, 100)
+    ])
+    .unit_is_dead());
     assert!(ghost.is_dead_or_ghost(), "the ghost-flag leg");
     assert!(
         !feigning.is_dead_or_ghost(),
@@ -852,8 +872,8 @@ fn feign_death_reads_dead_without_touching_the_raw_health_field() {
     assert_eq!(feigning.unit_max_power(MANA), Some(900));
     // Out-of-range power slots stay None under the flag, as the ungated reader has them.
     assert_eq!(feigning.unit_shown_power(5), None);
-    // An empty store has no flag and no health.
-    assert!(!ObjectFields::default().unit_reads_dead());
+    // An empty store's health reads 0, dead by `0x605f9b`.
+    assert!(ObjectFields::default().unit_reads_dead());
     assert_eq!(ObjectFields::default().unit_shown_health(), None);
 }
 

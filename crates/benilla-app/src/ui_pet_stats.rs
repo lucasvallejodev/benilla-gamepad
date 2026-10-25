@@ -46,12 +46,37 @@ pub(crate) struct PetFamilyTables {
 #[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct PetSnapshot;
 
+/// [`feed_pet_stats`]' memory per VM, a resource so the world entry's reset
+/// ([`crate::ui_pet::drop_bar`]) records what it pushed and the feed neither pushes nor signals it
+/// again.
+#[derive(Resource, Default)]
+pub(crate) struct PetStatsFeed(pub(crate) crate::ui_script::VmMemo<StatsMemory>);
+
+/// The bucket and its two tooltip figures, the `UNIT_HAPPINESS` key.
+type Happiness = (Option<u32>, u32, u32);
+
+/// What [`feed_pet_stats`] last pushed to a VM, and the happiness of the last pet it saw, by guid.
+#[derive(Default)]
+pub(crate) struct StatsMemory {
+    pub(crate) pushed: Option<(bool, PetStats)>,
+    /// The streamed pet's guid and its [`Happiness`] when last pushed; a push with no pet keeps it.
+    happiness: Option<(u64, Happiness)>,
+}
+
+fn happiness(s: &PetStats) -> Happiness {
+    (
+        s.happiness,
+        s.damage_percentage.to_bits(),
+        s.loyalty_rate.to_bits(),
+    )
+}
+
 pub(crate) struct UiPetStatsPlugin;
 
 impl Plugin for UiPetStatsPlugin {
     fn build(&self, app: &mut App) {
         // In the unit feed, so the pet frame repaints in the pass that pushes its health.
-        app.add_systems(
+        app.init_resource::<PetStatsFeed>().add_systems(
             Update,
             feed_pet_stats
                 .in_set(UnitFeed)
@@ -164,33 +189,33 @@ pub(crate) fn feed_pet_stats(
     tables: Option<Res<PetStatTables>>,
     family_tables: Option<Res<PetFamilyTables>>,
     names: Res<NameCache>,
-    mut last: Local<crate::ui_script::VmMemo<Option<(bool, PetStats)>>>,
+    mut last: ResMut<PetStatsFeed>,
 ) {
     vm.feed(|script, bar, fires| {
         let Some(script) = script else {
             return;
         };
-        let last = last.get(script);
+        let memory = last.0.get(script);
         let store = pet.store(bar.spells.pet_guid);
         let family = family_for(store, &names, family_tables.as_deref());
         let fresh = stats_for(store, self_store.iter().next(), tables.as_deref(), family);
+        // `UNIT_HAPPINESS`, the pet frame's icon repaint (`PetFrame.lua:63`), is the pet's
+        // happiness field's watch: it fires for a change on the pet the feed last saw, never for a
+        // VM's first push, a pet's arrival or the bar's return. Deviation: fired when the bucket
+        // or its two tooltip figures change, not on every change of the happiness field as in the
+        // reference, because no stock consumer reads the raw value.
+        let now = store.map(|_| (bar.spells.pet_guid, happiness(&fresh.1)));
+        let happiness_moved = matches!(
+            (memory.happiness, now),
+            (Some((was_pet, was)), Some((pet, is))) if was_pet == pet && was != is
+        );
+        if now.is_some() {
+            memory.happiness = now;
+        }
+        let last = &mut memory.pushed;
         if last.as_ref() == Some(&fresh) {
             return;
         }
-        // `UNIT_HAPPINESS`, the pet frame's icon repaint (`PetFrame.lua:63`). Deviation: fired when
-        // the bucket or its two tooltip figures change, not on every change of the happiness field
-        // as in the reference, because no stock consumer reads the raw value.
-        let happiness_moved = last.as_ref().map(|(_, s)| {
-            (
-                s.happiness,
-                s.damage_percentage.to_bits(),
-                s.loyalty_rate.to_bits(),
-            )
-        }) != Some((
-            fresh.1.happiness,
-            fresh.1.damage_percentage.to_bits(),
-            fresh.1.loyalty_rate.to_bits(),
-        ));
         if happiness_moved {
             debug!(
                 "ui_pet_stats: happiness {:?} ({}% damage), loyalty {:?}",
@@ -224,7 +249,6 @@ pub(crate) fn feed_pet_stats(
 mod tests {
     use super::*;
     use benilla_protocol::ObjectFields;
-    use benilla_ui::script::UiScript;
 
     const BYTES_0: u16 = 36;
     const BYTES_1: u16 = 138;
@@ -534,73 +558,16 @@ mod tests {
         assert!(s.food_types.is_empty());
     }
 
-    /// `UNIT_PET` must reach Lua with `HasPetUI()` already answering, as `PetTab_Update` reads it;
-    /// only a real schedule orders the feeds, so this runs one `app.update()` on a cold pet.
+    /// `UNIT_PET` must reach Lua with `HasPetUI()` already answering, as `PetTab_Update` reads it:
+    /// the bar's signal (`0x4bc84f`) waits on the notice lane, which fires once every feed has
+    /// pushed, this snapshot's included.
     #[test]
     fn unit_pet_reaches_lua_with_has_pet_ui_already_true() {
-        use crate::client_state::ClientState;
-        use crate::net::GuidIndex;
-        use crate::ui_pet::UiPetPlugin;
-
-        const PET_GUID: u64 = 0xf140_0000_0000_002a;
-
-        let (tx, _rx) = crossbeam_channel::unbounded();
-        let mut app = App::new();
-        app.add_plugins((MinimalPlugins, bevy::state::app::StatesPlugin))
-            .insert_state(ClientState::InWorld)
-            .init_resource::<NameCache>()
-            .init_resource::<GuidIndex>()
-            .init_resource::<crate::target::Selection>()
-            .init_resource::<crate::net::SelfGuid>()
-            .init_resource::<crate::ui_script::UiClock>()
-            .init_resource::<crate::ui_action::UiErrorKeys>()
-            .init_resource::<crate::net::Reputations>()
-            .init_resource::<crate::spell::QueuedMeleeSpell>()
-            .init_resource::<crate::spell::AutoRepeatActive>()
-            .init_resource::<crate::creature_anim::UnitEdits>()
-            .add_message::<crate::player::StandStateRequest>()
-            .init_resource::<crate::ui_loot::LootState>()
-            .init_resource::<crate::ui_loot::LootLatch>()
-            .add_message::<crate::creature_anim::SheathRequest>()
-            .add_message::<crate::net::FieldChanged>()
-            .insert_resource(crate::net::NetCommands(tx))
-            .add_plugins((UiPetStatsPlugin, UiPetPlugin));
-
-        // The pet is in the world when the bar's guid lands: a cold summon.
-        let pet = app.world_mut().spawn(boar()).id();
-        app.world_mut()
-            .resource_mut::<GuidIndex>()
-            .0
-            .insert(PET_GUID, pet);
-        app.world_mut().resource_mut::<PetBar>().spells.pet_guid = PET_GUID;
-
-        // A frame standing in for the pet page records what `HasPetUI()` answers at dispatch.
-        let script = UiScript::new().unwrap();
-        script
-            .run(
-                r#"
-                BENILLA_SAW = "never fired"
-                local f = CreateFrame("Frame")
-                f:RegisterEvent("UNIT_PET")
-                f:SetScript("OnEvent", function()
-                    BENILLA_SAW = HasPetUI() and "has pet UI" or "no pet UI"
-                end)
-                "#,
-            )
-            .unwrap();
-        app.insert_non_send_resource(script);
-
-        app.update();
-
-        let saw: String = app
-            .world_mut()
-            .non_send_resource::<UiScript>()
-            .eval("return BENILLA_SAW")
-            .unwrap();
-        assert_eq!(
-            saw, "has pet UI",
-            "UNIT_PET must not reach Lua ahead of the snapshot its handlers read — unordered, \
-             this answered \"no pet UI\" and the Pet tab stayed down for the session"
-        );
+        let mut app = crate::game_plugins::schedule_tests::headless_client();
+        assert!(crate::test_support::runs_before(
+            &mut app,
+            feed_pet_stats,
+            crate::lanes::fire_in_order
+        ));
     }
 }

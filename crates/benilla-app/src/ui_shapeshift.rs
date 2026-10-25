@@ -130,25 +130,30 @@ impl Plugin for UiShapeshiftPlugin {
 /// Build the bar from the known spells and the catalog (module doc), and diff-push it.
 #[allow(clippy::type_complexity)] // a Bevy system's full input set
 fn feed_shapeshift_bar(
-    mut vm: crate::script_calls::VmWith<(Res<'static, Cooldowns>, Res<'static, Selection>)>,
+    mut vm: crate::script_calls::VmWith<(
+        Res<'static, Cooldowns>,
+        Res<'static, Selection>,
+        crate::target::RelationWorld<'static, 'static>,
+    )>,
     actions: Res<PlayerActions>,
     spells: Option<Res<Spells>>,
     self_q: Query<&ObjectStore, With<SelfPlayer>>,
     // The selection's guid index, and the bag walk behind each form's reagent leg.
     objects: Objects,
     units: Query<&ObjectStore, Without<SelfPlayer>>,
-    relations: crate::target::RelationWorld,
     items: Res<Items>,
     clock: Res<crate::ui_script::UiClock>,
     spell_mods: Res<crate::spell::SpellModifiers>,
     own_control: Option<Res<crate::player::OwnControlLost>>,
     // The skill lines the walk's cost finds its level through.
     skill_lines: Option<Res<crate::ui_spellbook::SkillLines>>,
+    // `ItemSubClass.dbc`, whose flags the walk's ammo leg reads.
+    sub_classes: Option<Res<crate::ui_items::ItemSubClasses>>,
     mut memory: Local<crate::ui_script::VmMemo<StanceMemory>>,
 ) {
     // The forms, read off the host's cooldowns and selection; their push signals, so it runs
     // with the host lent.
-    let Some((fresh, form_byte)) = vm.turn(|script, (cooldowns, selection)| {
+    let Some((fresh, form_byte)) = vm.turn(|script, (cooldowns, selection, relations)| {
         // No VM, no bar.
         script?;
         let spells = spells?;
@@ -205,6 +210,7 @@ fn feed_shapeshift_bar(
                             spell_mods: &spell_mods,
                             control_lost: own_control.as_ref().is_some_and(|c| c.0),
                             skill_lines: skill_lines.as_deref().map(|s| &s.catalog),
+                            sub_classes: sub_classes.as_deref().map(|s| &s.0),
                         };
                         usable::spell_usable(id, d, &spells, &ctx, &objects, &items).0
                     });

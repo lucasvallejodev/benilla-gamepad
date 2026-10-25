@@ -95,7 +95,7 @@ fn viewer(model: &Model, u: &UnitState) -> Option<Viewer> {
     if me == 0 {
         return None;
     }
-    let player = model.unit("player");
+    let player = model.snapshot_unit("player");
     let rel = model.unit_relations.as_deref();
     let ask = |f: &dyn Fn(&dyn super::UnitRelations) -> Option<bool>| {
         u.has_object && rel.and_then(f).unwrap_or(false)
@@ -133,6 +133,9 @@ pub enum TooltipTint {
     /// The skill-difficulty ramp `0x529fa0` of a known opener's value against the requirement:
     /// a skill-opened "Locked" line (`0x52ab31`) and `LOCKED_WITH_SPELL_KNOWN` (`0x52abd8`).
     Skill { required: i32, value: i32 },
+    /// `0xc0d3e8` = `0xffffd200`, the name line's gold: a type handler's lines, which
+    /// `0x530380` adds with that colour on both cells (`0x53038d`, `0x530392`).
+    Gold,
 }
 
 /// `CreatureType.dbc` id 10, "Not specified".
@@ -224,9 +227,8 @@ fn render_unit(lua: &Lua, this: &Table, token: &str) -> mlua::Result<bool> {
     // A unit is its object, found by guid (`0x52a021`); guid 0 finds none.
     let (unit, viewer, player_level, skinning, me) = {
         let model = lua.app_data_mut::<Model>().expect("model app_data");
-        let unit = model
-            .unit(token)
-            .cloned()
+        let unit = crate::script::unit::view(lua, &model, token)
+            .map(std::borrow::Cow::into_owned)
             .filter(|u| u.exists && u.guid != 0);
         // The group record by guid, for every unit shown (`0x52a02b`): its member row's.
         let unit = unit.map(|mut u| {
@@ -489,7 +491,7 @@ impl super::UiScript {
     }
 
     /// Show the world-mouseover GameObject tooltip (builder `0x52aa20`): the backdrop tinted, the
-    /// name in gold, then the caller's lock lines. The anchor forks on the object's
+    /// name in gold, then the caller's handler and lock lines. The anchor forks on the object's
     /// `[vtbl+0x5c]`: true (`0x492a01`) owns it by `UIParent` in mode 6, `ANCHOR_CURSOR`
     /// (`0x52ffe0(UIParent, 6, 0, 0)` at `0x492a1e`), which the tooltip's own update then keeps on
     /// the cursor; false (`0x492a42`) fires `OnTooltipSetDefaultAnchor` for the default corner, as
@@ -517,6 +519,7 @@ impl super::UiScript {
                     TooltipTint::Skill { required, value } => {
                         super::tooltip_item::names::skill_color(required, value)
                     }
+                    TooltipTint::Gold => GOLD,
                 };
                 append_line(lua, this, (text.clone(), colour), None, false)?;
             }
@@ -572,13 +575,13 @@ impl super::UiScript {
         true
     }
 
-    /// Show the minimap blip tooltip (an `AreaPOI` or quest-dot name), from `Minimap`'s own hover
-    /// probe `0x4eb0c0`: owned by `Minimap` itself (`0x4eb19c` keeps `this + 0x24`, pushed at
-    /// `0x4eb57d`) in mode 6, `ANCHOR_CURSOR` (`0x4eb587`), so the tooltip's own update keeps it on
-    /// the cursor; one gold line, faint gold for a cross-interior dot; then the show
-    /// (`0x4eb85f`/`0x4eb869`). The blip is held until the probe finds none
+    /// Show the minimap blip tooltip, from `Minimap`'s own hover probe `0x4eb0c0`: owned by
+    /// `Minimap` itself (`0x4eb19c` keeps `this + 0x24`, pushed at `0x4eb57d`) in mode 6,
+    /// `ANCHOR_CURSOR` (`0x4eb587`), so the tooltip's own update keeps it on the cursor; `text`, the
+    /// names of everything under the cursor joined by `\n`, as one gold line (`0x530380`); then the
+    /// show (`0x4eb85f`/`0x4eb869`). The text is held until the probe finds nothing
     /// ([`Self::minimap_blip_lost`]) or misses the Minimap.
-    pub fn minimap_tooltip(&mut self, text: &str, grey: bool) -> bool {
+    pub fn minimap_tooltip(&mut self, text: &str) -> bool {
         let (h, id, root) = {
             let mut model = self.model_mut();
             let Some(h) = model.arena.lookup("GameTooltip") else {
@@ -597,14 +600,7 @@ impl super::UiScript {
             }
         };
         set_owner_core(&self.lua, h, Some(root), TooltipAnchor::Cursor, 0.0, 0.0);
-        // A cross-interior entry's `|cffb0b0b0` wrap modulates the gold: faint gold, not grey.
-        let dim = 0xb0 as f32 / 255.0;
-        let color = if grey {
-            [GOLD[0] * dim, GOLD[1] * dim, GOLD[2] * dim, 1.0]
-        } else {
-            GOLD
-        };
-        if let Err(e) = append_line(&self.lua, &wrapper, (text.to_string(), color), None, false) {
+        if let Err(e) = append_line(&self.lua, &wrapper, (text.to_string(), GOLD), None, false) {
             self.push_error(e);
             return false;
         }

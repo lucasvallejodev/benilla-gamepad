@@ -129,7 +129,6 @@ impl Plugin for CombatLogPlugin {
             .net_handler(K::EnvironmentalDamageLog, on_environmental_damage_log)
             .net_handler(K::XpGain, on_xp_gain)
             .net_handler(K::ExplorationXp, on_exploration_xp)
-            .net_handler(K::LevelUp, on_level_up)
             .net_handler(K::PvpCredit, on_pvp_credit)
             // Written by the missile flight; declared here too, as registering is idempotent.
             .add_message::<MissileMiss>()
@@ -446,12 +445,6 @@ fn on_exploration_xp(
     }
 }
 
-fn on_level_up(In(ev): In<SessionEvent>, l: Sinks) {
-    if let SessionEvent::LevelUp(lv) = ev {
-        text::level_up(lv, &l.log);
-    }
-}
-
 /// An honor credit (`0x625270`): the combat-log line, which raises the `HONOR_GAINED` word once
 /// written. The packet's handler writes nothing unless the client holds the active player
 /// (`0x48f703`, type mask `0x10`; `0x48f708`). A kill needs its victim held as a unit (`0x62529f`,
@@ -663,6 +656,8 @@ mod tests {
             }],
             target: Some(ME),
             go_target: None,
+            target_mask: 0x2,
+            source: None,
             dest: None,
             ammo_display_id: None,
             item_caster: None,
@@ -704,6 +699,8 @@ mod tests {
             }],
             target: Some(ME),
             go_target: None,
+            target_mask: 0x2,
+            source: None,
             dest: None,
             ammo_display_id: None,
             item_caster: (item || (second != 0 && first != second)).then_some(first),
@@ -929,6 +926,7 @@ mod tests {
             .add_message::<crate::swing_refusal::SwingRefusalEdge>()
             .init_resource::<crate::creature_anim::PendingImpacts>()
             .init_resource::<crate::creature_anim::PlaySeq>()
+            .init_resource::<crate::creature_anim::AttackStopInFlight>()
             .add_plugins(CombatLogPlugin);
         crate::creature_anim::net::register(&mut app);
         app
@@ -984,5 +982,102 @@ mod tests {
             kinds(&app),
             ["combat", "unit combat", "combat", "unit combat"]
         );
+    }
+
+    /// The swing's log step triggers Spells and Abilities for a swing of the active player's
+    /// whose victim state is 1, a hit (`0x629b1a`-`0x629b37`), on the state the record read
+    /// left; a dodge, or a hit on us, triggers nothing.
+    #[test]
+    fn our_own_landed_swing_triggers_spells_and_abilities() {
+        let swing = |attacker: u64, victim: u64, victim_state: u32| {
+            SessionEvent::AttackerState(benilla_protocol::messages::AttackerState {
+                attacker,
+                victim,
+                hit_info: 0x2,
+                damage: 30,
+                victim_state,
+                absorb: 0,
+                resist: 0,
+                blocked: 0,
+                melee_spell_id: 0,
+                school: 0,
+            })
+        };
+        let mut app = swing_world(&[ME, MOB]);
+        app.init_resource::<crate::tutorial::Tutorials>();
+        app.world()
+            .resource::<crate::tutorial::Tutorials>()
+            .lock()
+            .apply_flags(&[0u8; 32]);
+        let fired = |app: &mut App, ev: SessionEvent| {
+            crate::net::handlers::dispatch(app.world_mut(), vec![ev]);
+            app.world()
+                .resource::<crate::tutorial::Tutorials>()
+                .take_fired()
+        };
+        assert!(fired(&mut app, swing(ME, MOB, 2)).is_empty(), "a dodge");
+        assert!(fired(&mut app, swing(MOB, ME, 1)).is_empty(), "a hit on us");
+        assert_eq!(fired(&mut app, swing(ME, MOB, 1)), [0x06], "our hit");
+    }
+
+    /// `HandleUnitCombatMessage` signals `PLAYER_ENTER_COMBAT` inside our `SMSG_ATTACKSTART`
+    /// (`0x6256ff`) and `PLAYER_LEAVE_COMBAT` inside our `SMSG_ATTACKSTOP`, after its swing flush
+    /// (`0x625763` → `0x624e40`, then `0x625778`), each gated on the attacker being the active
+    /// player (`0x5fa6d0`): a start and a stop in one drain both signal, at their place among the
+    /// swing's line and its flushed feedback, and another unit's attack signals neither.
+    #[test]
+    fn our_attack_start_and_stop_signal_combat_at_their_packets() {
+        let me_hits_mob = SessionEvent::AttackerState(benilla_protocol::messages::AttackerState {
+            attacker: ME,
+            victim: MOB,
+            hit_info: 0x2,
+            damage: 30,
+            victim_state: 1,
+            absorb: 0,
+            resist: 0,
+            blocked: 0,
+            melee_spell_id: 0,
+            school: 0,
+        });
+        let mut app = swing_world(&[ME, MOB]);
+        crate::net::handlers::dispatch(
+            app.world_mut(),
+            vec![
+                SessionEvent::AttackStart {
+                    attacker: ME,
+                    victim: MOB,
+                },
+                me_hits_mob,
+                SessionEvent::AttackStop {
+                    attacker: ME,
+                    victim: MOB,
+                },
+            ],
+        );
+        assert_eq!(
+            kinds(&app),
+            [
+                "PLAYER_ENTER_COMBAT",
+                "combat",
+                "unit combat",
+                "PLAYER_LEAVE_COMBAT"
+            ]
+        );
+
+        let mut app = swing_world(&[ME, MOB]);
+        crate::net::handlers::dispatch(
+            app.world_mut(),
+            vec![
+                SessionEvent::AttackStart {
+                    attacker: MOB,
+                    victim: ME,
+                },
+                SessionEvent::AttackStop {
+                    attacker: MOB,
+                    victim: ME,
+                },
+            ],
+        );
+        assert!(kinds(&app).is_empty(), "{:?}", kinds(&app));
     }
 }

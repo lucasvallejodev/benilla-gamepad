@@ -343,7 +343,10 @@ impl AutoMove<'_, '_> {
             pitch: None,
         });
         if !standing {
-            stand.write(super::StandStateRequest { state: 0 });
+            stand.write(super::StandStateRequest {
+                state: 0,
+                sent: false,
+            });
         }
         Ok(())
     }
@@ -825,6 +828,8 @@ mod tests {
         app.world_mut()
             .resource_mut::<ButtonInput<MouseButton>>()
             .press(MouseButton::Forward);
+        // Autorun's on press, which the command press toggled ahead of this (`super::press`).
+        app.world_mut().resource_mut::<Player>().autorun = true;
         frame(&mut app, true);
         let approach = app.world().resource::<Approach>();
         assert!(!approach.active() && approach.arrived.is_none());
@@ -956,6 +961,7 @@ mod tests {
             guid: 0xB0A7,
             local_pos: Vec3::ZERO,
             boat_yaw: 0.0,
+            placed: true,
         });
         let point = Vec3::new(0.0, 0.0, -10.0);
         assert!(app
@@ -1040,6 +1046,7 @@ mod tests {
             guid: 0xB0A7,
             local_pos: Vec3::ZERO,
             boat_yaw: 0.0,
+            placed: true,
         });
         let point = Vec3::new(0.0, 0.0, -10.0);
         assert!(app

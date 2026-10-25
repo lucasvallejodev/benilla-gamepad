@@ -7,7 +7,7 @@
 
 use bevy::prelude::*;
 
-use benilla_ui::script::{ActionSlot, ScriptValue, UiScript, UnitState};
+use benilla_ui::script::{ActionSlot, ScriptValue, UnitState};
 
 use crate::ui_unit::UnitFeed;
 use benilla_world::schedule::WorldStage;
@@ -24,10 +24,15 @@ pub(crate) mod glue_create;
 pub(crate) mod glue_mgr;
 pub(crate) mod glue_scene;
 mod input;
+mod movie;
+mod records;
 /// The server alert's fetch and `LaunchURL`'s browser, for the stock glue screens.
 pub(crate) mod server_alert;
 #[cfg(test)]
 pub(crate) use input::feed_keys;
+#[cfg(test)]
+pub(crate) use records::records_from_planes;
+pub(crate) use records::{collect_input_records, InputRecord, InputRecords, Record};
 // Test-only: the bindings tests run the UI's wheel sweep ahead of the dispatch pass.
 #[cfg(test)]
 pub(crate) use input::feed_wheel;
@@ -149,6 +154,24 @@ pub(crate) struct PlayerUiClickConsumed(pub(crate) bool);
 #[derive(Resource, Default)]
 pub(crate) struct PlayerUiPressConsumed(pub(crate) bool);
 
+/// Who this frame's button presses went to, as the records dispatched them: `(button, over_ui)`
+/// per press, `over_ui` when a frame was hovered, the interface consumed it or the dev overlay held
+/// the pointer. The world frame's binding and the world's mouse latch both read it, so they agree
+/// on who owns a press; a button no record pressed this frame is absent.
+#[derive(Resource, Default)]
+pub(crate) struct WorldPresses(pub(crate) Vec<(MouseButton, bool)>);
+
+impl WorldPresses {
+    /// Whether the frame's last press of `button` was the interface's, `None` with no press.
+    pub(crate) fn over_ui(&self, button: MouseButton) -> Option<bool> {
+        self.0
+            .iter()
+            .rev()
+            .find(|(b, _)| *b == button)
+            .map(|(_, over)| *over)
+    }
+}
+
 /// Whether the cursor carries a payload, a `Send` mirror. A click on sky with one held never
 /// deselects: the reference gates its nothing-leg `SetSelection(0,0)` on no payload (`0x492d30`).
 #[derive(Resource, Default)]
@@ -171,15 +194,17 @@ pub(crate) struct UiPassState {
     pub(crate) derives_before: u64,
 }
 
-/// The player-UI feed phase, after [`WorldStage::Net`] and ungated (`UnitFeed` is the gated
-/// sub-phase): every push this frame's tick must see, as in the reference's frame, where packet
-/// dispatch precedes every `FrameScript_SignalEvent` and both precede `OnUpdate`. Every VM holder
-/// in `Update` is in this set or `.after(UiInput)`, as `game_plugins::schedule_tests` checks.
+/// The player-UI feed phase, after the input pass and [`WorldStage::Net`] and ungated (`UnitFeed`
+/// is the gated sub-phase): every push this frame's tick must see, as in the reference's tick,
+/// where the packets (category 6, `0x420d55`) follow the window input and precede the frame pass's
+/// `OnUpdate`. Every VM holder in `Update` is in the frame's input records ([`UiInput`],
+/// [`crate::player::WorldMouse`], [`crate::target::WorldClicks`]), in this set or
+/// `.after(UiTick)`, as `game_plugins::schedule_tests` checks.
 #[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct UiFeed;
 
 /// The drains of what the pass's Lua asked for (a send, a window's verb, a save, a sound), after
-/// the input pass and after every later host they are free to follow: the reference applies each
+/// the tick and after every later host they are free to follow: the reference applies each
 /// inside its call, so an ask is drained the frame it is made, wherever in the pass its Lua ran.
 #[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct UiDrain;
@@ -188,10 +213,26 @@ pub(crate) struct UiDrain;
 #[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct UiPaint;
 
-/// The player-UI input pass (tick, hit-test, handlers), before [`WorldStage::Input`] so its
-/// [`PlayerUiHover`] reaches `PointerOverUi` before `player::control` reads it.
+/// The player-UI input pass: the frame's window input records ([`InputRecords`]), each whole
+/// through the interface's walk and the world frame's binding before the next, which the reference
+/// runs ahead of its packets (`0x423920` at `0x420d23`), so ahead of the net drain
+/// ([`WorldStage::Net`]) and [`UiFeed`]: a handler and the calls it makes read the world as the
+/// last frame left it. First of the frame's input records, so its [`PlayerUiHover`] reaches
+/// `PointerOverUi` before the world's mouse reads it.
 #[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct UiInput;
+
+/// The VM's views the input records read pushed ahead of them, at the head of [`UiInput`]: what an
+/// engine writer outside the calls moved after the last frame's feeds (the targeting cursor's
+/// word).
+#[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct UiInputViews;
+
+/// The tick: the `OnUpdate` walk of the frame pass (category 0x11 at `0x420d6a`, `0x764330` →
+/// `0x765650`), after the input pass and the feeds, so a handler reads this frame's input and
+/// packets applied.
+#[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct UiTick;
 
 /// The frame's atomic (`Instant`, `GetTime`) pair, the one base for mapping a store `Instant` onto
 /// `GetTime`: `anchor`'s steps are the VM clock's deltas, so a mapped start is stable frame to
@@ -230,9 +271,9 @@ pub(crate) fn run_or_warn(script: &benilla_ui::script::UiScript, chunk: &str) {
 }
 
 /// The reference's `uiScale` CVar, which the VM makes `UIParent`'s own scale
-/// ([`UiScript::set_ui_scale`]): the screen root stays 768 units tall, so `uiScale = 768/screenH`
-/// is pixel-perfect inside `UIParent`, and a frame outside it is not scaled. Tests pin the
-/// `Default` 1.0.
+/// ([`benilla_ui::script::UiScript::set_ui_scale`]): the screen root stays 768 units tall, so
+/// `uiScale = 768/screenH` is pixel-perfect inside `UIParent`, and a frame outside it is not
+/// scaled. Tests pin the `Default` 1.0.
 #[derive(Resource)]
 pub(crate) struct UiScaleCvar(pub(crate) f32);
 
@@ -276,6 +317,12 @@ pub(crate) fn seam_scale(window_h: f32) -> f32 {
     }
 }
 
+/// [`window_to_ui`]'s inverse: a point in the VM's root units as a window cursor.
+pub(crate) fn ui_to_window(window_h: f32, at: Vec2) -> Vec2 {
+    let s = seam_scale(window_h);
+    Vec2::new(at.x * s, window_h - at.y * s)
+}
+
 /// A window cursor (logical px, y-down from the top left) in the VM's root units, y up: what the
 /// pointer feed hands the engine and `GetCursorPosition` answers (`0x48b820`, no scale divided out).
 pub(crate) fn window_to_ui(window_h: f32, cursor: Vec2) -> Vec2 {
@@ -298,12 +345,13 @@ pub(crate) fn on_cvar(ev: On<crate::cvars::CvarChanged>, mut scale: ResMut<UiSca
 /// `/reload` queue, which the world alone honours. It prints nothing in any state: the handler
 /// sets the flag `[0xb41d8c]` and calls `CGGameUI::Reload` (`0x491380`), neither of which writes
 /// a line, so a run with no interface to reload is silent too.
-fn console_reload_ui(world: &mut World, _args: &str) -> Vec<String> {
-    if let Some(mut rebuild) = world.get_resource_mut::<glue::GlueRebuild>() {
+fn console_reload_ui(steps: &mut crate::console::ConsoleSteps, _args: &str) -> Vec<String> {
+    if let Some(rebuild) = steps.glue_rebuild.as_deref_mut() {
         rebuild.request();
     }
-    if let Some(mut script) = world.get_non_send_resource_mut::<UiScript>() {
-        script.queue_session_request(benilla_ui::script::SessionRequest::ReloadUi);
+    // `CGGameUI::Reload`'s flag `0xb4b3f4`, which the session's `ReloadUI()` sets too.
+    if let Some(reload) = steps.reload.as_deref_mut() {
+        reload.0 = true;
     }
     Vec::new()
 }
@@ -313,7 +361,7 @@ impl Plugin for UiScriptPlugin {
         use crate::console::ConsoleCommandApp;
         app.add_observer(on_cvar);
         // Category 1 with no help (`0x402ba6`-`0x402bb4`).
-        app.console_command(
+        app.console_command_in_call(
             "reloadUI",
             crate::console::GRAPHICS,
             None,
@@ -341,6 +389,7 @@ impl Plugin for UiScriptPlugin {
             .init_resource::<UiKeyboardCapture>()
             .init_resource::<PlayerUiClickConsumed>()
             .init_resource::<PlayerUiPressConsumed>()
+            .init_resource::<WorldPresses>()
             .init_resource::<CursorPayloadHeld>()
             .init_resource::<UiClock>()
             .init_resource::<benilla_world::frame_pace::FrameStep>()
@@ -349,9 +398,11 @@ impl Plugin for UiScriptPlugin {
             .add_systems(
                 Startup,
                 // After the CVars load: the glue screens read the agreements as they come up. After
-                // the glyph cache, which measures the text their first show sizes frames by.
+                // the glyph cache, which measures the text their first show sizes frames by. After
+                // the word lists, which every VM is seated with as it is made.
                 setup_script
                     .after(benilla_assets::AssetSet::Open)
+                    .after(crate::text_filter::TextFilterLoad)
                     .after(crate::cvars::CvarLoad)
                     .after(crate::ui_text::FontAtlasInit),
             )
@@ -361,10 +412,18 @@ impl Plugin for UiScriptPlugin {
                 OnEnter(crate::client_state::ClientState::InWorld),
                 lifecycle::arm_entry_ui_load,
             )
-            // The shutdown tail: events, then writes, in the reference's order.
+            // The shutdown tail: events, then writes, in the reference's order; the clears of what
+            // the dying state shows after its `PLAYER_LOGOUT`, then the glue VM.
+            .configure_sets(
+                OnExit(crate::client_state::ClientState::InWorld),
+                (SessionEnd::Shutdown, SessionEnd::Clears, SessionEnd::Glue).chain(),
+            )
             .add_systems(
                 OnExit(crate::client_state::ClientState::InWorld),
-                end_ui_session,
+                (
+                    lifecycle::shut_down_session.in_set(SessionEnd::Shutdown),
+                    lifecycle::install_session_glue.in_set(SessionEnd::Glue),
+                ),
             )
             // `init_` here and in `UiUnitPlugin`: either plugin may be built alone in a test.
             .init_world_leave_sweep()
@@ -378,29 +437,37 @@ impl Plugin for UiScriptPlugin {
                 PreUpdate,
                 (
                     run_pending_reload,
-                    // The glue's `ConsoleExec` lines the last frame left and its top's size
-                    // callback, then the rebuild either asked for.
-                    (glue::drain_glue_console, glue::watch_glue_aspect)
-                        .chain()
+                    // The glue top's size callback, then the rebuild it or a `reloadUI` asked
+                    // for. The callback reads the `gxResolution` the screen shows this frame.
+                    glue::watch_glue_aspect
+                        .after(crate::video::show_screen_size)
                         .run_if(glue::glue_ui_up),
                     glue::run_pending_glue_rebuild,
                     lifecycle::run_pending_entry_load,
                 )
                     .chain(),
             )
-            // The UI phases in order: feeds after the net drain, the tick and the input pass, then
-            // the paint; the drains of what the Lua asked after the input pass, and after every
-            // later host the VM pass can put them behind, before the paint (`crate::vm_pass`).
+            // The UI phases in the reference's tick order (`core/loop`, "What one tick runs"): the
+            // window input records (`0x423920` at `0x420d23`) ahead of the net drain, then the
+            // feeds of the packets it applied (category 6, `0x420d55`), then the tick, the frame
+            // pass's `OnUpdate` walk (category 0x11, `0x420d6a`), and the paint; the drains of
+            // what the Lua asked after the tick, and after every later host the VM pass can put
+            // them behind, before the paint (`crate::vm_pass`).
             .configure_sets(
                 Update,
                 (
+                    UiInput.before(WorldStage::Net),
                     UiFeed.after(WorldStage::Net),
-                    UiInput.before(WorldStage::Input),
+                    UiTick.before(WorldStage::Input),
                     UiPaint,
                 )
                     .chain(),
             )
-            .configure_sets(Update, UiDrain.after(UiInput))
+            .configure_sets(Update, UiDrain.after(UiTick))
+            .configure_sets(
+                Update,
+                UiInputViews.in_set(UiInput).before(input::feed_ui_input),
+            )
             // `GetFramerate()`'s ring, a static of the client's that no reload or logout
             // resets: the feed hands a new VM its rate before the tick, and each world frame's
             // step joins the ring after its paint, standing for `CGWorldFrame::OnRender`
@@ -414,29 +481,75 @@ impl Plugin for UiScriptPlugin {
                     .after(WorldStage::Present)
                     .run_if(in_state(crate::client_state::ClientState::InWorld)),
             )
-            // The input pass hit-tests the rects the tick just resolved, and runs in-world only or
-            // on the stock glue screens.
+            // The input pass hit-tests the rects the last frame's paint resolved, as the reference's
+            // records meet the rects its last frame pass drained (`0x7656ba`, `0x765799`), and runs
+            // in-world only or on the stock glue screens.
             .init_resource::<UiPassState>()
+            // The frame's window input records, read first, ungated, so no frame dispatches a
+            // stale one.
+            .init_resource::<InputRecords>()
+            .add_message::<bevy::window::WindowEvent>()
+            .add_systems(
+                Update,
+                collect_input_records
+                    .in_set(UiInput)
+                    .before(UiInputViews)
+                    .before(crate::bindings::BindingHead),
+            )
+            // In `Last`, after a look session's end has put the cursor back, so the next frame's
+            // records start from where the pointer is.
+            .add_systems(Last, records::note_frame_end_cursor)
             .add_systems(
                 Update,
                 (
-                    extract::tick_script,
                     input::feed_ui_input.run_if(
                         in_state(crate::client_state::ClientState::InWorld).or(glue::glue_ui_up),
                     ),
                     input::feed_ui_wheel.run_if(
                         in_state(crate::client_state::ClientState::InWorld).or(glue::glue_ui_up),
                     ),
-                    // Off the walk that just ran, for the pick and the arbiter after the pass.
-                    crate::vplates::seed_plate_hover,
                 )
                     .chain()
                     .in_set(UiInput)
-                    // So a key a focused box consumed never also fires a binding.
-                    .before(crate::bindings::BindingSet),
+                    // Each record's binding runs inside its walk, between the pass's head and tail.
+                    .after(crate::bindings::BindingHead)
+                    .before(crate::bindings::BindingTail),
+            )
+            .add_systems(
+                Update,
+                (
+                    extract::tick_script,
+                    // After the input pass's hover walk and the pump's leaves and re-pick, for the
+                    // pick after the pass.
+                    crate::vplates::seed_plate_hover,
+                )
+                    .chain()
+                    .in_set(UiTick),
             )
             // After the plate driver seats this frame's nameplates, and before the append lane
             // fills the widget slot this pass parks.
+            // A scripted run's startup movie skipped before its first tick.
+            .add_systems(Update, glue::skip_unattended_startup_movie.in_set(UiInput))
+            // The movie audio's play times, a feed of the tick whose clock reads them.
+            // After the tutorial's selection judge, which reads the same VM.
+            .add_systems(
+                Update,
+                movie::feed_movie_audio
+                    .in_set(UiFeed)
+                    .after(crate::tutorial::judge_selections),
+            )
+            // The movie pictures the tick showed, ahead of the paint that draws them.
+            .init_resource::<movie::MovieScreen>()
+            .add_systems(
+                Update,
+                // After the frame's window and present modes apply, so the aspect is the
+                // window's this frame.
+                movie::upload_movie_pictures
+                    .in_set(UiPaint)
+                    .after(crate::video::apply_present_mode)
+                    .after(crate::video::apply_window_mode)
+                    .before(extract::paint_script),
+            )
             .add_systems(
                 Update,
                 extract::paint_script
@@ -444,12 +557,14 @@ impl Plugin for UiScriptPlugin {
                     .after(crate::vplates::VPlateSet)
                     .before(crate::ui_pass::UiQuadAppend),
             )
-            // After the hover is known and before gameplay reads `PointerOverUi`.
+            // After the hover is known and before gameplay reads `PointerOverUi`: the world's
+            // mouse among the input records, so a press the cursor brings onto a frame is the
+            // frame's alone.
             .add_systems(
                 Update,
                 arbitrate_pointer_over_ui
                     .after(UiInput)
-                    .before(WorldStage::Input),
+                    .before(crate::player::WorldMouse),
             )
             .add_message::<server_alert::LaunchUrl>()
             .add_message::<server_alert::LaunchAddonUrl>()
@@ -482,11 +597,12 @@ impl Plugin for UiScriptPlugin {
     }
 }
 
-/// The mouse and key feed once, for a test over the whole client: the input pass's Lua, with the
-/// call host the world lends.
+/// The mouse and key feed once, for a test over the whole client: the input pass's Lua over the
+/// records the test's planes and key messages make, with the call host the world lends.
 #[cfg(test)]
 pub(crate) fn feed_input_once(world: &mut World) {
     use bevy::ecs::system::RunSystemOnce;
+    records_from_planes(world);
     world
         .run_system_once(input::feed_ui_input)
         .expect("the input feeds");
@@ -521,8 +637,8 @@ fn arbitrate_pointer_over_ui(
 /// The session lifecycle: the VM's birth, identity, death and reload.
 mod lifecycle;
 pub(crate) use lifecycle::{
-    end_ui_session, ingame_ui_up, run_pending_reload, setup_script, strings_vm, AddOnIdentity,
-    PendingEntryUiLoad, ReloadUiPending,
+    ingame_ui_up, run_pending_reload, setup_script, strings_vm, AddOnIdentity, PendingEntryUiLoad,
+    ReloadUiPending, SessionEnd,
 };
 /// The leave-world sweep `0x490a80`: its latch, its schedule and its legs' order.
 mod sweep;
@@ -541,7 +657,7 @@ pub(crate) use lifecycle::load_ingame_ui_on_world_entry;
 use lifecycle::shutdown_on_exit;
 #[cfg(test)]
 pub(crate) use lifecycle::{
-    finish_ui_load, is_emote_token_line, seat_from_roster, shutdown_ui_state,
+    end_ui_session, finish_ui_load, is_emote_token_line, seat_from_roster, shutdown_ui_state,
 };
 
 /// The 30 world-frame times `GetFramerate()` averages (`0xc631c8`).
@@ -838,6 +954,19 @@ mod cinematic_tests;
 mod glue_input_tests;
 #[cfg(test)]
 mod key_walk_tests;
+#[cfg(test)]
+mod record_order_tests;
+#[cfg(test)]
+mod tick_order_tests;
+
+/// Whether `Update` declares `system` before the tick, the frame pass's `OnUpdate` walk.
+#[cfg(test)]
+pub(crate) fn tick_runs_after<M>(
+    app: &mut App,
+    system: impl bevy::ecs::system::IntoSystem<(), (), M>,
+) -> bool {
+    crate::test_support::runs_before(app, system, extract::tick_script)
+}
 
 #[cfg(test)]
 mod cast_tests;

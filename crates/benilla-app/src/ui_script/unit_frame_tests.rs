@@ -37,6 +37,9 @@ fn load_unit_frames_with(s: &UiScript, extra: &[&str]) {
         // `GetDifficultyColor` (`QuestLogFrame.lua:585`), which `TargetFrame_CheckLevel` asks for
         // an attackable target (`TargetFrame.lua:130`).
         r"Interface\FrameXML\QuestLogFrame.lua",
+        // `StaticPopup_Hide`, which UIParent's `PLAYER_UNGHOST` arm calls (`UIParent.lua:251-257`)
+        // at a live arrival.
+        r"Interface\FrameXML\StaticPopup.xml",
     ];
     for file in super::test_ui::production_order(&[UNIT_FRAMES, extra]) {
         load_xml(s, file);
@@ -59,6 +62,7 @@ fn relate(s: &mut UiScript, units: &[crate::target::RelUnit]) {
 fn shipped_unit_frames_drive_end_to_end() {
     benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
+    s.keep_calls();
     s.set_screen_size(1024.0, 768.0);
     load_unit_frames(&s);
     assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
@@ -287,6 +291,7 @@ fn extracted_text_height(s: &mut UiScript, text: &str) -> Option<f32> {
 fn unit_combat_drives_the_player_hit_indicator() {
     benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
+    s.keep_calls();
     s.set_screen_size(1024.0, 768.0);
     load_unit_frames(&s);
     s.set_unit(
@@ -463,6 +468,11 @@ fn left_clicking_the_player_frame_targets_self() {
         "Loot Method is nested for the leader"
     );
     s.resolve();
+    // `LeaveParty` sends only with the player's object (`0x4e9196`).
+    s.set_unit_guids(&benilla_ui::script::UnitGuids {
+        player: 0x5E1F,
+        ..Default::default()
+    });
     let (rx, ry) = s
         .eval::<(f64, f64)>("return DropDownList1Button4:GetCenter()")
         .unwrap();
@@ -487,6 +497,7 @@ fn left_clicking_the_player_frame_targets_self() {
 fn raid_mark_clicks_through_the_nested_level() {
     benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
+    s.keep_calls();
     s.set_screen_size(1024.0, 768.0);
     load_unit_frames(&s);
 
@@ -513,6 +524,8 @@ fn raid_mark_clicks_through_the_nested_level() {
         master_looter: None,
         loot_threshold: 2,
     });
+    // The resolver's inputs, which `SetRaidTarget` reads the token through (`0x4bbeff`).
+    s.seat_player_guid(0x5E1F);
     s.resolve();
 
     let (cx, cy) = s
@@ -561,7 +574,7 @@ fn raid_mark_clicks_through_the_nested_level() {
     assert_eq!(
         s.take_party_requests(),
         vec![benilla_ui::script::PartyRequest::SetRaidTarget {
-            unit: "player".into(),
+            guid: 0x5E1F,
             index: 8
         }],
         "Skull queues the mark intent for the menu's unit"
@@ -593,6 +606,7 @@ fn shipped_target_frame_runs_the_level_law() {
     benilla_formats::wow_data_or_skip!();
     use benilla_ui::script::PlayerReqState;
     let mut s = UiScript::new().unwrap();
+    s.keep_calls();
     s.set_screen_size(1024.0, 768.0);
     // `GetDifficultyColor`'s load chain: the stock quest log window.
     load_unit_frames_with(
@@ -784,6 +798,7 @@ fn shipped_target_frame_runs_the_level_law() {
 fn pvp_icon_follows_the_three_branch_law() {
     benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
+    s.keep_calls();
     s.set_screen_size(1024.0, 768.0);
     load_unit_frames(&s);
     let _ = s.take_sounds(); // the frames' own load-time kits (target hide) aren't ours
@@ -900,6 +915,7 @@ fn plate_color(s: &mut UiScript) -> [f32; 4] {
 fn flagged_friendly_player_plate_is_green() {
     benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
+    s.keep_calls();
     s.set_screen_size(1024.0, 768.0);
     load_unit_frames(&s);
 
@@ -946,6 +962,7 @@ fn an_exalted_npc_target_reads_revered_and_its_plate_is_green() {
     let data = benilla_formats::wow_data_or_skip!();
     let mut chain = benilla_formats::open_chain(&data).expect("open chain");
     let mut s = UiScript::new().unwrap();
+    s.keep_calls();
     s.set_screen_size(1024.0, 768.0);
     load_unit_frames(&s);
     let me = human_warrior(1);
@@ -1013,6 +1030,7 @@ fn a_live_faction_template_change_recolours_the_target_plate() {
     const ME: u64 = 0x77;
     const MOB: u64 = 0xF130_0000_3796_0001;
     let mut s = UiScript::new().unwrap();
+    s.keep_calls();
     s.set_screen_size(1024.0, 768.0);
     load_unit_frames(&s);
     s.set_unit_guids(&benilla_ui::script::UnitGuids {
@@ -1083,7 +1101,6 @@ fn a_live_faction_template_change_recolours_the_target_plate() {
 /// pushed for the stock poll.
 #[test]
 fn a_values_block_moves_the_target_health_bar_and_a_retarget_fires_no_unit_event() {
-    use crate::field_watch::FieldNotice;
     use crate::net::{Guid, GuidIndex, NetCommands, ObjectStore, SelfPlayer};
     use crate::target::Selection;
     use benilla_protocol::field::{FIELD_UNIT_HEALTH, FIELD_UNIT_MAXHEALTH};
@@ -1100,6 +1117,7 @@ fn a_values_block_moves_the_target_health_bar_and_a_retarget_fires_no_unit_event
 
     benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
+    s.keep_calls();
     s.set_screen_size(1024.0, 768.0);
     load_unit_frames(&s);
     s.run(
@@ -1213,6 +1231,7 @@ fn a_values_block_moves_the_target_health_bar_and_a_retarget_fires_no_unit_event
         crate::field_watch::values(
             &crate::field_watch::Around {
                 me: Some(ME),
+                target: None,
                 creature_lookup: &|_| false,
                 others: &Vec::new,
                 pet_bar: 0,
@@ -1227,7 +1246,7 @@ fn a_values_block_moves_the_target_health_bar_and_a_retarget_fires_no_unit_event
         )
     };
     app.world_mut()
-        .resource_mut::<Messages<FieldNotice>>()
+        .resource_mut::<crate::field_watch::NoticeLane>()
         .write_batch(notices);
     app.update();
     assert_eq!(seen(&mut app), ["UNIT_HEALTH:target"]);
@@ -1244,6 +1263,7 @@ fn a_values_block_moves_the_target_health_bar_and_a_retarget_fires_no_unit_event
         crate::field_watch::values(
             &crate::field_watch::Around {
                 me: Some(ME),
+                target: None,
                 creature_lookup: &|_| false,
                 others: &Vec::new,
                 pet_bar: 0,
@@ -1258,7 +1278,7 @@ fn a_values_block_moves_the_target_health_bar_and_a_retarget_fires_no_unit_event
         )
     };
     app.world_mut()
-        .resource_mut::<Messages<FieldNotice>>()
+        .resource_mut::<crate::field_watch::NoticeLane>()
         .write_batch(notices);
     app.update();
     assert!(seen(&mut app).is_empty(), "no targettarget unit event");
@@ -1272,7 +1292,8 @@ fn a_values_block_moves_the_target_health_bar_and_a_retarget_fires_no_unit_event
 }
 
 /// A forced-reaction table arriving recolours the target plate: the reference's handler `0x4d59a0`
-/// fires `UNIT_FACTION` for every token naming a unit (`0x4d5a5e` → `0x606e20`), where the plate
+/// refreshes the active player's reaction (`0x4d5a5e` → `0x606e20`), whose sweep signals
+/// `UNIT_FACTION` for the held target too, where the plate
 /// listens for it (`TargetFrame.lua:75-79`) and no field edge moves. A change of the standings
 /// alone fires nothing, a resend of the same table fires again, and a table naming another
 /// faction still fires: the handler tests nothing.
@@ -1303,6 +1324,8 @@ fn a_forced_reaction_table_arriving_recolours_the_target_plate() {
         .faction;
 
     let mut s = UiScript::new().unwrap();
+
+    s.keep_calls();
     s.set_screen_size(1024.0, 768.0);
     load_unit_frames(&s);
     s.run(
@@ -1375,6 +1398,23 @@ fn a_forced_reaction_table_arriving_recolours_the_target_plate() {
         out
     };
     let plate = |app: &mut App| plate_color(&mut script(app));
+    // `SMSG_SET_FORCED_REACTIONS` as its handler applies it: the table, then `RefreshReaction` on
+    // the active player (`0x4d5a5e`), its signals on the notice lane.
+    let arrive = |app: &mut App, table: Vec<(u32, u32)>| {
+        app.world_mut()
+            .resource_mut::<Reputations>()
+            .set_forced(table);
+        let world = app.world_mut();
+        let mut q = world.query::<(&Guid, &ObjectStore)>();
+        let units: Vec<(u64, benilla_protocol::ObjectFields)> =
+            q.iter(world).map(|(g, s)| (g.0, s.0.clone())).collect();
+        let me = units.iter().find(|(g, _)| *g == ME).map(|(_, f)| f.clone());
+        let others = || crate::field_watch::reaction_sweep(ME, units.iter().map(|(g, f)| (*g, f)));
+        let notices = crate::field_watch::reaction_signals(ME, &me.unwrap(), Some(ME), &others);
+        world
+            .resource_mut::<crate::field_watch::NoticeLane>()
+            .write_batch(notices);
+    };
     let is_green =
         |c: [f32; 4]| c[0].abs() < 1e-6 && (c[1] - 1.0).abs() < 1e-6 && c[2].abs() < 1e-6;
     let is_red = |c: [f32; 4]| (c[0] - 1.0).abs() < 1e-6 && c[1].abs() < 1e-6 && c[2].abs() < 1e-6;
@@ -1390,15 +1430,12 @@ fn a_forced_reaction_table_arriving_recolours_the_target_plate() {
     // A standing moves: the questgiver and unit feeds wake, and no event fires.
     app.world_mut()
         .resource_mut::<Reputations>()
-        .slots
-        .push((0, 0));
+        .set_standing(63, 1);
     app.update();
     assert!(seen(&mut app).is_empty(), "no table arrived");
 
     // A table naming another faction still fires: the handler tests nothing (`0x4d5a5e`).
-    app.world_mut()
-        .resource_mut::<Reputations>()
-        .set_forced(vec![(faction + 1000, 0)]);
+    arrive(&mut app, vec![(faction + 1000, 0)]);
     app.update();
     assert_eq!(
         seen(&mut app),
@@ -1411,27 +1448,21 @@ fn a_forced_reaction_table_arriving_recolours_the_target_plate() {
     );
 
     // The guard's faction forced to Hated: the plate follows `UNIT_FACTION`, not a retarget.
-    app.world_mut()
-        .resource_mut::<Reputations>()
-        .set_forced(vec![(faction, 0)]);
+    arrive(&mut app, vec![(faction, 0)]);
     app.update();
     assert_eq!(seen(&mut app), ["player", "target"]);
     let after = plate(&mut app);
     assert!(is_red(after), "forced Hated reads red, got {after:?}");
 
     // The same table sent again fires again, and the aura's removal (an empty table) repaints.
-    app.world_mut()
-        .resource_mut::<Reputations>()
-        .set_forced(vec![(faction, 0)]);
+    arrive(&mut app, vec![(faction, 0)]);
     app.update();
     assert_eq!(
         seen(&mut app),
         ["player", "target"],
         "a resend is an arrival"
     );
-    app.world_mut()
-        .resource_mut::<Reputations>()
-        .set_forced(Vec::new());
+    arrive(&mut app, Vec::new());
     app.update();
     assert_eq!(seen(&mut app), ["player", "target"]);
     let cleared = plate(&mut app);
@@ -1450,6 +1481,7 @@ fn a_forced_reaction_table_arriving_recolours_the_target_plate() {
 fn target_frame_border_follows_the_classification_law() {
     benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
+    s.keep_calls();
     s.set_screen_size(1024.0, 768.0);
     load_unit_frames(&s);
 
@@ -1566,6 +1598,7 @@ fn target_frame_border_follows_the_classification_law() {
 fn the_ring_art_paints_over_the_bars() {
     benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
+    s.keep_calls();
     s.set_screen_size(1024.0, 768.0);
     load_unit_frames(&s);
     s.set_unit(
@@ -1628,6 +1661,7 @@ fn the_ring_art_paints_over_the_bars() {
 fn the_party_art_paints_over_the_bars() {
     benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
+    s.keep_calls();
     s.set_screen_size(1024.0, 768.0);
     load_xml(&s, "Interface\\FrameXML\\GlobalStrings.lua");
     load_xml(&s, "Interface\\FrameXML\\Fonts.xml");
@@ -1747,6 +1781,7 @@ fn the_party_art_paints_over_the_bars() {
 fn a_feigning_target_paints_empty_bars_and_the_dead_text() {
     benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
+    s.keep_calls();
     s.set_screen_size(1024.0, 768.0);
     load_unit_frames(&s);
 
@@ -1840,6 +1875,7 @@ fn a_feigning_target_paints_empty_bars_and_the_dead_text() {
 fn the_player_frame_flashes_zzz_while_resting() {
     benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
+    s.keep_calls();
     s.set_screen_size(1024.0, 768.0);
     load_unit_frames(&s);
     s.set_unit(
@@ -1937,6 +1973,7 @@ fn the_player_frame_flashes_zzz_while_resting() {
 fn the_rest_badge_covers_the_level_number() {
     benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
+    s.keep_calls();
     s.set_screen_size(1024.0, 768.0);
     load_unit_frames(&s);
     s.set_unit(
@@ -1990,6 +2027,7 @@ fn the_rest_badge_covers_the_level_number() {
 fn status_bar_text_paints_the_player_numerals_but_not_the_targets() {
     benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
+    s.keep_calls();
     s.set_screen_size(1024.0, 768.0);
     load_unit_frames(&s);
 
@@ -2127,6 +2165,7 @@ fn status_bar_text_paints_the_player_numerals_but_not_the_targets() {
 fn no_two_numeral_strings_overlap_on_any_frame() {
     benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
+    s.keep_calls();
     s.set_screen_size(1024.0, 768.0);
     load_unit_frames(&s);
 
@@ -2196,7 +2235,8 @@ fn no_two_numeral_strings_overlap_on_any_frame() {
 #[test]
 fn the_unit_frame_hover_hooks_carry_the_references_names() {
     benilla_formats::wow_data_or_skip!();
-    let s = UiScript::new().unwrap();
+    let mut s = UiScript::new().unwrap();
+    s.keep_calls();
     load_unit_frames(&s);
 
     assert!(
@@ -2239,7 +2279,8 @@ fn the_unit_frame_hover_hooks_carry_the_references_names() {
 #[test]
 fn the_raid_mark_helper_maps_each_index_to_its_cell() {
     benilla_formats::wow_data_or_skip!();
-    let s = UiScript::new().unwrap();
+    let mut s = UiScript::new().unwrap();
+    s.keep_calls();
     load_unit_frames(&s);
     s.run(r#"RTMark = UIParent:CreateTexture("RTMark", "OVERLAY")"#)
         .unwrap();
@@ -2280,6 +2321,8 @@ fn the_player_frame_wears_the_leader_and_master_looter_icons() {
     use benilla_ui::script::{PartyMemberInfo, PartyState};
 
     let mut s = UiScript::new().unwrap();
+
+    s.keep_calls();
     s.set_screen_size(1024.0, 768.0);
     load_unit_frames(&s);
     s.set_unit(
@@ -2354,7 +2397,8 @@ fn the_player_frame_wears_the_leader_and_master_looter_icons() {
 #[test]
 fn the_unit_frames_publish_every_name_the_reference_declares() {
     benilla_formats::wow_data_or_skip!();
-    let s = UiScript::new().unwrap();
+    let mut s = UiScript::new().unwrap();
+    s.keep_calls();
     load_unit_frames(&s);
 
     // Names from `PlayerFrame.xml`, `TargetFrame.xml` and `PetFrame.xml`, less virtual templates
@@ -2455,6 +2499,7 @@ fn the_unit_frames_publish_every_name_the_reference_declares() {
 fn the_target_leader_crown_follows_player_flags_changed() {
     benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
+    s.keep_calls();
     s.set_screen_size(1024.0, 768.0);
     load_unit_frames(&s);
 
