@@ -27,6 +27,9 @@ pub(crate) struct ScriptSelect<'w, 's> {
     scan: scan::TargetScan<'w, 's>,
     history: ResMut<'w, scan::TabHistory>,
     time: Res<'w, Time>,
+    /// The deselects a call's own steps owe, its loot close's (`0x48f369`), run inside it; absent
+    /// in a harness without targets.
+    owed: Option<ResMut<'w, scan::OwedSelects>>,
 }
 
 impl ScriptSelect<'_, '_> {
@@ -156,10 +159,16 @@ impl ScriptSelect<'_, '_> {
         self.commit.pay_now(debt);
     }
 
-    /// StartAttack (`0x5ecb70`) at `guid` from an engine writer, its own select (`0x5eccaa`)
-    /// owing the swing past its signals ([`SelectCommit::start_attack`]).
-    pub(crate) fn start_attack(&mut self, guid: u64) -> SelectDebt {
-        self.commit.owing(|commit| commit.start_attack(guid))
+    /// Where the selects a call owes begin, for [`Self::owed_deselect`].
+    pub(crate) fn owed_mark(&self) -> usize {
+        self.owed.as_deref().map_or(0, scan::OwedSelects::mark)
+    }
+
+    /// The next deselect the call owed since `from` (`0x493910(guid, 1)`), torn down now and
+    /// owing what its signals owe, for the call to signal before it returns.
+    pub(crate) fn owed_deselect(&mut self, from: usize) -> Option<SelectDebt> {
+        let guid = self.owed.as_deref_mut()?.take_deselect(from)?;
+        Some(self.commit.owing(|commit| commit.tear_down(guid)))
     }
 
     /// `ClearTarget()` (`0x489ff0`): deselect whatever the calls before it left selected.
@@ -554,7 +563,7 @@ mod tests {
     #[test]
     fn target_and_assist_unit_name_the_interaction_npc() {
         use crate::net::{Guid, ObjectStore, SelfPlayer};
-        use crate::ui_session::InteractNpc;
+        use crate::ui_session::InteractLatch;
         use benilla_ui::script::UiScript;
         use bevy::ecs::system::RunSystemOnce;
 
@@ -577,7 +586,9 @@ mod tests {
         let index = &mut world.resource_mut::<crate::net::GuidIndex>().0;
         index.insert(VENDOR, vendor);
         index.insert(GUARD, guard);
-        world.insert_resource(InteractNpc(Some(vendor), Some(VENDOR)));
+        let mut latch = InteractLatch::default();
+        latch.latch_for_test(VENDOR);
+        world.insert_resource(latch);
 
         let run = |world: &mut World, lua: &str| {
             world
@@ -620,7 +631,7 @@ mod tests {
             .resource_mut::<crate::net::GuidIndex>()
             .0
             .insert(VENDOR, vendor);
-        world.insert_resource(InteractNpc::default());
+        world.insert_resource(InteractLatch::default());
         assert_eq!(run(&mut world, r#"TargetUnit("npc")"#), Some(GUARD));
     }
 
@@ -631,7 +642,7 @@ mod tests {
     fn typing_target_unit_npc_in_the_stock_chat_box_selects_the_vendor() {
         benilla_formats::wow_data_or_skip!();
         use crate::net::{Guid, ObjectStore, SelfPlayer};
-        use crate::ui_session::InteractNpc;
+        use crate::ui_session::InteractLatch;
         use benilla_ui::script::UiScript;
         use bevy::ecs::system::RunSystemOnce;
 
@@ -649,7 +660,9 @@ mod tests {
             .resource_mut::<crate::net::GuidIndex>()
             .0
             .insert(VENDOR, vendor);
-        world.insert_resource(InteractNpc(Some(vendor), Some(VENDOR)));
+        let mut latch = InteractLatch::default();
+        latch.latch_for_test(VENDOR);
+        world.insert_resource(latch);
 
         let mut script = world.non_send_resource_mut::<UiScript>();
         assert!(script.focus_editbox("ChatFrameEditBox"));

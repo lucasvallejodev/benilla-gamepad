@@ -89,8 +89,7 @@ fn seat_party_targeting(app: &mut App, pet: u64, target: u64) {
         });
 }
 
-/// One frame: the packets, the unit, party, pet and chain feeds' pushes of the frame's state,
-/// then the lanes' drain; what the spy saw.
+/// One frame: the packets, then the lanes' drain; what the spy saw.
 fn frame(app: &mut App, packets: Vec<SessionEvent>) -> Vec<String> {
     frame_after(app, |_| {}, packets)
 }
@@ -111,14 +110,6 @@ fn frame_after(
     }
     before(world);
     crate::net::handlers::dispatch(world, packets);
-    crate::ui_unit::run_feed_units_once(world);
-    world
-        .run_system_cached(crate::ui_party::feed_party)
-        .expect("the party feed runs");
-    world
-        .run_system_cached(crate::ui_pet::feed_pet_unit)
-        .expect("the pet feed runs");
-    crate::ui_unit::run_feed_chain_units_once(world);
     crate::lanes::fire_in_order(world);
     let s = world.non_send_resource_mut::<UiScript>();
     let out = s.eval::<Vec<String>>("return Seen").unwrap();
@@ -235,7 +226,7 @@ fn a_party_pet_replaced_mid_frame_reads_the_old_pet_before_the_swap() {
         .run(r#"function Look(event, unit) return UnitHealth("partypet1") end"#)
         .unwrap();
     frame(&mut app, vec![]);
-    // The resolver's inputs as the feeds push them ahead of the drain: the frame's last pet.
+    // The resolver's stand-in as the frame left it: the frame's last pet.
     let seat_new_pet = |world: &mut World| {
         world
             .non_send_resource_mut::<UiScript>()

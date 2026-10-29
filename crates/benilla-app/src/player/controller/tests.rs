@@ -48,6 +48,15 @@ struct Client {
 impl Client {
     /// `set` applies to [`Player`] before the first placement.
     fn new(body: Body, set: impl FnOnce(&mut Player)) -> Self {
+        Self::with_lock(body, set, |_| {})
+    }
+
+    /// [`Self::new`], with `lock` applied to the mover's lock too.
+    fn with_lock(
+        body: Body,
+        set: impl FnOnce(&mut Player),
+        lock: impl FnOnce(&mut super::super::MoverLock),
+    ) -> Self {
         let mut app = crate::game_plugins::schedule_tests::headless_client_unrun();
         let world = app.world_mut();
         // The startup's player, rig and camera, with no client data, the empty world's liquids and
@@ -72,10 +81,12 @@ impl Client {
         {
             let mut player = world.resource_mut::<Player>();
             player.active = true;
-            if body != Body::Own {
-                player.foreign_mover = Some(CREATURE);
-            }
             set(&mut player);
+            let mut mover = world.resource_mut::<super::super::MoverLock>();
+            if body != Body::Own {
+                mover.foreign_mover = Some(CREATURE);
+            }
+            lock(&mut mover);
         }
         let embody = world.register_system(super::super::embody::maintain_embodiment);
         let sample = world.register_system(sample_look);
@@ -86,7 +97,7 @@ impl Client {
         world.run_system(embody).expect("the embodiment runs");
         // `wire_in` seizes a streamed body (`0x6006e0`); an unstreamed claim stays a reseat.
         if body != Body::Unstreamed {
-            world.resource_mut::<Player>().reseat = false;
+            world.resource_mut::<super::super::MoverLock>().reseat = false;
         }
         Self {
             app,
@@ -124,11 +135,22 @@ impl Client {
     fn player(&mut self) -> Mut<'_, Player> {
         self.app.world_mut().resource_mut::<Player>()
     }
+
+    fn lock(&mut self) -> Mut<'_, super::super::MoverLock> {
+        self.app
+            .world_mut()
+            .resource_mut::<super::super::MoverLock>()
+    }
 }
 
 /// One frame's press on a fresh client.
 fn press(body: Body, set: impl FnOnce(&mut Player), now: Vec<BindingInput>) -> Option<bool> {
     Client::new(body, set).frame(vec![], now)
+}
+
+/// [`press`] with control of the body lost.
+fn press_lost(body: Body, now: Vec<BindingInput>) -> Option<bool> {
+    Client::with_lock(body, |_| {}, |l| l.control_lost = true).frame(vec![], now)
 }
 
 fn forward() -> Vec<BindingInput> {
@@ -154,7 +176,7 @@ fn a_press_while_rooted_cancels_the_cast() {
 #[test]
 fn a_press_while_the_body_is_not_ours_to_drive_cancels_the_cast() {
     assert_eq!(
-        press(Body::Own, |p| p.control_lost = true, forward()),
+        press_lost(Body::Own, forward()),
         Some(false),
         "control lost: the cast, not the channel"
     );
@@ -184,11 +206,7 @@ fn jump_cancels_only_with_a_mover() {
         Some(false),
         "a possessed body"
     );
-    assert_eq!(
-        press(Body::Own, |p| p.control_lost = true, jump()),
-        None,
-        "control lost"
-    );
+    assert_eq!(press_lost(Body::Own, jump()), None, "control lost");
     assert_eq!(press(Body::Unstreamed, |_| {}, jump()), None, "no mover");
     assert_eq!(
         press(Body::Unstreamed, |_| {}, forward()),
@@ -204,11 +222,11 @@ fn jump_cancels_only_with_a_mover() {
 /// returned mover (`0x60084d`), so the latch runs.
 #[test]
 fn the_latch_toggles_while_control_is_lost_and_runs_on_its_return() {
-    let mut client = Client::new(Body::Own, |p| p.control_lost = true);
+    let mut client = Client::with_lock(Body::Own, |_| {}, |l| l.control_lost = true);
     assert_eq!(client.frame(vec![], toggle()), Some(false), "on");
     assert_eq!(client.frame(vec![], toggle()), None, "off");
     assert_eq!(client.frame(vec![], toggle()), Some(false), "on again");
-    client.player().control_lost = false;
+    client.lock().control_lost = false;
     assert_eq!(client.frame(vec![], vec![]), None);
     let player = client.player();
     assert!(player.autorun, "the latch outlives the loss of control");
@@ -712,6 +730,82 @@ fn following(client: &mut Client) -> bool {
         .resource::<super::super::follow::FollowState>()
         .guid
         .is_some()
+}
+
+/// Far sight on, its object gone: the render's update (`0x483054` → `0x5ee290`) finds the field
+/// naming no held object, puts the camera back on the player and returns with the bit still set
+/// (`0x5ee324`-`0x5ee360`), so the input tick's precondition still refuses (`0x514540`): a forward
+/// press starts nothing, though the camera is home.
+#[test]
+fn a_lost_far_sight_object_keeps_the_input_torn_down() {
+    use crate::player::{FarSight, ViewSubject};
+    use benilla_protocol::field::FIELD_UNIT_HEALTH;
+    /// `PLAYER_FARSIGHT`, the guid's low word.
+    const FARSIGHT: u16 = 712;
+    const EYE: u64 = 0xF130_0000_0000_0043;
+    let mut client = Client::standing(Body::Own);
+    let world = client.app.world_mut();
+    let me = world.resource::<GuidIndex>().0[&ME];
+    world.entity_mut(me).insert(crate::net::ObjectStore(
+        benilla_protocol::ObjectFields::from_pairs(&[
+            (FIELD_UNIT_HEALTH, 100),
+            (FARSIGHT, EYE as u32),
+            (FARSIGHT + 1, (EYE >> 32) as u32),
+        ]),
+    ));
+    let eye = world.spawn(Transform::from_xyz(30.0, 0.0, 0.0)).id();
+    world.resource_mut::<GuidIndex>().0.insert(EYE, eye);
+    let index = world.resource::<GuidIndex>();
+    world.resource::<FarSight>().start(
+        Some(EYE),
+        |g| index.0.contains_key(&g),
+        world.resource::<NetCommands>(),
+    );
+    world.resource_mut::<GuidIndex>().0.remove(&EYE);
+    world
+        .run_system_once(super::super::view_subject::publish_view_subject)
+        .expect("the render's update runs");
+    let far_sight = world.resource::<FarSight>();
+    assert!(far_sight.on() && far_sight.camera().is_none());
+    assert!(
+        world.resource::<ViewSubject>().remote.is_none(),
+        "the camera is home"
+    );
+    let sent = client.traced(vec![], forward(), |_| {});
+    assert!(
+        !sent
+            .iter()
+            .any(|(_, s)| matches!(s, Sent::Move(crate::net::MoveKind::StartForward, _))),
+        "{sent:?}"
+    );
+}
+
+/// A stun that lands before its root: the stun's tick finds the mover free to translate, and the
+/// root's ack runs the tick again (`0x60e33d` → `0x60e347`), which now takes the teardown leg
+/// (`0x5146d6`): the follow ends and autorun clears at the ack.
+#[test]
+fn a_root_ack_after_a_stun_ends_the_follow_at_the_ack() {
+    use benilla_protocol::field::{FIELD_UNIT_FLAGS, FIELD_UNIT_HEALTH};
+    let mut client = Client::new(Body::Own, |_| {});
+    let world = client.app.world_mut();
+    let me = world.resource::<GuidIndex>().0[&ME];
+    world.entity_mut(me).insert(crate::net::ObjectStore(
+        benilla_protocol::ObjectFields::from_pairs(&[
+            (FIELD_UNIT_HEALTH, 100),
+            (FIELD_UNIT_FLAGS, crate::player::UNIT_FLAG_STUNNED),
+        ]),
+    ));
+    follow(&mut client);
+    client.frame(vec![], vec![]);
+    assert!(
+        following(&mut client),
+        "a stun alone leaves the mover free to translate"
+    );
+    client.player().autorun = true;
+    root(client.app.world_mut());
+    client.frame(vec![], vec![]);
+    assert!(!following(&mut client), "the root's ack ends it");
+    assert!(!client.player().autorun, "and releases autorun at once");
 }
 
 /// `ToggleAutoRun`'s on press starts the move through `0x60dc60`, whose guard `0x60e990` ends a

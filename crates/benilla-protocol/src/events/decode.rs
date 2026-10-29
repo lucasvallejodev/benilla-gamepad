@@ -759,7 +759,9 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
             vec![SessionEvent::ServerUnixTime { unix_time }]
         }
         ServerPacket::BindPoint { area, .. } => vec![SessionEvent::BindPoint { area }],
-        ServerPacket::GmTicketAnswer { ticket } => vec![SessionEvent::GmTicket { ticket }],
+        ServerPacket::GmTicketAnswer { status, ticket } => {
+            vec![SessionEvent::GmTicket { status, ticket }]
+        }
         ServerPacket::GmTicketCreated { response } => {
             vec![SessionEvent::GmTicketCreated { response }]
         }
@@ -813,6 +815,8 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
             vec![SessionEvent::MeetingStoneSetQueue { area, status }]
         }
         ServerPacket::MeetingStoneNotice(notice) => vec![SessionEvent::MeetingStoneNotice(notice)],
+        ServerPacket::AccountDataMd5(md5) => vec![SessionEvent::AccountDataMd5(md5.digests)],
+        ServerPacket::UpdateAccountData(data) => vec![SessionEvent::UpdateAccountData(data)],
         ServerPacket::TutorialFlags(flags) => vec![SessionEvent::TutorialFlags(flags.bytes)],
         ServerPacket::PlayerBound { binder, area } => {
             vec![SessionEvent::PlayerBound { binder, area }]
@@ -929,6 +933,16 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
         ServerPacket::GameObjectPageText { guid } => {
             vec![SessionEvent::GameObjectPageText { guid }]
         }
+        ServerPacket::ReadItemOk { guid } => vec![SessionEvent::ReadItemOk { guid }],
+        ServerPacket::ReadItemFailed {
+            guid,
+            reason,
+            milliseconds,
+        } => vec![SessionEvent::ReadItemFailed {
+            guid,
+            reason,
+            milliseconds,
+        }],
         ServerPacket::OpenContainer { item } => vec![SessionEvent::OpenContainer { item }],
         ServerPacket::StandStateUpdate { state } => {
             vec![SessionEvent::StandStateUpdate { state }]

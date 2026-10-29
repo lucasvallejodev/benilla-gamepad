@@ -437,7 +437,12 @@ pub(crate) fn seat_text_measurer(script: &mut UiScript, atlas: &UiFontAtlas, sea
 /// errors. The quads are [`paint_script`]'s, after the camera that places the `WorldFrame`
 /// nameplates.
 pub(super) fn tick_script(
-    mut hosted_vm: crate::script_calls::HostedVm,
+    // With the dial, `UIParent`'s scale in the VM, and `widescreen`, which picks the aspect the
+    // interface's screen is built for: CVar knobs the call host's callbacks write.
+    mut vm: crate::script_calls::VmWith<(
+        Res<'static, super::UiScaleCvar>,
+        Option<Res<'static, crate::video::Widescreen>>,
+    )>,
     window: Query<&Window, With<PrimaryWindow>>,
     // The paced frame step, unclamped, as 1.12.1 hands `OnUpdate` its frame time (`0x76b2c0`):
     // not `Time<Real>`, which pipelined rendering mis-splits, nor `Time<Virtual>`, which clamps a
@@ -453,18 +458,21 @@ pub(super) fn tick_script(
     mut last_seam: Local<f32>,
     // The `scale_factor` measures were last answered under; 0 until the first frame.
     mut last_dpi: Local<f32>,
-    // The dial, `UIParent`'s scale in the VM, and the automatic scale's last display.
-    (ui_scale, mut auto_cache): (
-        Res<super::UiScaleCvar>,
-        Option<ResMut<super::UiAutoScaleCache>>,
-    ),
+    // The automatic scale's last display.
+    mut auto_cache: Option<ResMut<super::UiAutoScaleCache>>,
     mut ui_cost: ResMut<super::UiFrameCost>,
     mut pass: ResMut<super::UiPassState>,
     // The loading screen, whose layer hides the interface's from the frame pass.
     loading: Option<Res<crate::loading_screen::LoadingScreen>>,
+    // The display size the display handler last ran for (`0x492e90`).
+    mut last_display: Local<Option<(u32, u32)>>,
 ) {
     let covered = loading.is_some_and(|l| l.hides_interface());
-    hosted_vm.run(|script| {
+    let (ui_scale, widescreen) = {
+        let (scale, widescreen) = vm.own();
+        (scale.0, widescreen.as_deref().copied())
+    };
+    vm.run(|script| {
         pass.live = false;
         let Some(script) = script else {
             // No VM, no UI sampling a booth pane: a stranded pane would keep its camera rendering
@@ -478,7 +486,10 @@ pub(super) fn tick_script(
             booths.character.reset(0);
             return;
         };
-        let (w, h) = (window.width(), window.height());
+        // The interface's screen: the window's, or 4:3 and stretched across it
+        // ([`super::UiScreen`]).
+        let screen = super::UiScreen::of_window(window, widescreen.as_ref());
+        let h = screen.size.y;
         // The client's UI space is 768 units tall at every aspect (`f(screenH) = 768`, `0x41ad10`;
         // the caret's `H_px/192`, `0x77b8c0`), the dial being `UIParent`'s scale inside it. The VM
         // lives in it: quads scale ×s out, and the mouse and the measures ÷s in.
@@ -523,7 +534,7 @@ pub(super) fn tick_script(
         };
         {
             let _span = bevy::log::info_span!("ui_script: tick").entered();
-            let resized = script.set_window_size(w, h);
+            let resized = script.set_screen_aspect(screen.aspect);
             // The UI scale is `UIParent`'s, which only the in-game state has; the glue lays out on
             // the root alone (`0x46dd30`).
             if script.vm_kind() == benilla_ui::script::VmKind::InGame {
@@ -535,15 +546,19 @@ pub(super) fn tick_script(
                 // resize re-lays out the live UI, the chat bubbles' window-derived `BubbleGeometry`
                 // with it, because the window resizes freely and a reload on each resize would tear
                 // down every addon's state mid-play.
-                if resized {
-                    let display = (w.round() as u32, h.round() as u32);
+                // The handler runs on a display change (`0x492e90`), which with `widescreen` 0
+                // leaves the 4:3 cells as they were.
+                let display = screen.display();
+                let mut applied = false;
+                if resized || *last_display != Some(display) {
+                    *last_display = Some(display);
                     let mut none = None;
                     let cache = auto_cache.as_deref_mut().map_or(&mut none, |c| &mut c.0);
-                    script.apply_ui_scale(display, cache);
+                    applied = script.apply_ui_scale(display, cache);
                 }
-                let rescaled = script.set_ui_scale(ui_scale.0);
-                // Either re-runs what the interface computed from the old `GetScreenHeight()`.
-                if resized || rescaled {
+                let rescaled = script.set_ui_scale(ui_scale);
+                // Any re-runs what the interface computed from the old `GetScreenHeight()`.
+                if resized || rescaled || applied {
                     super::manifest::on_screen_resized(script);
                 }
             } else if resized && script.vm_kind() == benilla_ui::script::VmKind::Glue {
@@ -621,9 +636,8 @@ pub(super) fn tick_script(
         }
         drop(measure_span);
         let us_measure = lap();
-        // Script errors reach the Lua handler (`_ERRORMESSAGE`, `BasicControls.xml:16`) before the
-        // log, so a failing handler lands in this frame's drain.
-        script.dispatch_script_errors_to_handler();
+        // Script errors reached the Lua handler (`_ERRORMESSAGE`, `BasicControls.xml:16`) as they
+        // were raised; the log drains them here.
         for err in script.take_errors() {
             warn!("ui_script: {err}");
         }
@@ -655,7 +669,8 @@ pub(super) fn tick_script(
 /// The UI pass's second half, after the camera and the plate driver: an incremental measure and
 /// `resolve` for what was written since the tick, the walk, and the conversion into [`UiQuads`].
 pub(super) fn paint_script(
-    mut hosted_vm: crate::script_calls::HostedVm,
+    // With `widescreen`, a CVar knob the call host's callbacks write.
+    mut vm: crate::script_calls::VmWith<Option<Res<'static, crate::video::Widescreen>>>,
     window: Query<&Window, With<PrimaryWindow>>,
     mut quads: ResMut<UiQuads>,
     world_assets: Option<ResMut<WorldAssets>>,
@@ -682,7 +697,8 @@ pub(super) fn paint_script(
 ) {
     let no_movies = super::movie::MovieScreen::default();
     let movies = movies.as_deref().unwrap_or(&no_movies);
-    hosted_vm.run(|script| {
+    let widescreen = vm.own().as_deref().copied();
+    vm.run(|script| {
         let (capture, ui_cost_wanted) = run;
         // Stand down with the tick half, which already cleared the booth panes.
         if !pass.live {
@@ -695,7 +711,8 @@ pub(super) fn paint_script(
         let Ok(window) = window.single() else {
             return;
         };
-        let (w, h) = (window.width(), window.height());
+        let screen = super::UiScreen::of_window(window, widescreen.as_ref());
+        let Vec2 { x: w, y: h } = screen.size;
         let (s, dpi) = (pass.seam, pass.dpi);
         let (us_tick, us_resolve) = (pass.us_tick, pass.us_resolve);
         let (solves_before, derives_before) = (Some(pass.solves_before), Some(pass.derives_before));
@@ -1073,11 +1090,14 @@ pub(super) fn paint_script(
                 CursorPayload::PetAction(p) => p.texture,
                 CursorPayload::StablePet(p) => Some(p.texture),
                 CursorPayload::Merchant(m) => m.texture,
+                CursorPayload::Ammo(a) => a.texture,
                 CursorPayload::Money(m) => {
                     Some(benilla_ui::script::coin_icon(i64::from(m.copper)).to_string())
                 }
             });
-            if let (Some(texture), Some(pos)) = (texture, window.cursor_position()) {
+            if let (Some(texture), Some(pos)) =
+                (texture, window.cursor_position().map(|p| screen.point(p)))
+            {
                 if let Some(handle) = assets
                     .as_mut()
                     .and_then(|a| a.sprite_texture(&texture, &mut images))

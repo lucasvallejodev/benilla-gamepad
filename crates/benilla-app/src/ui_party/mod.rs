@@ -12,8 +12,6 @@ use benilla_protocol::messages::{
 };
 use bevy::prelude::*;
 
-use crate::ui_script::UiFeed;
-
 #[cfg(test)]
 mod call_tests;
 mod calls;
@@ -24,19 +22,18 @@ pub(crate) mod net;
 mod pets;
 mod records;
 pub(crate) use calls::PartyCalls;
-pub(crate) use cells::{Cells, RosterCells};
-#[cfg(test)]
-pub(crate) use feed::feed_party;
+pub(crate) use cells::{Cells, RaidRow, RosterCells};
 pub(crate) use feed::{
-    drain_party, fold_dying_vm_ready_check, raid_row_guid, raid_row_guids, seed_reloaded_vm,
-    seed_vm_ready_check, synthetic_raid, synthetic_roster, GROUPTYPE_RAID, GROUP_MEMBER_SUBGROUP,
+    drain_party, fold_dying_vm_ready_check, raid_row_guid, raid_row_guids, seed_vm_party,
+    synthetic_raid, synthetic_roster, GROUPTYPE_RAID, GROUP_MEMBER_SUBGROUP,
 };
 #[cfg(test)]
 pub(crate) use feed::{fire_party_lane, PartyLane};
-pub(crate) use feed::{GroupSources, PARTY_PET_TOKENS, PARTY_TOKENS, RAID_PET_TOKENS, RAID_TOKENS};
 pub(crate) use live::RosterLive;
-pub(crate) use pets::Roster;
-pub(crate) use records::{record_notices, roster_aura_slots_in};
+pub(crate) use records::{
+    party_record, record_notices, roster_aura_slots_in, seat_member_record, seat_pet_record,
+    GroupAsOf,
+};
 
 pub(crate) struct UiPartyPlugin;
 
@@ -56,21 +53,9 @@ impl Plugin for UiPartyPlugin {
             .init_resource::<calls::GroupEdits>()
             .init_resource::<crate::sound::MessageSounds>()
             .init_resource::<crate::field_watch::NoticeLane>()
-            .add_systems(
-                Update,
-                (
-                    // Ahead of the field events, whose handlers read the group tokens, and after
-                    // the unit snapshots: TargetFrame answers RAID_TARGET_UPDATE with
-                    // GetRaidTargetIndex("target"), which reads the target snapshot's
-                    // `raid_target`, so a new mark landed on the target frame only when the target
-                    // changed if this ran first.
-                    feed::feed_party
-                        .after(crate::ui_unit::UnitSnapshots)
-                        .in_set(UiFeed)
-                        .in_set(crate::ui_unit::field_events::FieldEventPushes),
-                    feed::drain_party.in_set(crate::ui_script::UiDrain),
-                ),
-            );
+            // The getters read the group at the call (`live`), a new VM is seeded at its birth
+            // (`feed::seed_vm_party`), and the ready check prints its lines in place.
+            .add_systems(Update, feed::drain_party.in_set(crate::ui_script::UiDrain));
     }
 }
 
@@ -85,19 +70,18 @@ pub struct GroupState {
     pub own_flags: u8,
     /// The other members in wire order; the list never contains the recipient.
     pub members: Vec<GroupMemberEntry>,
-    /// Our own raid row's guid while the raid roster holds rows: a raid list that names a member
-    /// appends us after them, at row `count` (`0x5e6e6f`-`0x5e6e9c`), and one that names nobody
+    /// The raid roster's rows below its count (`0xb712a8`, `[0xb713e0]`), as the last rebuild
+    /// wrote them (`0x4ba5f0`), apart from the party slots: a raid list that names a member writes
+    /// them and us after them, at row `count` (`0x5e6e6f`-`0x5e6e9c`), one that names nobody
     /// leaves the roster empty (`0x5e6e71`, the writer's count at `0x4ba8a4`), as does any list
-    /// that is not a raid (`0x4ba550`). The guid is the session's own, known from the login on,
-    /// and a worldport keeps it. The reference writes the active player's (`0x5e6e73`), 0 while
-    /// none is set, as in a worldport's new object manager (`0x401bc0` into `0x464ff0`) until our
-    /// create, and the world entry fills that zero row (`0x4ba140`). vmangos sends our create
-    /// ahead of any list at login (`Map.cpp:432`, `Group.cpp:1454`), so only a list that lands
-    /// mid-worldport takes that path, which is not built.
-    pub own_raid_row: Option<u64>,
-    /// Whether any `SMSG_GROUP_LIST` landed this session, the all-zero one included: what a fresh
-    /// VM's catch-up reads (`feed::catch_up`).
-    pub listed: bool,
+    /// that is not a raid (`0x4ba550`), and an ending keeps them. Our row's guid is the session's
+    /// own, known from the login on, and a worldport keeps it. The reference writes the active
+    /// player's (`0x5e6e73`), 0 while none is set, as in a worldport's new object manager
+    /// (`0x401bc0` into `0x464ff0`) until our create, and the world entry fills that zero row
+    /// (`0x4ba140`). vmangos sends our create ahead of any list at login (`Map.cpp:432`,
+    /// `Group.cpp:1454`), so only a list that lands mid-worldport takes that path, which is not
+    /// built.
+    pub(crate) raid: Vec<RaidRow>,
     /// The group events the handlers signalled, in the order they signalled them.
     pub(crate) signals: SignalLog,
     /// The name lookups the group's handlers left waiting, in the order they were added: the name
@@ -118,9 +102,6 @@ pub struct GroupState {
     /// from the session's start (`0x4e7c9f` stores -1), then what each list's and each ending's
     /// leader store leaves ([`Self::store_leader_index`]).
     pub leader_index: u32,
-    /// The leader the raid roster's ranks were written against at its last rebuild (`0x4ba8f9`),
-    /// which an ending's zeroing of the cell leaves alone.
-    pub raid_leader: u64,
     /// The loot tail, present whenever the list has members.
     pub loot: Option<GroupLootInfo>,
     /// The loot setter's stored method, master and threshold (`0xbc7600`, `0xbc7608`,
@@ -143,6 +124,10 @@ pub struct GroupState {
     /// raised, in its order, for the handler to resolve against the objects held
     /// ([`Self::take_released`]).
     pub(crate) released: Vec<RosterRelease>,
+    /// While a test sets it, each signal with the roster cells as they stood when its handler
+    /// signalled it, what a listener fired at that place would read.
+    #[cfg(test)]
+    pub(crate) signal_cells: Option<Vec<(GroupSignal, RosterCells)>>,
 }
 
 /// One name lookup a group handler left waiting on the name cache ([`GroupState::name_waits`]).
@@ -237,8 +222,16 @@ pub(crate) enum GroupSignal {
     ReadyCheck,
     /// One member's answer, relayed to the leader (`0x4ba3f9`, `0x4ba405`).
     ReadyCheckAnswer { guid: u64, ready: bool },
+    /// The raid rebuild's ready-check leg, at its end (`0x4bac5a`-`0x4bacb9`): the rows it wrote
+    /// carry the pending flags, and with a member `gone` (the count at `0x4ba825`) the check
+    /// closes for its leader once no row is both pending and online.
+    RaidRebuilt { gone: bool },
+    /// `TriggerTutorial(id, 0)` (`0x4b5390`) inside a list's handler: the raid rebuild's Raid
+    /// Groups at its head (`0x4ba604`-`0x4ba60d`), the fire-once test and its `TUTORIAL_TRIGGER`
+    /// in place.
+    Tutorial(u32),
     /// `UPDATE_INSTANCE_INFO`, once per `SMSG_RAID_INSTANCE_INFO` (`0x49e1a7`, straight from
-    /// `0x49e0d8` when empty), with the list: `RaidFrame.lua:43` ignores the first, so the Raid
+    /// `0x49e08e` when empty), with the list: `RaidFrame.lua:43` ignores the first, so the Raid
     /// Info button is decided on the second.
     InstanceInfo(Vec<benilla_protocol::messages::RaidInstanceEntry>),
 }
@@ -249,8 +242,8 @@ pub(crate) enum GroupSignal {
 /// among the other lanes' items, once each ([`feed::fire_group_signals`]). Sequence numbers run on
 /// across trims and sessions, so a cursor into the log stays good. An entry lives two ages:
 /// `feed::drain_party` ages the log every frame, and the lane, which fires every frame the
-/// in-game interface is up, fires everything logged before the next age drops it. A frame with
-/// no VM drops what no VM heard; the next VM is a fresh one, and its catch-up stands in.
+/// in-game interface is up, fires everything logged before the next age drops it. A new VM
+/// starts past every entry logged before its birth (`feed::seed_vm_party`).
 #[derive(Default)]
 pub(crate) struct SignalLog {
     /// The sequence number of `entries[0]`.
@@ -311,12 +304,20 @@ impl SignalLog {
         self.aged = self.base;
     }
 
-    /// Every entry but the lines, which leaves the log empty.
+    /// Every entry but the lines, the raid rebuild's tutorial and its ready-check leg, which
+    /// leaves the log empty.
     #[cfg(test)]
     pub(crate) fn take_events(&mut self) -> Vec<GroupSignal> {
         self.take()
             .into_iter()
-            .filter(|s| !matches!(s, GroupSignal::Line(_)))
+            .filter(|s| {
+                !matches!(
+                    s,
+                    GroupSignal::Line(_)
+                        | GroupSignal::RaidRebuilt { .. }
+                        | GroupSignal::Tutorial(_)
+                )
+            })
             .collect()
     }
 
@@ -385,7 +386,10 @@ impl GroupState {
     /// (`0x4e8477`), each raid arrival and departure onto a held roster its notice's name
     /// (`0x4ba744`, `0x4ba7e3`), and a raid list's rebuild each row, ours included
     /// (`0x4ba9b6`-`0x4ba9c7`); a raid row that misses holds `RAID_ROSTER_UPDATE` back
-    /// (`0x4babdf`) until its answer, and a notice that misses waits for its own.
+    /// (`0x4babdf`) until its answer, and a notice that misses waits for its own. Each store is
+    /// written where the handler writes it, so each signal's place holds what a listener there
+    /// reads: the party slots ahead of `PARTY_MEMBERS_CHANGED`, then the leader, the loot cells and
+    /// at last the raid rows; the records take their online bits at the end.
     pub fn apply_list_awaiting(
         &mut self,
         group_type: u8,
@@ -398,7 +402,6 @@ impl GroupState {
         cached_name: &dyn Fn(u64) -> Option<String>,
     ) -> ListOutcome {
         let missed = |guid: u64| lookup(guid).is_none();
-        self.listed = true;
         // The entry naming the active player is skipped ahead of the raid arrays and the seats
         // (`0x5e6b77`-`0x5e6b88`); the wire omits the recipient, so it drops nothing there.
         let active = self_guid.unwrap_or(0);
@@ -427,6 +430,11 @@ impl GroupState {
                 .filter(|&g| g != 0 && missed(g))
                 .map(NameWait::Seat),
         );
+        // The emptier ahead of the seat loop (`0x5e6b19` into `0x4e84a0(0)`) zeroes the leader
+        // cell and the index cell (`0x4e85a9`, `0x4e85b5`), which the leader store fills only after
+        // the event (`0x5e6c7e`).
+        self.leader = 0;
+        self.store_leader_index();
         for m in &seated {
             if !held {
                 // Seated into no group: no line, but the chime (`0x5e6dc6`).
@@ -437,12 +445,19 @@ impl GroupState {
                 out.invite_accept = true;
             }
         }
+        // The seat loop has written the party slots (`0x5e6c4a` into `0x4e82d0`); the raid rows
+        // stay as the last rebuild left them until this list's (`0x5e6eb4`).
+        self.members = members.clone();
+        self.own_flags = own_flags;
+        self.slots_emptied = false;
         // Every path of the handler reaches the event after the seat loop (`0x5e6c66`), the leave
         // list and a party's list alike, and then the leader store (`0x5e6c7e` into `0x4e8250`),
         // against a cell the handler's own emptier zeroed first (`0x5e6b19` into `0x4e84a0(0)`,
         // `0x4e85a9`): it signals for every list naming a leader, the same one included, and
         // returns on the all-zero list's 0 (`0x4e8267`).
         self.signal(GroupSignal::MembersChanged);
+        self.leader = leader;
+        self.store_leader_index();
         if leader != 0 {
             self.signal(GroupSignal::LeaderChanged);
         }
@@ -476,6 +491,7 @@ impl GroupState {
         // The loot store (`0x5e6e52` into `0x4e86f0`) runs for a list with members, the one that
         // carries the loot tail (`0x5e6e12`): the lines of what the tail changes, then the event,
         // which it signals whatever the tail says (`0x4e87fa`), ahead of the raid legs.
+        self.loot = loot;
         if let Some(loot) = loot {
             for line in self.store_loot(loot, cached_name) {
                 self.line(&mut out, line);
@@ -483,7 +499,12 @@ impl GroupState {
             self.signal(GroupSignal::LootMethodChanged);
         }
         if raid {
-            // `0x4ba5f0`: with names pending, the old rows' lookups are cancelled first.
+            // `0x4ba5f0` opens on Raid Groups for a list with members, every rebuild; the
+            // tutorial's own bit makes it fire once (`0x4ba604`-`0x4ba60d`).
+            if !members.is_empty() {
+                self.signal(GroupSignal::Tutorial(crate::tutorial::id::RAID_GROUPS));
+            }
+            // With names pending, the old rows' lookups are cancelled next.
             if self.raid_names_pending != 0 {
                 let old: Vec<u64> = self.raid_rows().collect();
                 self.name_waits
@@ -493,6 +514,7 @@ impl GroupState {
             // (`0x5e6e6f`-`0x5e6e9c`).
             let own_row = (!members.is_empty()).then(|| self_guid.unwrap_or(0));
             let new_rows: Vec<u64> = members.iter().map(|m| m.guid).chain(own_row).collect();
+            let gone = raid_held && self.raid_rows().any(|g| !new_rows.contains(&g));
             // Onto a held roster (`0x4ba725`), each arrival in list order, then each departure in
             // row order, ours the last (`0x4ba7a0`-`0x4ba7fd`), so a list naming nobody sees us
             // leave too. Each is looked up with its notice's callback, a zero guid asking nothing
@@ -531,6 +553,8 @@ impl GroupState {
                 self.line(&mut out, UiError::key("ERR_RAID_YOU_JOINED"));
                 out.ask_raid_targets = true;
             }
+            // The rows (`0x4ba8a4`-`0x4ba960`), each ranked against this list's leader.
+            self.raid = RaidRow::rebuilt(&members, (self_guid.unwrap_or(0), own_flags), leader);
             // The rebuild counts afresh (`0x4ba89e`): each new row's lookup, ours after the
             // members' once any is listed, a zero guid asking nothing (`0x4ba9b4`). It ends in the
             // signal unless a name is pending (`0x4babdf`-`0x4babef`).
@@ -544,6 +568,7 @@ impl GroupState {
             if self.raid_names_pending == 0 {
                 self.signal(GroupSignal::RaidRosterUpdate);
             }
+            self.signal(GroupSignal::RaidRebuilt { gone });
         } else {
             // `0x4ba550`: a list that is not a raid drops the held roster (`0x4ba55f`), and says so
             // (`0x4ba57b`); with no roster held it signals no `RAID_ROSTER_UPDATE`. Either way it
@@ -552,6 +577,8 @@ impl GroupState {
             // (`Group.cpp:1358`).
             if raid_held {
                 self.line(&mut out, UiError::key("ERR_RAID_YOU_LEFT"));
+                // The count zeroed between the line and the event (`0x4ba571`).
+                self.raid.clear();
                 self.signal(GroupSignal::RaidRosterUpdate);
             }
             self.raid_targets = [0; 8];
@@ -582,14 +609,6 @@ impl GroupState {
 
         self.in_group = true;
         self.group_type = group_type;
-        self.own_flags = own_flags;
-        self.own_raid_row = (raid && !members.is_empty()).then(|| self_guid.unwrap_or(0));
-        self.raid_leader = if raid { leader } else { 0 };
-        self.members = members;
-        self.slots_emptied = false;
-        self.leader = leader;
-        self.store_leader_index();
-        self.loot = loot;
         // A real list ends the sandbox; `synthetic_roster` re-raises the flag after its own call.
         self.test = false;
         out
@@ -636,6 +655,13 @@ impl GroupState {
 
     /// Log one event where its handler signals it, behind every signal before it.
     pub(super) fn signal(&mut self, signal: GroupSignal) {
+        #[cfg(test)]
+        if self.signal_cells.is_some() {
+            let cells = self.cells().to_owned();
+            if let Some(seen) = &mut self.signal_cells {
+                seen.push((signal.clone(), cells));
+            }
+        }
         self.signals.push(signal);
     }
 
@@ -755,6 +781,13 @@ impl GroupState {
         self.cells().raid_rows()
     }
 
+    /// The rows a raid list's rebuild would write over the members, our flags and the leader as
+    /// they stand, our guid `own`, for a test that seats a raid by hand.
+    #[cfg(test)]
+    pub(crate) fn rebuild_raid(&mut self, own: u64) {
+        self.raid = RaidRow::rebuilt(&self.members, (own, self.own_flags), self.leader);
+    }
+
     /// The teardowns the last list or ending raised, for its handler to resolve.
     pub(crate) fn take_released(&mut self) -> Vec<RosterRelease> {
         std::mem::take(&mut self.released)
@@ -767,25 +800,31 @@ impl GroupState {
         self.signal(GroupSignal::InviteRequest(inviter.to_string()));
     }
 
-    /// `SMSG_GROUP_DECLINE`: our invitee said no; only the inviter gets it.
-    pub fn apply_declined(&mut self, name: &str) -> Vec<UiError> {
-        vec![UiError::s("ERR_DECLINE_GROUP_S", name)]
+    /// A handler's line, shown where it shows it (`0x496720`), among its signals; returned too.
+    fn show(&mut self, line: UiError) -> UiError {
+        self.signal(GroupSignal::Line(line.clone()));
+        line
     }
 
-    /// `SMSG_GROUP_UNINVITE`: we were kicked; ends the party and prints unconditionally
-    /// (`0x5e6850`-`0x5e6865`).
+    /// `SMSG_GROUP_DECLINE`: our invitee said no; only the inviter gets it.
+    pub fn apply_declined(&mut self, name: &str) -> Vec<UiError> {
+        vec![self.show(UiError::s("ERR_DECLINE_GROUP_S", name))]
+    }
+
+    /// `SMSG_GROUP_UNINVITE`: we were kicked; ends the party, then prints unconditionally
+    /// (`0x5e6855`, `0x5e685e`, then `0x5e6865`).
     pub fn apply_uninvited(&mut self) -> Vec<UiError> {
         self.end_party();
-        vec![UiError::key("ERR_UNINVITE_YOU")]
+        vec![self.show(UiError::key("ERR_UNINVITE_YOU"))]
     }
 
     /// `SMSG_GROUP_DESTROYED`: prints only while a party slot is occupied (`0x5e6880` tests
-    /// `0x4e86d0`, the slot count), so not after a kick or in a raid whose subgroup holds only us,
-    /// then ends the party (`0x5e6893`). vmangos's two-member collapse sends none
+    /// `0x4e86d0`, the slot count), so not after a kick or in a raid whose subgroup holds only us
+    /// (`0x5e688b`), then ends the party (`0x5e6898`). vmangos's two-member collapse sends none
     /// (`Group/Group.cpp:533`).
     pub fn apply_destroyed(&mut self) -> Vec<UiError> {
         let lines = if self.party_slots().next().is_some() {
-            vec![UiError::key("ERR_GROUP_DISBANDED")]
+            vec![self.show(UiError::key("ERR_GROUP_DISBANDED"))]
         } else {
             Vec::new()
         };
@@ -795,11 +834,12 @@ impl GroupState {
 
     /// `SMSG_GROUP_SET_LEADER`; vmangos sends the full list right after (`Group::ChangeLeader`).
     pub fn apply_leader_changed(&mut self, name: &str, own_name: Option<&str>) -> Vec<UiError> {
-        if own_name == Some(name) {
-            vec![UiError::key("ERR_NEW_LEADER_YOU")]
+        let line = if own_name == Some(name) {
+            UiError::key("ERR_NEW_LEADER_YOU")
         } else {
-            vec![UiError::s("ERR_NEW_LEADER_S", name)]
-        }
+            UiError::s("ERR_NEW_LEADER_S", name)
+        };
+        vec![self.show(line)]
     }
 
     /// `SMSG_PARTY_COMMAND_RESULT` through the reference's jump table (`0x5e6a14`): one message
@@ -814,7 +854,7 @@ impl GroupState {
         result: u32,
     ) -> Option<UiError> {
         let named = |key: &'static str| UiError::s(key, member);
-        match result {
+        let line = match result {
             party_result::OK => match operation {
                 // The reference's guard: an invite ack with no name prints nothing.
                 party_operation::INVITE if !member.is_empty() => Some(named("ERR_INVITE_PLAYER_S")),
@@ -834,7 +874,8 @@ impl GroupState {
             party_result::WRONG_FACTION => Some(UiError::key("ERR_PLAYER_WRONG_FACTION")),
             party_result::IGNORING_YOU => Some(named("ERR_IGNORING_YOU_S")),
             _ => None,
-        }
+        };
+        line.map(|line| self.show(line))
     }
 
     /// `SMSG_PARTY_MEMBER_STATS`: a delta patches the record field by field (`0x5e519d`, seeded from
@@ -927,10 +968,9 @@ impl GroupState {
             group_type,
             own_flags,
             members,
-            own_raid_row,
+            raid,
             slots_emptied,
             leader,
-            raid_leader,
             loot,
             stats,
             raid_targets,
@@ -942,8 +982,7 @@ impl GroupState {
             loot_stored: _,
             // The leader-index cell, which the list's own leader store writes next (`0x5e6c7e`).
             leader_index: _,
-            // Session state the feed fires events off: kept until `clear_session`.
-            listed: _,
+            // The lane's log: kept until `clear_session`.
             signals: _,
             // The name cache's callbacks, which no list ending touches (`0x4ba550`).
             name_waits: _,
@@ -951,15 +990,16 @@ impl GroupState {
             saved_instances: _,
             // The list's own teardowns, raised before its reset.
             released: _,
+            #[cfg(test)]
+                signal_cells: _,
         } = self;
         *in_group = false;
         *group_type = 0;
         *own_flags = 0;
         members.clear();
-        *own_raid_row = None;
+        raid.clear();
         *slots_emptied = false;
         *leader = 0;
-        *raid_leader = 0;
         *loot = None;
         stats.clear();
         *raid_targets = [0; 8];
@@ -992,22 +1032,24 @@ impl GroupState {
     }
 
     /// `MSG_RAID_READY_CHECK`, open form, echoed to the whole group: `0x4ba360` splits on the
-    /// leader guid, and only a non-leader prints the leader's line and gets the popup. Both arms
-    /// arm the engine's side first.
-    pub fn apply_ready_check_request(&mut self, we_lead: bool) -> Vec<UiError> {
+    /// leader guid, and only a non-leader prints the leader's line (`0x4ba51e`), then gets the
+    /// popup (`0x4ba53a`). Both arms arm the engine's side first. The line's name is the name
+    /// cache's record for the leader, read with no callback (`cached_name`, `0x4ba50f` →
+    /// `0x55f080`): a miss prints nothing and queries nothing (`0x4ba514`-`0x4ba516`, `0x55f120`),
+    /// and the deadline and `READY_CHECK` follow either way (`0x4ba535`, `0x4ba53a`).
+    pub fn apply_ready_check_request(
+        &mut self,
+        we_lead: bool,
+        cached_name: &dyn Fn(u64) -> Option<String>,
+    ) -> Vec<UiError> {
         self.signal(GroupSignal::ReadyCheckRequest { we_lead });
         if we_lead {
             return Vec::new();
         }
+        let line = cached_name(self.leader)
+            .map(|name| self.show(UiError::s("ERR_RAID_LEADER_READY_CHECK_START_S", name)));
         self.signal(GroupSignal::ReadyCheck);
-        // The reference prints its name cache's entry for the leader; the roster holds the same.
-        let leader = self
-            .members
-            .iter()
-            .find(|m| m.guid == self.leader)
-            .map(|m| m.name.as_str())
-            .unwrap_or("");
-        vec![UiError::s("ERR_RAID_LEADER_READY_CHECK_START_S", leader)]
+        line.into_iter().collect()
     }
 
     /// `MSG_RAID_READY_CHECK`, answer form: one member's answer, forwarded to the leader alone.
@@ -1123,9 +1165,6 @@ mod tests {
 
         g.leave_group();
         assert_eq!(g.signals.take_events(), [], "leaving is not a list");
-        assert!(g.listed);
-        g.clear_session();
-        assert!(!g.listed);
     }
 
     /// One list's signals and lines in the handler's order: the members change (`0x5e6c66`), the
@@ -1163,6 +1202,87 @@ mod tests {
         );
     }
 
+    /// The raid rows are their own state: a list zeroes the leader cells (`0x4e85a9`, `0x4e85b5`)
+    /// and writes the party slots ahead of `PARTY_MEMBERS_CHANGED` (`0x5e6c4a`, `0x5e6c66`), then
+    /// the leader (`0x5e6c7e`) and the loot cells (`0x5e6e52`), and the rows only at its rebuild
+    /// (`0x5e6eb4` into `0x4ba5f0`), so each signal's place holds the new slots beside the old rows
+    /// until the rebuild's own event.
+    #[test]
+    fn the_raid_rows_stay_as_stored_until_the_rebuild_writes_them() {
+        use GroupSignal::*;
+        let mut g = GroupState::default();
+        g.apply_list(
+            1,
+            0,
+            vec![sub("Alice", 1, 0), sub("Bob", 2, 1)],
+            ME,
+            None,
+            Some(ME),
+        );
+        let old_rows: Vec<u64> = g.raid_rows().collect();
+        assert_eq!(old_rows, [1, 2, ME]);
+        g.signal_cells = Some(Vec::new());
+        // Bob leaves, Carol joins our subgroup, and Alice leads.
+        let loot = GroupLootInfo {
+            method: 3,
+            master: 0,
+            threshold: 2,
+        };
+        g.apply_list(
+            1,
+            0,
+            vec![sub("Alice", 1, 0), sub("Carol", 3, 0)],
+            1,
+            Some(loot),
+            Some(ME),
+        );
+        let seen = g.signal_cells.take().unwrap();
+        let at = |signal: &GroupSignal| {
+            let (_, cells) = seen
+                .iter()
+                .find(|(s, _)| s == signal)
+                .unwrap_or_else(|| panic!("{signal:?} signalled"));
+            let cells = cells.cells();
+            if *signal == MembersChanged {
+                assert_eq!(
+                    cells.leader_index, 1,
+                    "the index cell zeroed, read plus one"
+                );
+            }
+            (
+                cells.party_slots().map(|m| m.guid).collect::<Vec<_>>(),
+                cells.leader,
+                cells.loot_stored.method,
+                cells.raid_rows().collect::<Vec<_>>(),
+            )
+        };
+        assert_eq!(
+            at(&MembersChanged),
+            (vec![1, 3], 0, 0, old_rows.clone()),
+            "the new slots beside the emptier's zeroed leader and the old loot and rows"
+        );
+        assert_eq!(
+            at(&LeaderChanged),
+            (vec![1, 3], 1, 0, old_rows.clone()),
+            "the leader stored, the rows still the old"
+        );
+        assert_eq!(
+            at(&LootMethodChanged),
+            (vec![1, 3], 1, 3, old_rows),
+            "the loot cells stored, the rows still the old"
+        );
+        assert_eq!(
+            at(&RaidRosterUpdate),
+            (vec![1, 3], 1, 3, vec![1, 3, ME]),
+            "the rebuild's own event reads its rows"
+        );
+        assert_eq!(
+            g.raid.iter().map(|r| r.rank).collect::<Vec<_>>(),
+            [2, 0, 0],
+            "ranked against this list's leader"
+        );
+    }
+
     /// The log keeps an entry through the age after the one that found it, so a reader between
     /// any two ages sees it, and its numbering runs on across ages and a clear.
     #[test]
@@ -1186,6 +1306,27 @@ mod tests {
             [RaidTargetUpdate],
             "an old cursor reads what is left"
         );
+    }
+
+    /// Each raid rebuild ends in its ready-check leg (`0x4bac5a`), after its roster signal, told
+    /// whether a member is gone from the rows it replaced (`0x4ba825`).
+    #[test]
+    fn each_raid_rebuild_ends_in_its_ready_check_leg() {
+        let mut g = GroupState::default();
+        let mut raid = |members: Vec<GroupMemberEntry>| {
+            g.apply_list(1, 0, members, 1, None, Some(ME));
+            g.signals
+                .take()
+                .into_iter()
+                .filter_map(|s| match s {
+                    GroupSignal::RaidRebuilt { gone } => Some(gone),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let (alice, bob) = (sub("Alice", 1, 0), sub("Bob", 2, 1));
+        assert_eq!(raid(vec![alice.clone(), bob]), [false], "a new raid");
+        assert_eq!(raid(vec![alice]), [true], "Bob is gone");
     }
 
     /// The raid roster writer signals after each rebuild (`0x4babef`), and nothing gates the signal
@@ -1438,7 +1579,7 @@ mod tests {
             ..Default::default()
         };
         g.raid_targets[0] = 0xA11CE;
-        g.apply_ready_check_request(false);
+        g.apply_ready_check_request(false, &|_| None);
         g.apply_raid_instance_info(Vec::new());
         g.apply_raid_instance_info(vec![lockout]);
         assert_eq!(
@@ -1472,6 +1613,50 @@ mod tests {
         assert!(g.saved_instances.is_empty());
     }
 
+    /// The leader's line is the name cache's record for the leader, read with no callback
+    /// (`0x4ba50f` → `0x55f080`), not the roster's row: a cached leader prints it ahead of
+    /// `READY_CHECK`, spelt as the cache has it.
+    #[test]
+    fn a_cached_leader_prints_the_ready_check_line_before_the_popup() {
+        let mut g = GroupState {
+            leader: 0xA11CE,
+            members: vec![member("Roster", 0xA11CE)],
+            ..Default::default()
+        };
+        let line = UiError::s("ERR_RAID_LEADER_READY_CHECK_START_S", "Cached");
+        assert_eq!(
+            g.apply_ready_check_request(false, &|guid| (guid == 0xA11CE).then(|| "Cached".into())),
+            vec![line.clone()]
+        );
+        assert_eq!(
+            g.signals.take(),
+            [
+                GroupSignal::ReadyCheckRequest { we_lead: false },
+                GroupSignal::Line(line),
+                GroupSignal::ReadyCheck
+            ]
+        );
+    }
+
+    /// A leader the cache lacks prints nothing, even with the roster holding the name, and
+    /// the deadline and `READY_CHECK` follow all the same (`0x4ba514`-`0x4ba53a`).
+    #[test]
+    fn an_uncached_leader_prints_no_ready_check_line_but_the_popup_fires() {
+        let mut g = GroupState {
+            leader: 0xA11CE,
+            members: vec![member("Alice", 0xA11CE)],
+            ..Default::default()
+        };
+        assert!(g.apply_ready_check_request(false, &|_| None).is_empty());
+        assert_eq!(
+            g.signals.take_events(),
+            [
+                GroupSignal::ReadyCheckRequest { we_lead: false },
+                GroupSignal::ReadyCheck
+            ]
+        );
+    }
+
     #[test]
     fn the_open_form_pops_for_a_member_and_stays_quiet_for_the_leader() {
         let mut g = GroupState {
@@ -1482,7 +1667,7 @@ mod tests {
         g.apply_ready_check_answer(0xB0B, true);
 
         assert_eq!(
-            g.apply_ready_check_request(false),
+            g.apply_ready_check_request(false, &|_| Some("Alice".into())),
             vec![UiError::s("ERR_RAID_LEADER_READY_CHECK_START_S", "Alice")]
         );
         assert_eq!(
@@ -1499,7 +1684,8 @@ mod tests {
         );
 
         assert!(
-            g.apply_ready_check_request(true).is_empty(),
+            g.apply_ready_check_request(true, &|_| Some("Alice".into()))
+                .is_empty(),
             "the leader's echo"
         );
         assert_eq!(
@@ -1638,7 +1824,11 @@ mod tests {
                 3,
                 "ending {i}: the raid roster stays"
             );
-            assert_eq!(g.raid_leader, 1, "and ranks as it was rebuilt");
+            assert_eq!(
+                g.raid.iter().map(|r| r.rank).collect::<Vec<_>>(),
+                [2, 0, 0],
+                "and ranks as it was rebuilt"
+            );
             assert_eq!(
                 g.apply_list(0, 0, Vec::new(), 0, None, Some(ME)).lines,
                 vec![UiError::key("ERR_RAID_YOU_LEFT")],
@@ -2301,7 +2491,7 @@ mod tests {
         lines.extend(g.apply_destroyed());
         lines.extend(g.apply_uninvited());
         g.leader = 1;
-        lines.extend(g.apply_ready_check_request(false));
+        lines.extend(g.apply_ready_check_request(false, &|_| Some("Alice".into())));
         lines.extend(g.apply_list(0, 0, Vec::new(), 0, None, None).lines);
 
         let mut keys: Vec<&str> = lines.iter().map(|m| m.key).collect();

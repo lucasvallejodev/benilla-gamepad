@@ -1,8 +1,9 @@
 //! The group getters' questions of the roster, asked of the lent host at the call
 //! ([`crate::script::live::ask`]): the reference's getters read the party slots (`0xbc6f48`), the
 //! leader cell (`0xbc75f8`), the loot cells and the raid rows (`0xb712a8`) as they stand when they
-//! run, so a listener reads the roster its own packet left. With no host free to ask, the
-//! snapshot ([`super::PartyState`]) answers.
+//! run, so a listener reads the roster its own packet left. With no host free to ask, the no-host
+//! default ([`super::PartyState`]) answers: ungrouped, as the app never pushes one, unless a
+//! host-less test seats it.
 
 use mlua::Lua;
 
@@ -164,4 +165,91 @@ pub struct GroupRow {
 
 impl LiveQuery for RowQuery {
     type Answer = GroupRow;
+}
+
+/// Every group row the token walk reads as an event names its unit (`0x515c50`): party rows 1 to
+/// 4 (`0x491920`, `0x491930`) and raid rows 1 to 40 (`0x491940`, `0x491960`), each as
+/// [`RowQuery`] answers it, at the call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GroupRowsQuery;
+
+/// The party rows and the raid rows, an empty row past the roster's end.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GroupRows {
+    pub party: [GroupRow; 4],
+    pub raid: Vec<GroupRow>,
+}
+
+impl LiveQuery for GroupRowsQuery {
+    type Answer = GroupRows;
+}
+
+/// `guid`'s place in the group, live where a host answers, else off the snapshot: the active
+/// player or a party slot (`0x4e7f70`), a raid row below the count (`0x4baee0`) with its rank.
+pub(crate) fn membership(lua: &Lua, snapshot: &PartyState, guid: u64) -> Membership {
+    if let Some(live) = live_membership(lua, guid) {
+        return live;
+    }
+    let rank = snapshot
+        .raid
+        .iter()
+        .find(|m| guid != 0 && m.guid == guid)
+        .map(|m| m.rank);
+    Membership {
+        party: guid != 0
+            && (guid == snapshot.own_guid
+                || snapshot.members.iter().take(4).any(|m| m.guid == guid)),
+        raid: rank.is_some(),
+        rank,
+    }
+}
+
+/// The raid rows below the count (`[0xb712a8]`, `[0xb713e0]`) as `GetRaidRosterInfo` reads them,
+/// live where a host answers, else off the snapshot.
+pub(crate) fn raid_rows(lua: &Lua, snapshot: &PartyState) -> Vec<RaidMemberInfo> {
+    let Some(cells) = live_cells(lua) else {
+        return snapshot.raid.clone();
+    };
+    (0..cells.raid_count as usize)
+        .filter_map(|row| ask(lua, &RaidRowQuery(row)).flatten())
+        .collect()
+}
+
+/// The raid rows' guids below the count, live where a host answers, else off the snapshot.
+pub(crate) fn raid_guids(lua: &Lua, snapshot: &PartyState) -> Vec<u64> {
+    let Some(cells) = live_cells(lua) else {
+        return snapshot.raid.iter().map(|m| m.guid).collect();
+    };
+    (0..cells.raid_count)
+        .filter_map(|row| ask(lua, &RowQuery(UnitBase::Raid(row))).map(|r| r.member))
+        .collect()
+}
+
+/// One group member as the by-name resolver's roster passes see it (`0x493b22`, `0x493ba7`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RosterName {
+    /// The member's name; empty for none, which the matcher skips (`0x493c68`).
+    pub name: String,
+    pub guid: u64,
+    /// The object manager holds a unit under the guid (`0x493b46`, `0x493bde`).
+    pub held: bool,
+}
+
+/// The party slots and the raid rows below the count, as the roster passes walk them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RosterNames {
+    pub party: Vec<RosterName>,
+    pub raid: Vec<RosterName>,
+}
+
+/// The roster passes' members ([`RosterNames`]).
+pub struct RosterNamesQuery;
+
+impl LiveQuery for RosterNamesQuery {
+    type Answer = RosterNames;
+}
+
+/// The roster passes' members through the lent host, `None` where none answers.
+pub(crate) fn live_roster_names(lua: &Lua) -> Option<RosterNames> {
+    ask(lua, &RosterNamesQuery)
 }

@@ -635,12 +635,6 @@ pub(crate) struct CastEvent {
     pub(crate) entity: Entity,
     pub(crate) spell_id: u32,
     pub(crate) kind: CastEventKind,
-    /// `SMSG_SPELL_GO`'s cast flags, 0 on every other edge: the tradeskill repeat's hook skips a
-    /// GO with `0x41` set (`0x6e81de`, vmangos `Spell.h:54`).
-    pub(crate) cast_flags: u16,
-    /// `SMSG_SPELL_GO`'s first guid is an item, not the caster: the tradeskill repeat's hook runs
-    /// only when that guid is the player (`0x6e81d3`-`0x6e81dc`).
-    pub(crate) item_cast: bool,
     /// `PlaySeq` stamp, carried to the kit's `EmoteAnim`.
     pub(crate) seq: u64,
 }
@@ -863,6 +857,8 @@ pub(crate) use impact::{DefenseAnim, PendingImpacts, SwingImpact, SwingSlowdown}
 
 /// The cast and auto-repeat state the seams queue for after the pass.
 mod edits;
+#[cfg(test)]
+pub(crate) use edits::applied_resources;
 pub(crate) use edits::{apply_unit_edits, flush_unit_edits, UnitEdit, UnitEdits};
 
 /// The unit's precast spell and its busy bit.

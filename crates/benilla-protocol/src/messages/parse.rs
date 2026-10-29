@@ -8,13 +8,13 @@ use crate::wire::{
 };
 
 use super::{
-    action_bar, area_trigger, attack, auction, bank, battlefield, binder, broadcast, channel, chat,
-    combat_log, death, duel, game_time, gameobject, gm_ticket, gossip, group, guild, instance,
-    items, loot, mail, meeting_stone, mirror_timer, monster_move, movement, opcode, page_text, pet,
-    petition, pose, progression, pvp, quest, social, spellbook, spells, stable, summon, tabard,
-    taxi, trade, trainer, tutorial, update_object, vendor, world_state, AddonRecord,
-    AttackSwingError, Character, CreatureQueryInfo, JumpInfo, MoveMode, ServerPacket, SpeedKind,
-    SplineMode, WowTime,
+    account_data, action_bar, area_trigger, attack, auction, bank, battlefield, binder, broadcast,
+    channel, chat, combat_log, death, duel, game_time, gameobject, gm_ticket, gossip, group, guild,
+    instance, items, loot, mail, meeting_stone, mirror_timer, monster_move, movement, opcode,
+    page_text, pet, petition, pose, progression, pvp, quest, social, spellbook, spells, stable,
+    summon, tabard, taxi, trade, trainer, tutorial, update_object, vendor, world_state,
+    AddonRecord, AttackSwingError, Character, CreatureQueryInfo, JumpInfo, MoveMode, ServerPacket,
+    SpeedKind, SplineMode, WowTime,
 };
 
 /// Read a `SMSG_FORCE_*_SPEED_CHANGE` body: `[packed guid][u32 counter][f32 speed]` for all six
@@ -459,9 +459,13 @@ fn parse_server_body(
             }
         }
         // The ticket response opcodes share one 4-byte body; only the opcode names the verb.
-        opcode::SMSG_GMTICKET_GETTICKET => ServerPacket::GmTicketAnswer {
-            ticket: gm_ticket::read_gm_ticket(&mut r)?.map(Box::new),
-        },
+        opcode::SMSG_GMTICKET_GETTICKET => {
+            let (status, ticket) = gm_ticket::read_gm_ticket(&mut r)?;
+            ServerPacket::GmTicketAnswer {
+                status,
+                ticket: ticket.map(Box::new),
+            }
+        }
         opcode::SMSG_GMTICKET_CREATE => ServerPacket::GmTicketCreated {
             response: gm_ticket::read_gm_ticket_response(&mut r)?,
         },
@@ -565,6 +569,12 @@ fn parse_server_body(
         ),
         opcode::SMSG_MEETINGSTONE_JOIN_FAILED => {
             ServerPacket::MeetingStoneNotice(meeting_stone::read_meeting_stone_join_failed(&mut r)?)
+        }
+        opcode::SMSG_ACCOUNT_DATA_MD5 => {
+            ServerPacket::AccountDataMd5(account_data::read_account_data_md5(&mut r)?)
+        }
+        opcode::SMSG_UPDATE_ACCOUNT_DATA => {
+            ServerPacket::UpdateAccountData(account_data::read_update_account_data(&mut r)?)
         }
         opcode::SMSG_TUTORIAL_FLAGS => {
             ServerPacket::TutorialFlags(tutorial::read_tutorial_flags(&mut r)?)
@@ -1322,6 +1332,17 @@ fn parse_server_body(
         opcode::SMSG_GAMEOBJECT_PAGETEXT => ServerPacket::GameObjectPageText {
             guid: gameobject::read_gameobject_page_text(&mut r)?,
         },
+        opcode::SMSG_READ_ITEM_OK => ServerPacket::ReadItemOk {
+            guid: read_u64_le(&mut r)?,
+        },
+        opcode::SMSG_READ_ITEM_FAILED => {
+            let (guid, reason, milliseconds) = items::read_read_item_failed(&mut r)?;
+            ServerPacket::ReadItemFailed {
+                guid,
+                reason,
+                milliseconds,
+            }
+        }
         opcode::SMSG_OPEN_CONTAINER => ServerPacket::OpenContainer {
             item: items::read_open_container(&mut r)?,
         },

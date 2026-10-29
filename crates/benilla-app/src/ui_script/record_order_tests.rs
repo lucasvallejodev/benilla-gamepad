@@ -4,17 +4,25 @@
 //! window's own message order gives them.
 
 use bevy::input::keyboard::{Key, KeyboardInput};
-use bevy::input::mouse::MouseButtonInput;
+use bevy::input::mouse::{MouseButtonInput, MouseScrollUnit, MouseWheel};
 use bevy::input::ButtonState;
 use bevy::prelude::*;
 use bevy::window::{CursorMoved, WindowEvent};
 
 use benilla_ui::script::UiScript;
 
-/// The whole client in the world with a VM that binds `1` to a body logging `key;`, and a button
-/// over the screen's left half logging its `OnClick` as `click;`. The cursor starts over it.
+/// The whole client in the world with a VM that binds `1` to a body logging `key;` and the wheel up
+/// to one logging `zoom;`, and a button over the screen's left half logging its `OnClick` as
+/// `click;` and its `OnMouseWheel` as `wheel;`. The cursor starts over it. A small frame on the
+/// right half logs its `OnEnter` and `OnLeave`.
 fn client() -> App {
+    client_with(UVec2::new(1024, 768), true)
+}
+
+/// [`client`] on a `size` window, `widescreen` as given.
+fn client_with(size: UVec2, widescreen: bool) -> App {
     let mut app = crate::game_plugins::schedule_tests::headless_client();
+    app.insert_resource(crate::video::Widescreen(widescreen));
     app.insert_resource(bevy::ecs::error::DefaultErrorHandler(
         bevy::ecs::error::ignore,
     ));
@@ -26,7 +34,7 @@ fn client() -> App {
     let mut script = UiScript::new().expect("a VM");
     script.set_default_bindings(benilla_ui::script::keybind::parse_bindings_wtf(
         "bind 1 PROBEKEY\r\nbind SHIFT-1 PROBESHIFT\r\nbind ENTER PROBEBOX\r\n\
-         bind W PROBEW\r\nbind BUTTON1 PROBEBUTTON\r\n",
+         bind W PROBEW\r\nbind BUTTON1 PROBEBUTTON\r\nbind MOUSEWHEELUP PROBEWHEEL\r\n",
     ));
     script.load_binding_set(1);
     script.register_bindings(
@@ -36,6 +44,7 @@ fn client() -> App {
                 <Binding name="PROBESHIFT">LOG = LOG .. "shift;"</Binding>
                 <Binding name="PROBEBOX">ProbeBox:Show() ProbeBox:SetFocus()</Binding>
                 <Binding name="PROBEW">LOG = LOG .. "w;"</Binding>
+                <Binding name="PROBEWHEEL">LOG = LOG .. "zoom;"</Binding>
                 <Binding name="PROBEBUTTON" runOnUp="true">LOG = LOG .. "b1 " .. keystate .. ";"</Binding>
             </Bindings>"#,
         )
@@ -49,6 +58,13 @@ fn client() -> App {
             b:SetPoint("BOTTOMLEFT", 0, 0) b:SetWidth(512) b:SetHeight(768)
             b:EnableMouse(true)
             b:SetScript("OnClick", function() LOG = LOG .. "click;" end)
+            b:EnableMouseWheel(true)
+            b:SetScript("OnMouseWheel", function() LOG = LOG .. "wheel;" end)
+            local f = CreateFrame("Frame", "CrossedFrame")
+            f:SetPoint("BOTTOMLEFT", 700, 618) f:SetWidth(100) f:SetHeight(100)
+            f:EnableMouse(true)
+            f:SetScript("OnEnter", function() LOG = LOG .. "enter;" end)
+            f:SetScript("OnLeave", function() LOG = LOG .. "leave;" end)
             local e = CreateFrame("EditBox", "ProbeBox")
             e:SetPoint("TOPLEFT", 600, -10) e:SetWidth(200) e:SetHeight(20)
             e:SetAutoFocus(false) e:Hide()"#,
@@ -59,7 +75,7 @@ fn client() -> App {
     app.insert_non_send_resource(script);
     app.insert_resource(State::new(crate::client_state::ClientState::InWorld));
     let mut window = Window {
-        resolution: UVec2::new(1024, 768).into(),
+        resolution: size.into(),
         ..default()
     };
     window.set_cursor_position(Some(Vec2::new(100.0, 100.0)));
@@ -93,7 +109,10 @@ fn send(app: &mut App, event: WindowEvent) {
         WindowEvent::CursorMoved(e) => {
             world.write_message(e);
         }
-        _ => unreachable!("the fixture sends keys, buttons and moves"),
+        WindowEvent::MouseWheel(e) => {
+            world.write_message(e);
+        }
+        _ => unreachable!("the fixture sends keys, buttons, moves and wheel turns"),
     }
     world.write_message(event);
 }
@@ -143,6 +162,20 @@ fn button(app: &mut App, state: ButtonState) {
         WindowEvent::MouseButtonInput(MouseButtonInput {
             button: MouseButton::Left,
             state,
+            window,
+        }),
+    );
+}
+
+/// One wheel notch up.
+fn wheel_up(app: &mut App) {
+    let window = app.world().resource::<PrimaryId>().0;
+    send(
+        app,
+        WindowEvent::MouseWheel(MouseWheel {
+            unit: MouseScrollUnit::Line,
+            x: 0.0,
+            y: 1.0,
             window,
         }),
     );
@@ -258,4 +291,113 @@ fn a_press_and_its_binding_agree_when_the_cursor_crosses_a_frame_in_the_frame() 
     app.update();
     assert_eq!(log(&app), "");
     assert!(!held(&app), "the press was the button's");
+}
+
+/// With `widescreen` 0 the interface is 4:3 (`0x4901e0` answers 4/3) and drawn stretched across a
+/// 16:9 window: a point in root units taken out to the window and clicked there reaches the frame
+/// under it, and `GetCursorPosition` (`0x48b820`) answers the same point back.
+#[test]
+fn widescreen_off_takes_a_click_through_the_stretch_and_back() {
+    use super::{ui_to_window, UiScreen};
+    let mut app = client_with(UVec2::new(1920, 1080), false);
+    app.world_mut()
+        .non_send_resource_mut::<UiScript>()
+        .run(
+            r#"local b = CreateFrame("Button", "StretchProbe")
+            b:SetPoint("BOTTOMLEFT", 900, 0) b:SetWidth(124) b:SetHeight(768)
+            b:EnableMouse(true)
+            b:SetScript("OnClick", function()
+                local x, y = GetCursorPosition()
+                LOG = LOG .. format("%.0f %.0f %.0f;", x, y, GetScreenWidth())
+            end)"#,
+        )
+        .expect("the probe builds");
+    app.update();
+    let at = ui_to_window(
+        UiScreen::of(Vec2::new(1920.0, 1080.0), false),
+        Vec2::new(962.0, 384.0),
+    );
+    // The 1024-wide root spans the 1920 window: 962 units in is 1803.75 px.
+    assert!((at - Vec2::new(1803.75, 540.0)).length() < 1e-3, "{at}");
+    move_to(&mut app, at);
+    button(&mut app, ButtonState::Pressed);
+    button(&mut app, ButtonState::Released);
+    app.update();
+    assert_eq!(log(&app), "962 384 1024;");
+}
+
+/// Two moves in one frame, onto a frame and off it again: each move is a record with its own hover
+/// walk (`0x7660d0`), so the frame the cursor crossed gets its `OnEnter` and its `OnLeave`.
+#[test]
+fn a_frame_crossed_within_one_frame_is_entered_and_left() {
+    let mut app = client();
+    move_to(&mut app, Vec2::new(750.0, 100.0));
+    move_to(&mut app, Vec2::new(950.0, 100.0));
+    app.update();
+    assert_eq!(log(&app), "enter;leave;");
+}
+
+/// A wheel turn and a click in one frame run in the window's order: the wheel's record dispatches
+/// at its place (kind 0xb, category 0x10, `0x7664f0`), ahead of a click that follows it and behind
+/// one that came first.
+#[test]
+fn a_wheel_turn_runs_at_its_place_among_the_clicks() {
+    let mut app = client();
+    wheel_up(&mut app);
+    button(&mut app, ButtonState::Pressed);
+    button(&mut app, ButtonState::Released);
+    app.update();
+    assert_eq!(log(&app), "wheel;click;");
+
+    let mut app = client();
+    button(&mut app, ButtonState::Pressed);
+    button(&mut app, ButtonState::Released);
+    wheel_up(&mut app);
+    app.update();
+    assert_eq!(log(&app), "click;wheel;");
+}
+
+/// A notch over the world runs the world frame's wheel binding (`0x483d20`) inside its own record,
+/// so a key bound after it runs after it.
+#[test]
+fn a_notch_over_the_world_binds_at_its_place() {
+    let mut app = client();
+    // The world frame over the right half, where the wheel walk meets it.
+    app.world_mut()
+        .non_send_resource_mut::<UiScript>()
+        .run(
+            r#"WorldFrame:SetPoint("BOTTOMLEFT", 512, 0)
+            WorldFrame:SetWidth(512) WorldFrame:SetHeight(768)"#,
+        )
+        .expect("the world frame places");
+    app.update();
+    move_to(&mut app, Vec2::new(900.0, 700.0));
+    wheel_up(&mut app);
+    key(&mut app, KeyCode::Digit1, ButtonState::Pressed);
+    app.update();
+    assert_eq!(log(&app), "zoom;key;");
+}
+
+/// While the egui dev overlay holds the pointer, a notch over the world runs no binding: the
+/// world's wheel is not the overlay's to give.
+#[test]
+fn a_notch_runs_no_binding_while_the_dev_overlay_holds_the_pointer() {
+    let mut app = client();
+    app.world_mut()
+        .non_send_resource_mut::<UiScript>()
+        .run(
+            r#"WorldFrame:SetPoint("BOTTOMLEFT", 512, 0)
+            WorldFrame:SetWidth(512) WorldFrame:SetHeight(768)"#,
+        )
+        .expect("the world frame places");
+    app.update();
+    app.insert_resource(super::EguiPointerOver(true));
+    move_to(&mut app, Vec2::new(900.0, 700.0));
+    wheel_up(&mut app);
+    app.update();
+    assert_eq!(log(&app), "");
+    app.insert_resource(super::EguiPointerOver(false));
+    wheel_up(&mut app);
+    app.update();
+    assert_eq!(log(&app), "zoom;", "and does once the overlay lets go");
 }

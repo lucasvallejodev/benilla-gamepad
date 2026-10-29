@@ -5,13 +5,11 @@
 use benilla_protocol::field::{FIELD_UNIT_HEALTH, FIELD_UNIT_MAXHEALTH};
 use benilla_protocol::messages::ObjectType;
 use benilla_protocol::{EntityKind, ObjectFields, SessionEvent};
-use bevy::ecs::system::RunSystemOnce;
 use bevy::prelude::*;
 
-use super::{click, track, Hovered, PressPick, Selection};
+use super::{click, Hovered, PressPick, Selection};
 use crate::net::{ClientCommand, GuidIndex, SelfGuid};
 use crate::test_support::runs_before;
-use benilla_world::interact::WorldClick;
 
 const ME: u64 = 0x10;
 const MOB: u64 = 0xF130_0000_0031_0001;
@@ -44,10 +42,9 @@ fn created(guid: u64, kind: EntityKind, as_type: ObjectType, mask: u32) -> Sessi
 enum Step {
     /// The world click's select.
     Click,
-    /// The net drain, which applies the frame's packets.
+    /// The net drain, which applies the frame's packets, a unit's release tearing its selection
+    /// down inside it.
     Net,
-    /// The selection's follow of its object, whose deactivation tears it down.
-    Follow,
 }
 
 /// Binds `$s` to the client's system for `$step` and evaluates `$body` with it.
@@ -55,15 +52,11 @@ macro_rules! with_system {
     ($step:expr, |$s:ident| $body:expr) => {
         match $step {
             Step::Click => {
-                let $s = click::select_on_click;
+                let $s = crate::ui_script::dispatch_input_records;
                 $body
             }
             Step::Net => {
                 let $s = crate::net::apply_net_updates;
-                $body
-            }
-            Step::Follow => {
-                let $s = track::follow_selection_object;
                 $body
             }
         }
@@ -72,7 +65,7 @@ macro_rules! with_system {
 
 /// The steps in the order `Update` declares them; panics on a pair it leaves unordered.
 fn in_frame_order(app: &mut App) -> Vec<Step> {
-    let mut steps = vec![Step::Click, Step::Net, Step::Follow];
+    let mut steps = vec![Step::Click, Step::Net];
     let mut before = Vec::new();
     for (i, a) in steps.iter().enumerate() {
         for b in &steps[i + 1..] {
@@ -99,14 +92,14 @@ fn in_frame_order(app: &mut App) -> Vec<Step> {
 
 /// A left click released over a unit in the frame whose packets remove it, the frame's steps in
 /// the schedule's order: the click selects it (`CMSG_SET_SELECTION` with its guid), and the
-/// removal's deactivation then tears the selection down with its own send (`0x5fbbe5`). With the
-/// packets and the follow first, the click would select a guid whose object has gone, with no
-/// deactivation left to end it.
+/// removal's release then tears the selection down with its own send (`0x5fbbe5`). With the
+/// packets first, the click would select a guid whose object has gone, with no release left to
+/// end it.
 #[test]
 fn a_click_on_a_unit_its_frames_packet_removes_selects_it_first() {
     let mut app = crate::game_plugins::schedule_tests::headless_client();
     let order = in_frame_order(&mut app);
-    assert_eq!(order, [Step::Click, Step::Net, Step::Follow]);
+    assert_eq!(order, [Step::Click, Step::Net]);
     app.insert_resource(bevy::ecs::error::DefaultErrorHandler(
         bevy::ecs::error::ignore,
     ));
@@ -137,7 +130,7 @@ fn a_click_on_a_unit_its_frames_packet_removes_selects_it_first() {
         distance: 3.0,
         ..Hovered::default()
     };
-    world.write_message(WorldClick);
+    crate::script_calls::insert_test_vm(world);
     for ev in crate::net::wire([
         SessionEvent::ObjectsRemoved(vec![MOB]),
         SessionEvent::ObjectUpdateEnd,
@@ -146,13 +139,10 @@ fn a_click_on_a_unit_its_frames_packet_removes_selects_it_first() {
     }
     for step in order {
         match step {
-            Step::Click => world
-                .run_system_once(click::select_on_click)
-                .expect("the click runs"),
+            Step::Click => {
+                super::release_click(world, benilla_ui::script::ClickMode::Select);
+            }
             Step::Net => crate::net::apply_net_updates(world),
-            Step::Follow => world
-                .run_system_once(track::follow_selection_object)
-                .expect("the follow runs"),
         }
     }
 
@@ -178,19 +168,15 @@ fn a_click_on_a_unit_its_frames_packet_removes_selects_it_first() {
 #[test]
 fn a_right_clicks_cast_goes_out_ahead_of_the_packets() {
     let mut app = crate::game_plugins::schedule_tests::headless_client();
-    assert!(runs_before(
+    assert!(crate::test_support::runs_before_in(
         &mut app,
-        click::act_on_right_click,
-        crate::ui_action::drain_click_casts
-    ));
-    assert!(runs_before(
-        &mut app,
+        crate::target::WorldClickLegs,
         click::act_on_interact,
         crate::ui_action::drain_click_casts
     ));
     assert!(runs_before(
         &mut app,
-        crate::ui_action::drain_click_casts,
+        crate::ui_script::dispatch_input_records,
         crate::net::apply_net_updates
     ));
     assert!(runs_before(

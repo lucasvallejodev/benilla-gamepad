@@ -21,9 +21,10 @@ use super::{
     VendorItem, WhoResults, WowTime, XpGain,
 };
 
-/// The final facing a `SMSG_MONSTER_MOVE` dictates (`moveType`), applied as a hard snap, not a
-/// turn (`0x6018f0`); `Spot` and `Target` resolve once, from positions at receipt.
-#[derive(Debug, Clone, Copy)]
+/// The final facing a `SMSG_MONSTER_MOVE` dictates (`moveType`): kept for the path's end when a
+/// path installs, else the unit's raw facing at once (`0x6018f0`, `0x601fee`). `Spot` and `Target`
+/// resolve when applied, from the positions then.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum MonsterMoveFacing {
     /// `moveType` 0 or a stop: the unit faces its travel direction.
     None,
@@ -209,9 +210,10 @@ pub enum ServerPacket {
         map: u32,
         area: u32,
     },
-    /// `SMSG_GMTICKET_GETTICKET`: our open ticket, `None` for "no ticket". Also pushed unasked
-    /// when a GM views, escalates or completes it (`GMTicketMgr.cpp:153-159`).
+    /// `SMSG_GMTICKET_GETTICKET`: the status and our open ticket, `None` for "no ticket". Also
+    /// pushed unasked when a GM views, escalates or completes it (`GMTicketMgr.cpp:153-159`).
     GmTicketAnswer {
+        status: u32,
         ticket: Option<Box<GmTicket>>,
     },
     /// `SMSG_GMTICKET_CREATE`: 2 created, 3 refused, 1 already have one; vmangos never sends 1
@@ -289,6 +291,10 @@ pub enum ServerPacket {
     },
     /// `0x297`/`0x298`/`0x299`/`0x2BB`: the meeting stone's display-only replies.
     MeetingStoneNotice(crate::messages::MeetingStoneNotice),
+    /// `SMSG_ACCOUNT_DATA_MD5`: the server's digest of each account-data section.
+    AccountDataMd5(crate::messages::AccountDataMd5),
+    /// `SMSG_UPDATE_ACCOUNT_DATA`: one account-data section's file, compressed.
+    UpdateAccountData(crate::messages::UpdateAccountData),
     /// `SMSG_TUTORIAL_FLAGS`: the account's tutorial bank.
     TutorialFlags(crate::messages::TutorialFlags),
     /// `SMSG_SUMMON_REQUEST`: someone asks to pull us to them; nothing moves until
@@ -392,6 +398,17 @@ pub enum ServerPacket {
     /// `SMSG_GAMEOBJECT_PAGETEXT`: a bare `u64` guid, the object whose page the reader opens on.
     GameObjectPageText {
         guid: u64,
+    },
+    /// `SMSG_READ_ITEM_OK`: the book may be read (the item's guid).
+    ReadItemOk {
+        guid: u64,
+    },
+    /// `SMSG_READ_ITEM_FAILED`: the item's guid, the reason byte and, for reason 1, the translation
+    /// time in milliseconds (`items::read_read_item_failed`).
+    ReadItemFailed {
+        guid: u64,
+        reason: u8,
+        milliseconds: i32,
     },
     /// `SMSG_FISH_NOT_HOOKED`: the channel ended unhooked (empty body; `ERR_FISH_NOT_HOOKED`).
     FishNotHooked,
@@ -1379,6 +1396,8 @@ impl ServerPacket {
             ServerPacket::MeetingStoneNotice(crate::messages::MeetingStoneNotice::JoinFailed {
                 ..
             }) => "SMSG_MEETINGSTONE_JOIN_FAILED".into(),
+            ServerPacket::AccountDataMd5(_) => "SMSG_ACCOUNT_DATA_MD5".into(),
+            ServerPacket::UpdateAccountData(_) => "SMSG_UPDATE_ACCOUNT_DATA".into(),
             ServerPacket::TutorialFlags(_) => "SMSG_TUTORIAL_FLAGS".into(),
             ServerPacket::SetProficiency { .. } => "SMSG_SET_PROFICIENCY".into(),
             ServerPacket::InitializeFactions { .. } => "SMSG_INITIALIZE_FACTIONS".into(),
@@ -1394,6 +1413,8 @@ impl ServerPacket {
             ServerPacket::GameObjectCustomAnim { .. } => "SMSG_GAMEOBJECT_CUSTOM_ANIM".into(),
             ServerPacket::GameObjectDespawnAnim { .. } => "SMSG_GAMEOBJECT_DESPAWN_ANIM".into(),
             ServerPacket::GameObjectPageText { .. } => "SMSG_GAMEOBJECT_PAGETEXT".into(),
+            ServerPacket::ReadItemOk { .. } => "SMSG_READ_ITEM_OK".into(),
+            ServerPacket::ReadItemFailed { .. } => "SMSG_READ_ITEM_FAILED".into(),
             ServerPacket::OpenContainer { .. } => "SMSG_OPEN_CONTAINER".into(),
             ServerPacket::Inspect { .. } => "SMSG_INSPECT".into(),
             ServerPacket::StandStateUpdate { .. } => "SMSG_STANDSTATE_UPDATE".into(),
