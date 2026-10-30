@@ -10,6 +10,7 @@ Writes 32-bit TGAs (bottom-left origin, the form 1.12 loads) into addon/BenillaP
                   round icon's edge at 0.69
 - RingSelect.tga  the gold press / selection ring, same geometry
 - Disc.tga        a soft white disc (badges, shadows, the wheel's backdrop)
+- Sweep.tga       a white half-disc, the round cooldown sweep's two halves
 - one 64x64 icon per game action, window-wheel entry and bot command (`ICONS`): a dark slate
                   tile with a bold glyph, so none reads as a spell
 
@@ -172,6 +173,14 @@ def ring_select(x, y):
 
 def disc(x, y):
     return (1.0, 1.0, 1.0, fill(math.hypot(x, y) - 0.94, 0.04))
+
+
+def sweep(x, y):
+    """The round cooldown's half-disc, right of the centre line. The Lua samples it through
+    texcoords scaled by 0.7071, so a turned corner stays inside the texture and the 0.7 radius
+    lands just inside the ring; the small overshoot past the line keeps the two halves' seam
+    solid."""
+    return (1.0, 1.0, 1.0, fill(math.hypot(x, y) - 0.7, 0.02) * fill(-x - 0.04, 0.02))
 
 
 # ── The icons ──
@@ -507,6 +516,7 @@ ART_FILES = {
     "Ring.tga": (128, ring),
     "RingSelect.tga": (128, ring_select),
     "Disc.tga": (64, disc),
+    "Sweep.tga": (64, sweep),
 }
 for _name, _glyph in ICONS.items():
     ART_FILES[_name + ".tga"] = (64, icon(_glyph))

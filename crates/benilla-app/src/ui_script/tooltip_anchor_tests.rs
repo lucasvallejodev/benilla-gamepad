@@ -37,6 +37,7 @@ fn harness(extra: &[&str]) -> UiScript {
 fn wolf() -> UnitState {
     UnitState {
         exists: true,
+        guid: 0xF130_0000_4500_0001,
         name: Some("Timber Wolf".into()),
         health: 30,
         max_health: 50,
@@ -57,7 +58,8 @@ fn uiparent_is_a_real_full_screen_frame() {
         .eval(
             "return UIParent ~= nil and UIParent:GetName() == \"UIParent\" \
                and UIParent:GetLeft() == 0 and UIParent:GetBottom() == 0 \
-               and UIParent:GetRight() == 1024 and UIParent:GetTop() == 768",
+               and UIParent:GetRight() == GetScreenWidth() and UIParent:GetTop() == GetScreenHeight() \
+               and GetScreenWidth() == 1024 and GetScreenHeight() == 767.9999427795418",
         )
         .unwrap();
     assert!(ok, "UIParent exists and fills the screen");
@@ -78,7 +80,8 @@ fn world_hover_seats_the_default_corner() {
     let ok: bool = s
         .eval(
             "return GameTooltip:IsVisible() \
-               and GameTooltip:GetRight() == 1011 and GameTooltip:GetBottom() == 70",
+               and math.abs(GameTooltip:GetRight() - 1011) < 1e-3 \
+               and math.abs(GameTooltip:GetBottom() - 70) < 1e-3",
         )
         .unwrap();
     assert!(ok, "world tooltip sits at the screen's bottom-right corner");
@@ -118,7 +121,8 @@ fn unit_frame_hover_takes_the_default_corner_and_drops_on_leave() {
     let ok: bool = s
         .eval(
             "return GameTooltip:IsVisible() \
-               and GameTooltip:GetRight() == 1011 and GameTooltip:GetBottom() == 70 \
+               and math.abs(GameTooltip:GetRight() - 1011) < 1e-3 \
+               and math.abs(GameTooltip:GetBottom() - 70) < 1e-3 \
                and GameTooltip:IsOwned(TargetFrame)",
         )
         .unwrap();
@@ -232,6 +236,8 @@ fn your_own_portrait_explains_the_menu_instead_of_showing_your_health() {
     s.set_unit(
         "target",
         Some(UnitState {
+            // Another unit than `player`, so `UnitIsUnit("target", "player")` is false.
+            guid: 0x0000_0000_0000_0C0C,
             is_player: true,
             player_controlled: true,
             name: Some("Someone".into()),
@@ -275,7 +281,7 @@ fn action_button_hover_takes_the_default_corner() {
         .eval(
             "local p, rel, rp, x, y = GameTooltip:GetPoint() \
              return p == \"BOTTOMRIGHT\" and rel ~= nil and rel:GetName() == \"UIParent\" \
-               and rp == \"BOTTOMRIGHT\" and x == -13 and y == 70",
+               and rp == \"BOTTOMRIGHT\" and math.abs(x + 13) < 1e-3 and math.abs(y - 70) < 1e-3",
         )
         .unwrap();
     assert!(
@@ -436,6 +442,7 @@ fn buff_hover_hangs_below_left_of_the_button() {
         name: Some("Arcane Intellect".into()),
         icon: Some("Interface\\Icons\\Spell_Holy_MagicalSentry".into()),
         count: 1,
+        level: 0,
         debuff_type: None,
         duration: 1800.0,
         expiration_time: 1800.0,
@@ -443,6 +450,10 @@ fn buff_hover_hangs_below_left_of_the_button() {
         cancelable: true,
         until_cancelled: false,
         channeled: false,
+        raid_listed: false,
+        slot: 0,
+        until_cancelled_unknown: false,
+        vision_hidden: false,
     }]);
     // The event the stock buff buttons register (`BuffFrame.lua:113`).
     s.fire_event("PLAYER_AURAS_CHANGED", vec![]);
@@ -472,7 +483,7 @@ fn buff_hover_hangs_below_left_of_the_button() {
 fn a_cursor_seated_gameobject_plate_is_owned() {
     benilla_formats::wow_data_or_skip!();
     let mut s = harness(&[]);
-    assert!(s.world_tooltip_gameobject("Brill", &[], Some((512.0, 384.0))));
+    assert!(s.world_tooltip_gameobject("Brill", &[], true));
     let owned: bool = s.eval("return GameTooltip:IsOwned(UIParent)").unwrap();
     assert!(
         owned,
@@ -491,7 +502,7 @@ fn a_cursor_seated_gameobject_plate_survives_an_addons_on_show_hook() {
     // Questie's hook, in one line: the plate's own show event calls Show() again.
     s.run(r#"GameTooltip:SetScript("OnShow", function() GameTooltip:Show() end)"#)
         .unwrap();
-    assert!(s.world_tooltip_gameobject("Brill", &[], Some((512.0, 384.0))));
+    assert!(s.world_tooltip_gameobject("Brill", &[], true));
     let shown: bool = s
         .eval("return GameTooltip:IsShown() and true or false")
         .unwrap();
@@ -510,7 +521,7 @@ fn a_cursor_seated_gameobject_plate_survives_an_addons_on_show_hook() {
 fn a_corner_seated_gameobject_plate_is_owned_and_shown() {
     benilla_formats::wow_data_or_skip!();
     let mut s = harness(&[]);
-    assert!(s.world_tooltip_gameobject("Ironforge Main Gate", &[], None));
+    assert!(s.world_tooltip_gameobject("Ironforge Main Gate", &[], false));
     let owned: bool = s.eval("return GameTooltip:IsOwned(UIParent)").unwrap();
     assert!(owned, "the corner plate is owned; errors: {:?}", s.errors());
     let shown: bool = s
@@ -526,7 +537,7 @@ fn a_corner_seated_gameobject_plate_survives_an_addons_on_show_hook() {
     let mut s = harness(&[]);
     s.run(r#"GameTooltip:SetScript("OnShow", function() GameTooltip:Show() end)"#)
         .unwrap();
-    assert!(s.world_tooltip_gameobject("Ironforge Main Gate", &[], None));
+    assert!(s.world_tooltip_gameobject("Ironforge Main Gate", &[], false));
     let shown: bool = s
         .eval("return GameTooltip:IsShown() and true or false")
         .unwrap();

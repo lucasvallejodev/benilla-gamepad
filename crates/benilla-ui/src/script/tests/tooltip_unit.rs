@@ -17,6 +17,11 @@ fn seed_level_strings(s: &mut UiScript) {
         PLAYER = "[PLAYER]"
         ELITE  = "[ELITE]"
         BOSS   = "[BOSS]"
+        PVP_ENABLED       = "[PVP]"
+        RESURRECTABLE     = "[RESURRECTABLE]"
+        UNIT_SKINNABLE    = "[SKINNABLE]"
+        PVP_RANK_CIVILIAN = "[CIVILIAN]"
+        PVP_RANK_LEADER   = "[LEADER]"
     "#,
     )
     .unwrap();
@@ -25,12 +30,14 @@ fn seed_level_strings(s: &mut UiScript) {
 fn wolf() -> UnitState {
     UnitState {
         exists: true,
+        has_object: true,
         guid: 0xF130_0000_4500_0001,
         name: Some("Timber Wolf".into()),
         health: 30,
         max_health: 50,
         level: 10,
         reaction: 2, // hostile
+        player_reaction: 2,
         creature_type_name: Some("Beast".into()),
         rank: 2, // rare-elite prints ELITE (the byte table)
         skinnable: true,
@@ -38,7 +45,7 @@ fn wolf() -> UnitState {
     }
 }
 
-/// A creature: gold name, subtitle, the CLASS_TYPE level line, red Skinnable.
+/// A creature: gold name, subtitle, the CLASS_TYPE level line, red `UNIT_SKINNABLE`.
 #[test]
 fn creature_line_law() {
     let mut s = script();
@@ -54,13 +61,13 @@ fn creature_line_law() {
     s.run(
         r#"
         local a = CreateFrame("Button", "UF1"); a:SetPoint("CENTER", 0, 0); a:SetWidth(10); a:SetHeight(10)
-        local tt = CreateFrame("GameTooltip", "TT")
+        local tt = CreateFrame("GameTooltip", "TT", nil, "TestTooltipTemplate")
         tt:SetOwner(a, "ANCHOR_RIGHT")
         assert(tt:SetUnit("target") == 1, "SetUnit returns 1 on a live unit")
         assert(TTTextLeft1:GetText() == "Timber Wolf")
         assert(TTTextLeft2:GetText() == "Alpha")
         assert(TTTextLeft3:GetText() == "[LEVEL_CLASS_TYPE 10 Beast [ELITE]]", "got " .. TTTextLeft3:GetText())
-        assert(TTTextLeft4:GetText() == "Skinnable")
+        assert(TTTextLeft4:GetText() == "[SKINNABLE]")
         -- A RECOGNISED token naming nothing answers nil...
         assert(tt:SetUnit("party4") == nil, "a recognised but absent unit answers nil")
         -- ...while an UNRECOGNISED one raises, because SetUnit resolves through the client's one
@@ -68,6 +75,13 @@ fn creature_line_law() {
         -- none of the nine prefixes reaches `luaL_error("Unknown unit name: %s")` and longjmps).
         -- This used to read `SetUnit("nosuch") == nil`, which was the refuted claim.
         assert(pcall(tt.SetUnit, tt, "nosuch") == false, "an unrecognised token raises")
+        -- A non-string raises the binding's own line (`0x534a4c`), never mlua's conversion text.
+        for _, v in { {}, true } do
+            local ok, e = pcall(tt.SetUnit, tt, v)
+            assert(not ok and string.find(e, 'Usage: SetUnit%("unit"%)'), tostring(e))
+        end
+        local ok, e = pcall(tt.SetUnit, tt)
+        assert(not ok and string.find(e, 'Usage: SetUnit%("unit"%)'), tostring(e))
     "#,
     )
     .unwrap();
@@ -85,6 +99,7 @@ fn unqueried_wolf() -> UnitState {
         max_health: 50,
         level: 10,
         reaction: 2, // hostile
+        player_reaction: 2,
         skinnable: true,
         guid: 0xF130_0000_0000_0001,
         ..Default::default()
@@ -108,7 +123,7 @@ fn a_pending_name_titles_unknownobject_and_the_answer_replaces_it() {
         r#"
         UNKNOWNOBJECT = "Unknown"   -- GlobalStrings.lua:4444, enUS
         local a = CreateFrame("Button", "UF1"); a:SetPoint("CENTER", 0, 0); a:SetWidth(10); a:SetHeight(10)
-        local tt = CreateFrame("GameTooltip", "TT")
+        local tt = CreateFrame("GameTooltip", "TT", nil, "TestTooltipTemplate")
         tt:SetOwner(a, "ANCHOR_RIGHT")
         assert(tt:SetUnit("target") == 1, "a resolved unit shows, name or no name")
         assert(TTTextLeft1:GetText() == UNKNOWNOBJECT,
@@ -117,7 +132,7 @@ fn a_pending_name_titles_unknownobject_and_the_answer_replaces_it() {
         -- bare TOOLTIP_UNIT_LEVEL template because both the CLASS and TYPE slots are the record's.
         assert(TTTextLeft2:GetText() == "[LEVEL 10]", "got " .. TTTextLeft2:GetText())
         -- The descriptor's own lines are NOT the record's and show anyway.
-        assert(TTTextLeft3:GetText() == "Skinnable")
+        assert(TTTextLeft3:GetText() == "[SKINNABLE]")
     "#,
     )
     .unwrap();
@@ -135,7 +150,7 @@ fn a_pending_name_titles_unknownobject_and_the_answer_replaces_it() {
         assert(TTTextLeft1:GetText() == "Timber Wolf", "the answer replaced UNKNOWNOBJECT")
         assert(TTTextLeft2:GetText() == "Alpha")
         assert(TTTextLeft3:GetText() == "[LEVEL_CLASS_TYPE 10 Beast [ELITE]]", "got " .. TTTextLeft3:GetText())
-        assert(TTTextLeft4:GetText() == "Skinnable")
+        assert(TTTextLeft4:GetText() == "[SKINNABLE]")
     "#,
     )
     .unwrap();
@@ -216,7 +231,7 @@ fn the_tooltip_title_is_the_pvp_name() {
         PVP_MEDAL1 = "Guardian of Stormwind"
         PVP_RANK_CIVILIAN = "Civilian"
         local a = CreateFrame("Button", "UF1"); a:SetPoint("CENTER", 0, 0); a:SetWidth(10); a:SetHeight(10)
-        local tt = CreateFrame("GameTooltip", "TT")
+        local tt = CreateFrame("GameTooltip", "TT", nil, "TestTooltipTemplate")
         tt:SetOwner(a, "ANCHOR_RIGHT")
     "#,
     )
@@ -263,10 +278,12 @@ fn the_tooltip_title_is_the_pvp_name() {
     s.set_unit(
         "target",
         Some(UnitState {
+            guid: 0xF130_0000_0000_0100,
             exists: true,
             name: Some("Defias Civilian".into()),
             level: 20,
             reaction: 2,
+            player_reaction: 2,
             pvp: true,
             civilian: true,
             ..Default::default()
@@ -281,9 +298,9 @@ fn the_tooltip_title_is_the_pvp_name() {
     assert!(s.take_errors().is_empty());
 }
 
-/// The faction line sits between the level line and "PvP" (`0x529fe0`). Civilian needs the PvP
-/// bit, the flag, hostility and a grey level (`0x612550`); Leader only the PvP bit and the flag
-/// (`0x6125c0`).
+/// The faction line sits between the level line and `PVP_ENABLED` (`0x529fe0`).
+/// `PVP_RANK_CIVILIAN` needs the PvP bit, the flag, hostility and a grey level (`0x612550`);
+/// `PVP_RANK_LEADER` only the PvP bit and the flag (`0x6125c0`).
 #[test]
 fn faction_line_and_civilian_gate() {
     let mut s = script();
@@ -297,10 +314,14 @@ fn faction_line_and_civilian_gate() {
     s.set_unit(
         "target",
         Some(UnitState {
+            guid: 0xF130_0000_0000_0101,
             exists: true,
             name: Some("Marshal McBride".into()),
+            has_object: true,
+            flags: 0x1000,
             level: 20,
             reaction: 6, // friendly
+            player_reaction: 6,
             creature_type_name: Some("Humanoid".into()),
             faction_name: Some("Stormwind".into()),
             pvp: true,
@@ -311,12 +332,12 @@ fn faction_line_and_civilian_gate() {
     s.run(
         r#"
         local a = CreateFrame("Button", "UF9"); a:SetPoint("CENTER", 0, 0); a:SetWidth(10); a:SetHeight(10)
-        local tt = CreateFrame("GameTooltip", "TT")
+        local tt = CreateFrame("GameTooltip", "TT", nil, "TestTooltipTemplate")
         tt:SetOwner(a, "ANCHOR_RIGHT")
         tt:SetUnit("target")
         assert(TTTextLeft2:GetText() == "[LEVEL 20]", "friendly creature: no type word; got " .. TTTextLeft2:GetText())
         assert(TTTextLeft3:GetText() == "Stormwind", "faction line before PvP; got " .. TTTextLeft3:GetText())
-        assert(TTTextLeft4:GetText() == "PvP")
+        assert(TTTextLeft4:GetText() == "[PVP]")
         assert(TTTextLeft5 == nil or TTTextLeft5:GetText() == nil, "friendly civilian shows NO Civilian line")
     "#,
     )
@@ -325,10 +346,14 @@ fn faction_line_and_civilian_gate() {
     s.set_unit(
         "target",
         Some(UnitState {
+            guid: 0xF130_0000_0000_0102,
             exists: true,
+            has_object: true,
+            flags: 0x1000,
             name: Some("Defias Civilian".into()),
             level: 20,
             reaction: 2, // hostile
+            player_reaction: 2,
             creature_type_name: Some("Humanoid".into()),
             pvp: true,
             civilian: true,
@@ -341,9 +366,9 @@ fn faction_line_and_civilian_gate() {
         TT:SetOwner(UF9, "ANCHOR_RIGHT")
         TT:SetUnit("target")
         assert(TTTextLeft2:GetText() == "[LEVEL_CLASS 20 Humanoid]", "got " .. TTTextLeft2:GetText())
-        assert(TTTextLeft3:GetText() == "PvP")
-        assert(TTTextLeft4:GetText() == "Civilian", "hostile+grey+pvp civilian warns; got " .. TTTextLeft4:GetText())
-        assert(TTTextLeft5:GetText() == "Leader")
+        assert(TTTextLeft3:GetText() == "[PVP]")
+        assert(TTTextLeft4:GetText() == "[CIVILIAN]", "hostile+grey+pvp civilian warns; got " .. TTTextLeft4:GetText())
+        assert(TTTextLeft5:GetText() == "[LEADER]")
     "#,
     )
     .unwrap();
@@ -351,10 +376,14 @@ fn faction_line_and_civilian_gate() {
     s.set_unit(
         "target",
         Some(UnitState {
+            guid: 0xF130_0000_0000_0103,
             exists: true,
+            has_object: true,
+            flags: 0x1000,
             name: Some("Defias Civilian".into()),
             level: 25,
             reaction: 2,
+            player_reaction: 2,
             creature_type_name: Some("Humanoid".into()),
             pvp: true,
             civilian: true,
@@ -365,7 +394,7 @@ fn faction_line_and_civilian_gate() {
         r#"
         TT:SetOwner(UF9, "ANCHOR_RIGHT")
         TT:SetUnit("target")
-        assert(TTTextLeft3:GetText() == "PvP")
+        assert(TTTextLeft3:GetText() == "[PVP]")
         assert(TTTextLeft4 == nil or TTTextLeft4:GetText() == nil, "a non-grey civilian does not warn")
     "#,
     )
@@ -373,7 +402,9 @@ fn faction_line_and_civilian_gate() {
     assert!(s.take_errors().is_empty());
 }
 
-/// Players read "Race Class (Player)"; the dead read "Corpse"; a world boss reads "??".
+/// Players read "Race Class (Player)"; the dead read "Corpse"; a world boss reads "??", and so
+/// does any unit hostile to the player ten or more levels above it, a player too: the path from
+/// `0x52a338` to `0x52a366` tests no type.
 #[test]
 fn level_line_variants() {
     let mut s = script();
@@ -386,24 +417,27 @@ fn level_line_variants() {
     s.set_unit(
         "target",
         Some(UnitState {
+            guid: 0xF130_0000_0000_0104,
             exists: true,
             name: Some("Bandit".into()),
+            has_object: true,
             level: 32,
             is_player: true,
             race: Some("Human".into()),
             class: Some("Rogue".into()),
             pvp: true,
+            flags: 0x1000,
             ..Default::default()
         }),
     );
     s.run(
         r#"
         local a = CreateFrame("Button", "UF2"); a:SetPoint("CENTER", 0, 0); a:SetWidth(10); a:SetHeight(10)
-        local tt = CreateFrame("GameTooltip", "TT")
+        local tt = CreateFrame("GameTooltip", "TT", nil, "TestTooltipTemplate")
         tt:SetOwner(a, "ANCHOR_RIGHT")
         tt:SetUnit("target")
         assert(TTTextLeft2:GetText() == "[LEVEL_CLASS_TYPE 32 Human Rogue [PLAYER]]", "got " .. TTTextLeft2:GetText())
-        assert(TTTextLeft3:GetText() == "PvP")
+        assert(TTTextLeft3:GetText() == "[PVP]")
     "#,
     )
     .unwrap();
@@ -411,11 +445,13 @@ fn level_line_variants() {
     s.set_unit(
         "target",
         Some(UnitState {
+            guid: 0xF130_0000_0000_0105,
             exists: true,
             name: Some("Slain Wolf".into()),
             level: 3,
             dead: true,
             reaction: 2,
+            player_reaction: 2,
             creature_type_name: Some("Beast".into()),
             ..Default::default()
         }),
@@ -432,10 +468,12 @@ fn level_line_variants() {
     s.set_unit(
         "target",
         Some(UnitState {
+            guid: 0xF130_0000_0000_0106,
             exists: true,
             name: Some("Kazzak".into()),
             level: 63,
             reaction: 2,
+            player_reaction: 2,
             creature_type_name: Some("Demon".into()),
             rank: 3,
             ..Default::default()
@@ -451,10 +489,12 @@ fn level_line_variants() {
     .unwrap();
     // A hostile unit (reaction 2 or less) 10 levels up reads "??".
     let ten_up = |reaction: u8, is_player: bool| UnitState {
+        guid: 0xF130_0000_0000_0107,
         exists: true,
         name: Some("Elder".into()),
         level: 70,
         reaction,
+        player_reaction: reaction,
         is_player,
         creature_type_name: (!is_player).then(|| "Beast".into()),
         race: is_player.then(|| "Orc".into()),
@@ -478,12 +518,22 @@ fn level_line_variants() {
     "#,
     )
     .unwrap();
-    // Players never read "??".
+    // A hostile player ten up reads "??" too, and `UnitLevel` -1.
     s.set_unit("target", Some(ten_up(2, true)));
     s.run(
         r#"
         TT:SetOwner(UF2, "ANCHOR_RIGHT"); TT:SetUnit("target")
-        assert(TTTextLeft2:GetText() == "[LEVEL_CLASS_TYPE 70 Orc Shaman [PLAYER]]", "hostile player, got " .. TTTextLeft2:GetText())
+        assert(TTTextLeft2:GetText() == "[LEVEL_CLASS_TYPE ?? Orc Shaman [PLAYER]]", "hostile player, got " .. TTTextLeft2:GetText())
+        assert(UnitLevel("target") == -1, "UnitLevel's hostile leg has no player test either")
+    "#,
+    )
+    .unwrap();
+    // An unfriendly player ten up shows the level.
+    s.set_unit("target", Some(ten_up(3, true)));
+    s.run(
+        r#"
+        TT:SetOwner(UF2, "ANCHOR_RIGHT"); TT:SetUnit("target")
+        assert(TTTextLeft2:GetText() == "[LEVEL_CLASS_TYPE 70 Orc Shaman [PLAYER]]", "unfriendly player, got " .. TTTextLeft2:GetText())
     "#,
     )
     .unwrap();
@@ -506,16 +556,18 @@ fn a_players_level_line_ignores_the_snapshots_creature_type() {
     s.run(
         r#"
         local a = CreateFrame("Button", "UF3"); a:SetPoint("CENTER", 0, 0); a:SetWidth(10); a:SetHeight(10)
-        local tt = CreateFrame("GameTooltip", "TT")
+        local tt = CreateFrame("GameTooltip", "TT", nil, "TestTooltipTemplate")
         tt:SetOwner(a, "ANCHOR_RIGHT")
     "#,
     )
     .unwrap();
     let druid = |reaction: u8, creature_type: Option<&str>| UnitState {
+        guid: 0xF130_0000_0000_0108,
         exists: true,
         name: Some("Fenwick".into()),
         level: 40,
         reaction,
+        player_reaction: reaction,
         is_player: true,
         race: Some("Night Elf".into()),
         class: Some("Druid".into()),
@@ -539,6 +591,118 @@ fn a_players_level_line_ignores_the_snapshots_creature_type() {
     assert!(s.take_errors().is_empty());
 }
 
+/// A creature of type 10, "Not specified", has no word in the level line (`0x52a2c1`-`0x52a2c6`
+/// skip the type row), where `UnitCreatureType` still answers it (`0x51a2dc`): the line reads
+/// without a class slot, for a hostile unit as for a neutral one, and an ordinary type shows its
+/// word beside it.
+#[test]
+fn a_type_ten_creature_has_no_word_in_the_level_line_but_unitcreaturetype_answers_it() {
+    let mut s = script();
+    seed_level_strings(&mut s);
+    s.set_screen_size(800.0, 600.0);
+    s.set_player_req_state(PlayerReqState {
+        level: 60,
+        ..Default::default()
+    });
+    s.run(
+        r#"
+        local a = CreateFrame("Button", "UF2"); a:SetPoint("CENTER", 0, 0); a:SetWidth(10); a:SetHeight(10)
+        local tt = CreateFrame("GameTooltip", "TT", nil, "TestTooltipTemplate")
+        tt:SetOwner(a, "ANCHOR_RIGHT")
+    "#,
+    )
+    .unwrap();
+    let creature = |reaction: u8, id: u32, word: &str| UnitState {
+        guid: 0xF130_0000_0000_0109,
+        exists: true,
+        has_object: true,
+        name: Some("Wisp".into()),
+        level: 60,
+        reaction,
+        player_reaction: reaction,
+        creature_type: id,
+        creature_type_name: Some(word.into()),
+        ..Default::default()
+    };
+    for reaction in [2, 4] {
+        s.set_unit("target", Some(creature(reaction, 10, "Not specified")));
+        s.run(
+            r#"
+            TT:SetOwner(UF2, "ANCHOR_RIGHT"); TT:SetUnit("target")
+            assert(TTTextLeft2:GetText() == "[LEVEL 60]", "got " .. TTTextLeft2:GetText())
+        "#,
+        )
+        .unwrap_or_else(|e| panic!("reaction {reaction}: {e}"));
+        assert_eq!(
+            s.eval::<String>(r#"return UnitCreatureType("target")"#)
+                .unwrap(),
+            "Not specified"
+        );
+        s.set_unit("target", Some(creature(reaction, 7, "Humanoid")));
+        s.run(
+            r#"
+            TT:SetOwner(UF2, "ANCHOR_RIGHT"); TT:SetUnit("target")
+            assert(TTTextLeft2:GetText() == "[LEVEL_CLASS 60 Humanoid]", "got " .. TTTextLeft2:GetText())
+        "#,
+        )
+        .unwrap_or_else(|e| panic!("reaction {reaction}: {e}"));
+    }
+    assert!(s.take_errors().is_empty());
+}
+
+/// The creature type shows by the player's reaction toward the unit, not the unit's toward the
+/// player (`0x6061e0(player, unit)`, `0x52a2d9`, under 4 internal): a not-at-war reputation
+/// faction such as the Cenarion Circle reads neutral toward the player while the player reads it
+/// friendly, so it shows no type, and neither does a guard turned hostile on a contested player,
+/// whom the player still reads friendly. No active player shows none (`0x52a2d0`).
+#[test]
+fn the_creature_type_reads_the_players_reaction_toward_the_unit() {
+    let mut s = script();
+    seed_level_strings(&mut s);
+    s.set_screen_size(800.0, 600.0);
+    s.set_player_req_state(PlayerReqState {
+        level: 60,
+        ..Default::default()
+    });
+    s.run(
+        r#"
+        local a = CreateFrame("Button", "UF4"); a:SetPoint("CENTER", 0, 0); a:SetWidth(10); a:SetHeight(10)
+        local tt = CreateFrame("GameTooltip", "TT", nil, "TestTooltipTemplate")
+        tt:SetOwner(a, "ANCHOR_RIGHT")
+    "#,
+    )
+    .unwrap();
+    let druid = |reaction: u8, player_reaction: u8| UnitState {
+        guid: 0xF130_0000_0000_010A,
+        exists: true,
+        has_object: true,
+        name: Some("Cenarion Druid".into()),
+        level: 60,
+        reaction,
+        player_reaction,
+        creature_type: 7,
+        creature_type_name: Some("Humanoid".into()),
+        ..Default::default()
+    };
+    for (reaction, player_reaction, line) in [
+        (4, 5, "[LEVEL 60]"),
+        (2, 5, "[LEVEL 60]"),
+        (5, 4, "[LEVEL_CLASS 60 Humanoid]"),
+        (2, 3, "[LEVEL_CLASS 60 Humanoid]"),
+        (4, 0, "[LEVEL 60]"),
+    ] {
+        s.set_unit("target", Some(druid(reaction, player_reaction)));
+        s.run(&format!(
+            r#"
+            TT:SetOwner(UF4, "ANCHOR_RIGHT"); TT:SetUnit("target")
+            assert(TTTextLeft2:GetText() == "{line}", "got " .. TTTextLeft2:GetText())
+        "#
+        ))
+        .unwrap_or_else(|e| panic!("reaction {reaction}, player's {player_reaction}: {e}"));
+    }
+    assert!(s.take_errors().is_empty());
+}
+
 /// `world_tooltip_unit` fires the default anchor, renders, then fires `UPDATE_MOUSEOVER_UNIT`.
 #[test]
 fn world_hover_drive_and_health_watcher() {
@@ -552,7 +716,7 @@ fn world_hover_drive_and_health_watcher() {
         -- handler must do the REAL seating (a counter-only stub is exactly the hole that let the
         -- unwired live handler park the plate at screen center).
         UIParent = CreateFrame("Frame", "UIParent"); UIParent:SetAllPoints()
-        local tt = CreateFrame("GameTooltip", "GameTooltip")
+        local tt = CreateFrame("GameTooltip", "GameTooltip", nil, "TestTooltipTemplate")
         tt:Hide()
         -- The XML wiring, test-side: default anchor + the reaction recolor + a status bar child.
         tt:SetScript("OnTooltipSetDefaultAnchor", function()
@@ -567,9 +731,15 @@ fn world_hover_drive_and_health_watcher() {
         end)
         local bar = CreateFrame("StatusBar", "GameTooltipStatusBar", tt)
         bar:SetPoint("TOPLEFT", tt, "BOTTOMLEFT", 2, -1); bar:SetWidth(100); bar:SetHeight(8)
+        BarFires = {}
+        bar:SetScript("OnValueChanged", function() table.insert(BarFires, arg1) end)
     "#,
     )
     .unwrap();
+    assert!(
+        s.publish_world_mouseover(Some(wolf().guid)),
+        "a first hover"
+    );
     assert!(s.world_tooltip_unit("mouseover"), "the hover shows");
     s.run(
         r#"
@@ -579,10 +749,11 @@ fn world_hover_drive_and_health_watcher() {
         assert(GameTooltipTextLeft1:GetText() == "Timber Wolf")
         local _, mx = GameTooltipStatusBar:GetMinMaxValues()
         assert(mx == 50 and GameTooltipStatusBar:GetValue() == 30, "bar seeded from the snapshot")
+        assert(table.getn(BarFires) == 1 and BarFires[1] == 30, "a fresh bar: the value fires")
     "#,
     )
     .unwrap();
-    // The auto-size needs the line measures before the plate has a rect.
+    // With no font engine the sizer waits on the line measures before the plate has a rect.
     let answers: Vec<(u32, f32, f32, u64)> = s
         .fontstrings_needing_measure()
         .iter()
@@ -591,22 +762,29 @@ fn world_hover_drive_and_health_watcher() {
     s.set_measured_text_unwrapped(&answers);
     s.resolve();
     s.run(
-        r#"assert(GameTooltip:GetRight() == 787 and GameTooltip:GetBottom() == 70,
+        r#"assert(math.abs(GameTooltip:GetRight() - 787) < 1e-3
+                  and math.abs(GameTooltip:GetBottom() - 70) < 1e-3,
                   "plate at the default corner, got " .. tostring(GameTooltip:GetRight()) .. "," .. tostring(GameTooltip:GetBottom()))"#,
     )
     .unwrap();
-    // A health push for the live token re-drives the bar without a rebuild.
+    // A push of the shown unit redraws nothing: the bar follows the object's health watch alone
+    // (`0x52a08d` → `0x529560`).
     let mut hurt = wolf();
     hurt.health = 12;
     s.set_unit("mouseover", Some(hurt));
+    s.run(r#"assert(GameTooltipStatusBar:GetValue() == 30, "a push redraws nothing")"#)
+        .unwrap();
+    // The watcher sets the range, re-firing the held 30, then the moved value.
+    s.tooltip_unit_health(wolf().guid, 12, 50);
     s.run(
-        r#"assert(GameTooltipStatusBar:GetValue() == 12, "the health watcher tracked the push")"#,
+        r#"assert(GameTooltipStatusBar:GetValue() == 12, "the health watcher")
+           assert(table.getn(BarFires) == 3 and BarFires[2] == 30 and BarFires[3] == 12,
+                  "fired " .. table.getn(BarFires))"#,
     )
     .unwrap();
     // Hover lost: the fade arms and `"mouseover"` names nobody (`0x492890` zeroes the pair), yet
     // the fading plate keeps its bar, whose watcher follows the unit's guid, not the token.
-    s.world_tooltip_fade();
-    s.set_unit("mouseover", None);
+    assert!(s.publish_world_mouseover(None));
     s.tick(0.1);
     s.run(
         r#"
@@ -618,38 +796,43 @@ fn world_hover_drive_and_health_watcher() {
     "#,
     )
     .unwrap();
-    // The same unit pushed under another token still drives the bar.
-    let mut as_target = wolf();
-    as_target.health = 8;
-    s.set_unit("target", Some(as_target));
-    s.run(r#"assert(GameTooltipStatusBar:GetValue() == 8, "the watcher follows the guid")"#)
+    // The object's own health watch, with no token naming it: the watcher follows the guid, and
+    // another unit's health moves nothing.
+    s.tooltip_unit_health(wolf().guid, 5, 50);
+    s.run(r#"assert(GameTooltipStatusBar:GetValue() == 5, "the object's health watch")"#)
         .unwrap();
-    s.tick(0.5);
+    s.tooltip_unit_health(wolf().guid + 1, 1, 50);
+    s.run(r#"assert(GameTooltipStatusBar:GetValue() == 5, "another unit's health")"#)
+        .unwrap();
+    s.tick(2.0);
     s.run(r#"assert(not GameTooltip:IsShown(), "faded out after the ramp")"#)
         .unwrap();
     assert!(s.take_errors().is_empty());
 }
 
-/// The minimap blip tooltip (`minimap_tooltip`): refused without `UIParent`, otherwise one line
-/// seated above the cursor, world-owned so the shared fade hides it on hover loss.
+/// The minimap blip tooltip (`minimap_tooltip`): refused without `Minimap`, otherwise one line
+/// seated above the cursor in mode 6, which follows the cursor and hides at once on hover loss.
 #[test]
-fn minimap_blip_tooltip_shows_and_fades() {
+fn minimap_blip_tooltip_shows_follows_and_hides() {
     let mut s = script();
     s.set_screen_size(800.0, 600.0);
-    s.run(r#"CreateFrame("GameTooltip", "GameTooltip")"#)
+    s.run(r#"CreateFrame("GameTooltip", "GameTooltip", nil, "TestTooltipTemplate")"#)
         .unwrap();
     assert!(
-        !s.minimap_tooltip("Stormwind", 700.0, 500.0, false),
-        "no UIParent yet: the show refuses"
+        !s.minimap_tooltip("Stormwind"),
+        "no Minimap yet: the show refuses"
     );
     s.run(
         r#"
         local up = CreateFrame("Frame", "UIParent")
         up:SetPoint("BOTTOMLEFT", 0, 0); up:SetWidth(800); up:SetHeight(600)
+        -- The cursor stays on the Minimap, whose probe drops the blip on a miss.
+        CreateFrame("Minimap", "Minimap", up):SetAllPoints(up)
     "#,
     )
     .unwrap();
-    assert!(s.minimap_tooltip("Stormwind", 795.0, 500.0, false));
+    s.mouse_move(795.0, 500.0);
+    assert!(s.minimap_tooltip("Stormwind"));
     s.run(
         r#"
         assert(GameTooltipTextLeft1:GetText() == "Stormwind")
@@ -669,13 +852,322 @@ fn minimap_blip_tooltip_shows_and_fades() {
         r#"assert(GameTooltip:GetRight() <= 800, "clamped inside the screen, got " .. tostring(GameTooltip:GetRight()))"#,
     )
     .unwrap();
-    s.world_tooltip_move(400.0, 300.0);
-    s.run(r#"assert(GameTooltipTextLeft1:GetText() == "Stormwind", "content survives a move")"#)
+    s.mouse_move(400.0, 300.0);
+    s.resolve();
+    s.run(
+        r#"
+        assert(GameTooltipTextLeft1:GetText() == "Stormwind", "content survives a move")
+        assert(math.abs(GameTooltip:GetBottom() - 300) < 1e-3, "the plate follows the cursor")
+        "#,
+    )
+    .unwrap();
+    // Hover loss hides at once.
+    s.minimap_blip_lost();
+    s.run(r#"assert(not GameTooltip:IsShown(), "hidden with no fade")"#)
         .unwrap();
-    // Hover loss rides the shared world fade.
-    s.world_tooltip_fade();
-    s.tick(0.6);
-    s.run(r#"assert(not GameTooltip:IsShown(), "faded out after the ramp")"#)
+    assert!(s.take_errors().is_empty());
+}
+
+/// A cursor-seated plate sits on the cursor under the UI scale: the cursor is in root units and
+/// the anchor offset in the tooltip's own, so the cursor arm divides by its effective scale
+/// (`0x530b20`).
+#[test]
+fn a_cursor_seated_plate_lands_on_the_cursor_under_the_ui_scale() {
+    let mut s = script();
+    s.set_screen_size(800.0, 600.0);
+    s.run(
+        r#"
+        local up = CreateFrame("Frame", "UIParent")
+        up:SetPoint("BOTTOMLEFT", 0, 0); up:SetPoint("TOPRIGHT", 0, 0)
+        -- The cursor stays on the Minimap, whose probe drops the blip on a miss.
+        CreateFrame("Minimap", "Minimap", up):SetAllPoints(up)
+        CreateFrame("GameTooltip", "GameTooltip", UIParent, "TestTooltipTemplate")
+    "#,
+    )
+    .unwrap();
+    assert!(s.set_ui_scale(0.9));
+    let at = |s: &mut crate::script::UiScript| -> (f64, f64) {
+        let answers: Vec<(u32, f32, f32, u64)> = s
+            .fontstrings_needing_measure()
+            .iter()
+            .map(|r| (r.id, 80.0, 10.0, r.key))
+            .collect();
+        s.set_measured_text_unwrapped(&answers);
+        s.resolve();
+        s.eval::<(f64, f64)>(
+            "local k = GameTooltip:GetEffectiveScale() \
+             local x = GameTooltip:GetCenter() \
+             return x * k, GameTooltip:GetBottom() * k",
+        )
+        .unwrap()
+    };
+    s.mouse_move(400.0, 300.0);
+    assert!(s.minimap_tooltip("Stormwind"));
+    let (x, y) = at(&mut s);
+    assert!(
+        (x - 400.0).abs() < 1e-3 && (y - 300.0).abs() < 1e-3,
+        "({x}, {y})"
+    );
+    s.mouse_move(200.0, 100.0);
+    let (x, y) = at(&mut s);
+    assert!(
+        (x - 200.0).abs() < 1e-3 && (y - 100.0).abs() < 1e-3,
+        "({x}, {y})"
+    );
+}
+
+/// The unit builder shows `<name>StatusBar` with a full show (`0x52a13c`/`0x52a146`), and the
+/// tooltip clear hides it the same way (`0x53009b`/`0x5300a1`) only while the tooltip holds a unit
+/// (`0x530070`), first in the clear, so its `OnHide` runs before `OnTooltipCleared`.
+#[test]
+fn the_health_bar_shows_and_hides_through_its_own_transitions() {
+    let mut s = script();
+    s.set_unit("target", Some(wolf()));
+    s.run(
+        r#"
+        log = {}
+        BarHost = CreateFrame("Frame", "BarHost")
+        BarTip = CreateFrame("GameTooltip", "BarTip", nil, "TestTooltipTemplate")
+        local bar = CreateFrame("StatusBar", "BarTipStatusBar", BarTip)
+        bar:Hide()
+        bar:SetScript("OnShow", function() table.insert(log, "bar show") end)
+        bar:SetScript("OnHide", function() table.insert(log, "bar hide") end)
+        BarTip:SetScript("OnTooltipCleared", function() table.insert(log, "cleared") end)
+        BarTip:SetScript("OnHide", function() table.insert(log, "tip hide") end)
+        BarTip:SetOwner(BarHost, "ANCHOR_RIGHT")
+        log = {}
+        assert(BarTip:SetUnit("target") == 1)
+        assert(BarTipStatusBar:IsShown(), "the unit shows the bar")
+        local n = 0
+        for _, e in ipairs(log) do if e == "bar show" then n = n + 1 end end
+        assert(n == 1, "the bar's OnShow fired once: " .. table.concat(log, ","))
+        log = {}
+        BarTip:ClearLines()
+        assert(not BarTipStatusBar:IsShown(), "the clear hides the bar")
+        assert(table.concat(log, ",") == "bar hide,cleared", "got " .. table.concat(log, ","))
+
+        -- No unit held: the clear leaves the bar alone.
+        BarTip:SetOwner(BarHost, "ANCHOR_RIGHT")
+        BarTip:SetText("Peacebloom")
+        BarTipStatusBar:Show()
+        log = {}
+        BarTip:ClearLines()
+        assert(BarTipStatusBar:IsShown(), "no unit: the bar stays")
+        assert(table.concat(log, ",") == "cleared", "got " .. table.concat(log, ","))
+
+        -- The hide's clear runs before the base hide.
+        BarTip:SetOwner(BarHost, "ANCHOR_RIGHT")
+        BarTip:SetUnit("target")
+        log = {}
+        BarTip:Hide()
+        assert(table.concat(log, ",") == "bar hide,cleared,tip hide", "got " .. table.concat(log, ","))
+        "#,
+    )
+    .unwrap();
+    assert!(s.take_errors().is_empty());
+}
+
+/// The world handler's fade request is `0x530ae0`, which hides a mode-6 plate at once; a
+/// cursor-seated GameObject plate is owned in mode 6 (`0x492a1e`), so hover loss hides it.
+#[test]
+fn a_cursor_seated_world_plate_hides_at_once_on_hover_loss() {
+    let mut s = script();
+    s.set_screen_size(800.0, 600.0);
+    s.run(
+        r#"
+        local up = CreateFrame("Frame", "UIParent"); up:SetAllPoints()
+        CreateFrame("GameTooltip", "GameTooltip", nil, "TestTooltipTemplate")
+        "#,
+    )
+    .unwrap();
+    s.publish_world_mouseover(Some(1));
+    assert!(s.world_tooltip_gameobject("Brill", &[], true));
+    s.run(r#"assert(GameTooltip:GetAnchorType() == "ANCHOR_CURSOR", "seated in mode 6")"#)
         .unwrap();
+    s.publish_world_mouseover(None);
+    s.run(r#"assert(not GameTooltip:IsVisible(), "gone at once")"#)
+        .unwrap();
+    assert!(s.take_errors().is_empty());
+}
+
+/// The minimap blip tooltip is owned by `Minimap` in mode 6 (`0x4eb19c`, `0x4eb587`), and when no blip is hovered
+/// `0x4eb0c0` hides it directly (`0x4eb12b`–`0x4eb166`), with no fade.
+#[test]
+fn a_minimap_blip_plate_hides_at_once_on_hover_loss() {
+    let mut s = script();
+    s.set_screen_size(800.0, 600.0);
+    s.run(
+        r#"
+        local up = CreateFrame("Frame", "UIParent"); up:SetAllPoints()
+        CreateFrame("Minimap", "Minimap", up)
+        CreateFrame("GameTooltip", "GameTooltip", nil, "TestTooltipTemplate")
+        "#,
+    )
+    .unwrap();
+    assert!(s.minimap_tooltip("Stormwind"));
+    s.run(
+        r#"
+        assert(GameTooltip:IsShown())
+        assert(GameTooltip:IsOwned(Minimap), "owned by the Minimap, whose probe it is")
+        assert(not GameTooltip:IsOwned(UIParent))
+        assert(GameTooltip:GetAnchorType() == "ANCHOR_CURSOR", "seated in mode 6")
+        "#,
+    )
+    .unwrap();
+    s.minimap_blip_lost();
+    s.run(r#"assert(not GameTooltip:IsShown(), "gone at once")"#)
+        .unwrap();
+    assert!(s.take_errors().is_empty());
+}
+
+/// The world handler tears down on every mouseover change (`0x492909`), so moving from one
+/// cursor-seated object straight to another hides the first plate (mode 6, `0x530ae3`) and shows
+/// the second afresh. Each seat clears twice: the SetOwner core's clear (`0x52ffe6`), then the
+/// builder's own (`0x52aa40`).
+#[test]
+fn a_cursor_plate_replaced_by_another_hides_then_shows_and_clears_twice_per_seat() {
+    let mut s = script();
+    s.set_screen_size(800.0, 600.0);
+    s.run(
+        r#"
+        log = {}
+        local up = CreateFrame("Frame", "UIParent"); up:SetAllPoints()
+        local tt = CreateFrame("GameTooltip", "GameTooltip", nil, "TestTooltipTemplate"); tt:Hide()
+        tt:SetScript("OnTooltipCleared", function() table.insert(log, "cleared") end)
+        tt:SetScript("OnShow", function() table.insert(log, "show") end)
+        tt:SetScript("OnHide", function() table.insert(log, "hide") end)
+        "#,
+    )
+    .unwrap();
+    s.publish_world_mouseover(Some(1));
+    assert!(s.world_tooltip_gameobject("Brill", &[], true));
+    s.run(r#"assert(table.concat(log, ",") == "cleared,cleared,show", table.concat(log, ",")) log = {}"#)
+        .unwrap();
+    // The driver's change: the teardown, then the next seat.
+    s.publish_world_mouseover(Some(2));
+    assert!(s.world_tooltip_gameobject("Tirisfal Glades", &[], true));
+    s.run(
+        r#"
+        assert(table.concat(log, ",") == "cleared,hide,cleared,cleared,show", table.concat(log, ","))
+        assert(GameTooltipTextLeft1:GetText() == "Tirisfal Glades")
+        "#,
+    )
+    .unwrap();
+    assert!(s.take_errors().is_empty());
+}
+
+/// The publisher tears down on every change away from a published mouseover (`0x4928d5`), loss
+/// and replacement alike, and not for a first one or an unchanged one (`0x4820b5`); its fade
+/// request is on `GameTooltip` whoever holds it (`0x492909`), so a tooltip a window took since
+/// fades too.
+#[test]
+fn a_mouseover_change_fades_the_tooltip_whoever_holds_it() {
+    let mut s = script();
+    s.set_screen_size(800.0, 600.0);
+    s.run(
+        r#"
+        UIParent = CreateFrame("Frame", "UIParent"); UIParent:SetAllPoints()
+        CreateFrame("GameTooltip", "GameTooltip", nil, "TestTooltipTemplate"):Hide()
+        Bag = CreateFrame("Button", "Bag")
+        function bag_tooltip()
+            GameTooltip:SetOwner(Bag, "ANCHOR_RIGHT"); GameTooltip:SetText("Bag slot")
+        end
+        "#,
+    )
+    .unwrap();
+    let up = |s: &mut crate::script::UiScript| {
+        s.tick(2.5);
+        s.eval::<bool>("return GameTooltip:IsShown() == 1").unwrap()
+    };
+    // A first publish has nothing to tear down; an unchanged one does nothing.
+    s.run("bag_tooltip()").unwrap();
+    assert!(s.publish_world_mouseover(Some(1)));
+    assert!(!s.publish_world_mouseover(Some(1)));
+    assert!(up(&mut s), "no fade for a first or an unchanged mouseover");
+    // A replacement and a loss each request the fade.
+    for next in [Some(2), None] {
+        s.run("bag_tooltip()").unwrap();
+        assert!(s.publish_world_mouseover(next));
+        assert!(
+            !up(&mut s),
+            "the bag's tooltip faded on the change to {next:?}"
+        );
+    }
+    // From the empty mouseover, a new one tears nothing down.
+    s.run("bag_tooltip()").unwrap();
+    assert!(s.publish_world_mouseover(Some(3)));
+    assert!(up(&mut s));
+    assert!(s.take_errors().is_empty());
+}
+
+/// A unit is found by its guid (`0x52a021`); guid 0 finds no object and the builder hides through
+/// its own hide (`0x52a04e`–`0x52a058`), so `SetUnit` answers nil.
+#[test]
+fn a_unit_with_guid_zero_is_no_unit() {
+    let mut s = script();
+    s.set_unit("target", Some(UnitState { guid: 0, ..wolf() }));
+    s.run(
+        r#"
+        ZeroHost = CreateFrame("Frame", "ZeroHost")
+        ZeroTip = CreateFrame("GameTooltip", "ZeroTip", nil, "TestTooltipTemplate")
+        ZeroTip:SetOwner(ZeroHost, "ANCHOR_RIGHT")
+        assert(ZeroTip:SetUnit("target") == nil, "no object, no plate")
+        assert(not ZeroTip:IsShown() and not ZeroTip:IsOwned(ZeroHost))
+        "#,
+    )
+    .unwrap();
+    assert!(s.take_errors().is_empty());
+}
+
+/// A unit with a maximum of 0 seeds the bar's range as `(0, 0)` (`0x52a0eb`, no floor), whose fill
+/// is 0 (`0x783394`): after the bar's update (`0x7833c0`) its texture is cut to nothing across.
+#[test]
+fn a_unit_with_no_maximum_health_draws_an_empty_tooltip_bar() {
+    let mut s = script();
+    s.set_screen_size(800.0, 600.0);
+    s.set_unit("target", Some(wolf()));
+    s.run(
+        r#"
+        EmptyHost = CreateFrame("Frame", "EmptyHost")
+        EmptyTip = CreateFrame("GameTooltip", "EmptyTip", nil, "TestTooltipTemplate")
+        local bar = CreateFrame("StatusBar", "EmptyTipStatusBar", EmptyTip)
+        bar:SetPoint("BOTTOMLEFT", nil, "BOTTOMLEFT", 10, 10)
+        bar:SetWidth(100); bar:SetHeight(8)
+        bar:SetStatusBarTexture("Interface\\TargetingFrame\\UI-StatusBar")
+        EmptyTip:SetOwner(EmptyHost, "ANCHOR_RIGHT")
+        assert(EmptyTip:SetUnit("target") == 1)
+    "#,
+    )
+    .unwrap();
+    let fill = |s: &UiScript| -> Option<([f32; 4], f32)> {
+        s.extract().iter().find_map(|q| match &q.content {
+            QuadContent::Texture {
+                path: Some(p),
+                tex_coords,
+                ..
+            } if p.contains("UI-StatusBar") => Some((
+                tex_coords.map_or([0.0, 1.0, 0.0, 1.0], |tc| tc.edges()),
+                (q.rect.expect("bar rect resolved").width() * 100.0).round() / 100.0,
+            )),
+            _ => None,
+        })
+    };
+    s.tick(0.0);
+    assert_eq!(fill(&s), Some(([0.0, 0.6, 0.0, 1.0], 60.0)), "30 of 50");
+    let mut spent = wolf();
+    spent.guid += 1;
+    spent.health = 0;
+    spent.max_health = 0;
+    s.set_unit("target", Some(spent));
+    s.run(
+        r#"
+        assert(EmptyTip:SetUnit("target") == 1)
+        local mn, mx = EmptyTipStatusBar:GetMinMaxValues()
+        assert(mn == 0 and mx == 0, "the raw maximum: " .. mn .. "," .. mx)
+    "#,
+    )
+    .unwrap();
+    s.tick(0.0);
+    assert_eq!(fill(&s), Some(([0.0, 0.0, 0.0, 1.0], 0.0)), "empty across");
     assert!(s.take_errors().is_empty());
 }

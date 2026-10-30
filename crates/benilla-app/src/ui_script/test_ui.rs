@@ -12,6 +12,36 @@ pub(crate) fn load_ui(s: &UiScript, entry: &str) -> usize {
     load_entry(s, entry, false, false)
 }
 
+/// Declares `TestTooltipTemplate`, the stock template's 30 `TextLeft`/`TextRight` pairs with their
+/// anchors (`GameTooltipTemplate.xml`), for a test with no install. A tooltip made without the
+/// template holds no line, as on 1.12.1; a test makes one with
+/// `CreateFrame("GameTooltip", name, parent, "TestTooltipTemplate")`.
+pub(crate) fn load_tooltip_template(s: &UiScript) {
+    // The FrameXML functions the tooltips' counted and gendered lines call (`0x703bf0`).
+    benilla_ui::test_support::install_text_rules(s);
+    let mut xml = String::from(
+        r#"<Ui><GameTooltip name="TestTooltipTemplate" virtual="true"><Layers><Layer level="ARTWORK">"#,
+    );
+    for i in 1..=30 {
+        let left_anchor = if i == 1 {
+            r#"<Anchor point="TOPLEFT"><Offset><AbsDimension x="10" y="-10"/></Offset></Anchor>"#
+                .to_string()
+        } else {
+            format!(
+                r#"<Anchor point="TOPLEFT" relativeTo="$parentTextLeft{}" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-2"/></Offset></Anchor>"#,
+                i - 1
+            )
+        };
+        xml.push_str(&format!(
+            r#"<FontString name="$parentTextLeft{i}" hidden="true"><Anchors>{left_anchor}</Anchors></FontString><FontString name="$parentTextRight{i}" hidden="true"><Anchors><Anchor point="RIGHT" relativeTo="$parentTextLeft{i}" relativePoint="LEFT"><Offset><AbsDimension x="40" y="0"/></Offset></Anchor></Anchors></FontString>"#
+        ));
+    }
+    xml.push_str("</Layer></Layers></GameTooltip></Ui>");
+    let doc = benilla_ui::framexml::parse(&xml).expect("tooltip template parses");
+    let report = benilla_ui::loader::load(s, &doc, &|_| None);
+    assert!(report.errors.is_empty(), "template: {:?}", report.errors);
+}
+
 /// The cooldown indicator's file, as the stock `CooldownFrameTemplate` names it.
 pub(super) const COOLDOWN_MODEL: &str = r"Interface\Cooldown\UI-Cooldown-Indicator.mdx";
 
@@ -157,7 +187,7 @@ fn load_entry(s: &UiScript, entry: &str, strict_templates: bool, no_warnings: bo
         let missing: Vec<&String> = report
             .warnings
             .iter()
-            .filter(|w| w.contains("unknown template"))
+            .filter(|w| w.contains("Couldn't find inherited node"))
             .collect();
         assert!(
             missing.is_empty(),
@@ -481,11 +511,12 @@ pub(super) const MERCHANT_UI: &[&str] = &[
     "ScrollTemplates.xml",
 ];
 
-/// Stock `GossipFrame.xml`'s dependencies in the production order, shared with `ui_gossip`'s feed
-/// tests. The greeting pane inherits `UIPanelScrollFrameTemplate`, and a missing template only
-/// warns, losing the scrollbar silently. Needs client data.
+/// Stock `GossipFrame.xml`'s dependencies in the production order, for the gossip lane's tests.
+/// The greeting pane inherits `UIPanelScrollFrameTemplate`, and a missing template only warns,
+/// losing the scrollbar silently. Needs client data.
 pub(crate) const GOSSIP_UI: &[&str] = &[
     r"Interface\FrameXML\GlobalStrings.lua",
+    r"Interface\FrameXML\Fonts.xml",
     r"Interface\FrameXML\BasicControls.xml",
     r"Interface\FrameXML\LocaleProperties.lua",
     r"Interface\FrameXML\UIParent.xml",
@@ -643,7 +674,7 @@ pub(super) fn load_social_ui(s: &mut UiScript) {
 
 /// The files a test needs before it can open a bag window, in the production order, trimmed to what
 /// the bags reach for. Needs client data: open with `benilla_formats::wow_data_or_skip!()`.
-pub(super) const BAG_UI: &[&str] = &[
+pub(crate) const BAG_UI: &[&str] = &[
     // The stock strings: the bar's hovers pass them to `GameTooltip:SetText`, which raises on nil.
     "Interface\\FrameXML\\GlobalStrings.lua",
     "Interface\\FrameXML\\Fonts.xml",
@@ -660,6 +691,8 @@ pub(super) const BAG_UI: &[&str] = &[
     "Interface\\FrameXML\\UIDropDownMenu.xml",
     r"Interface\FrameXML\UIPanelTemplates.lua",
     r"Interface\FrameXML\UIPanelTemplates.xml",
+    // `CharacterFrame.xml`'s tab template, for the hidden parent `PaperDollFrame` needs below.
+    r"Interface\FrameXML\CharacterFrameTemplates.xml",
     // The dialog engine, after the `UIPanelCloseButton` it inherits.
     r"Interface\FrameXML\StaticPopup.xml",
     // `ContainerFrameItemButton_OnClick` hides `StackSplitFrame` on every plain click
@@ -683,7 +716,9 @@ pub(super) const BAG_UI: &[&str] = &[
     "Interface\\FrameXML\\ItemButtonTemplate.xml",
     // `BagSlotButtonTemplate` inherits `PaperDollItemSlotButtonTemplate`, and its OnLoad
     // (`PaperDollItemSlotButton_OnLoad`) gives each bag button its inventory-slot id, 20..23.
-    // `CharacterFrame.xml` stays out: a missing `parent=` only warns.
+    // Its hidden parent `CharacterFrame` comes first: a parentless `PaperDollFrame` would be
+    // visible at the end of its load and run its OnShow, which reaches for the Honor tab.
+    "Interface\\FrameXML\\CharacterFrame.xml",
     "Interface\\FrameXML\\PaperDollFrame.xml",
     // The stock bag bar, with `BagSlotButtonTemplate` and `KEYRING_CONTAINER`.
     "Interface\\FrameXML\\MainMenuBarBagButtons.xml",
@@ -815,8 +850,7 @@ pub(crate) fn seat_chain_addon(s: &mut UiScript, name: &str) {
     let toc = super::reference_ui::read(&format!("Interface/AddOns/{name}/{name}.toc"))
         .map(|b| benilla_ui::toc::Toc::parse(&benilla_ui::source::decode(&b)))
         .unwrap_or_else(|| panic!("{name}: no toc off the chain"));
-    let mut info = super::addons::info_from_toc(name, &toc);
-    info.chain = true;
+    let info = super::addons::info_from_toc(name, &toc, true);
     s.set_addon_chain_reader(Box::new(super::reference_ui::read));
     s.register_addons(vec![info], None, None, None);
 }

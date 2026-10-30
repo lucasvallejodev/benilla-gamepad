@@ -30,6 +30,7 @@ pub struct Interacting<'w, 's> {
     transforms: Query<'w, 's, &'static Transform>,
     camera: Query<'w, 's, &'static GlobalTransform, With<WorldCamera>>,
     out: MessageWriter<'w, Interact>,
+    me: Local<'s, Option<(Entity, u64)>>,
 }
 
 /// One candidate, reduced to what the ranking reads.
@@ -108,12 +109,19 @@ pub fn soft_target(
 
 impl Interacting<'_, '_> {
     /// Our player's target, as the server last recorded it (`UNIT_FIELD_TARGET`).
-    pub fn target(&self) -> Option<u64> {
+    pub fn target(&mut self) -> Option<u64> {
         let me = self.objects.player()?;
+        let guid = match *self.me {
+            Some((entity, guid)) if entity == me => guid,
+            _ => {
+                let guid = self.objects.iter().find(|(_, e, _)| *e == me)?.0;
+                *self.me = Some((me, guid));
+                guid
+            }
+        };
         self.objects
-            .iter()
-            .find(|(_, e, _)| *e == me)
-            .and_then(|(_, _, fields)| fields.unit_target())
+            .object(guid)
+            .and_then(|fields| fields.unit_target())
             .filter(|g| *g != 0)
     }
 

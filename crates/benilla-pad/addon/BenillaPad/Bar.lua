@@ -117,10 +117,16 @@ local function newButton(key)
         b.pressed = hi
     end
 
-    local cd = CreateFrame("Model", "BenillaPadButton" .. key .. "Cooldown", b, "CooldownFrameTemplate")
-    cd:SetWidth(size * 0.9)
-    cd:SetHeight(size * 0.9)
-    cd:SetPoint("CENTER", b, "CENTER", 0, 0)
+    local cd
+    if round then
+        -- Inside the ring's band (0.43 of the button), so the ring stays unshaded.
+        cd = P.NewRoundSweep(b, size * 0.86)
+    else
+        cd = CreateFrame("Model", "BenillaPadButton" .. key .. "Cooldown", b, "CooldownFrameTemplate")
+        cd:SetWidth(size * 0.9)
+        cd:SetHeight(size * 0.9)
+        cd:SetPoint("CENTER", b, "CENTER", 0, 0)
+    end
     b.cooldown = cd
 
     -- Text sits on a child above the cooldown model.
@@ -202,6 +208,14 @@ local function tintIcon(b, r, g, bl)
     P.TintIcon(b.strips, r, g, bl)
 end
 
+local function setCooldown(b, start, duration, enable)
+    if b.round then
+        P.SetSweep(b.cooldown, start, duration, enable)
+    else
+        CooldownFrame_SetTimer(b.cooldown, start, duration, enable)
+    end
+end
+
 local function setGlyph(b)
     local key = b.key
     local color = BADGE_COLOR[key]
@@ -236,16 +250,14 @@ function Bar.UpdateButton(b)
     setIcon(b, tex)
     setGlyph(b)
     if b.slot and HasAction(b.slot) then
-        local start, duration, enable = GetActionCooldown(b.slot)
-        CooldownFrame_SetTimer(b.cooldown, start, duration, enable)
+        setCooldown(b, GetActionCooldown(b.slot))
         if IsConsumableAction(b.slot) then
             b.count:SetText(GetActionCount(b.slot))
         else
             b.count:SetText("")
         end
     elseif b.spellIndex then
-        local start, duration, enable = GetSpellCooldown(b.spellIndex, "spell")
-        CooldownFrame_SetTimer(b.cooldown, start, duration, enable)
+        setCooldown(b, GetSpellCooldown(b.spellIndex, "spell"))
         b.count:SetText("")
     else
         b.cooldown:Hide()

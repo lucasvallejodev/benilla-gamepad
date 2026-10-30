@@ -16,7 +16,7 @@ use std::path::PathBuf;
 
 use bevy::prelude::*;
 
-use crate::char_select::{ClientState, InWorldGated};
+use crate::client_state::{ClientState, InWorldGated};
 
 use super::camera::{CameraControl, FlyCam, CAM_PITCH_LIMIT};
 use super::camera_zoom::{CAM_DIST_DEFAULT, CAM_DIST_MAX, CAM_DIST_MIN};
@@ -90,7 +90,7 @@ fn parse(text: &str) -> (Option<f32>, Option<f32>) {
 /// Restores the pose once the roster names the character, the identity the macro and binding
 /// loads use. All three rig distances are set, so the login opens at the zoom, not gliding to it.
 fn load_camera_pose(
-    roster: Res<crate::char_select::Roster>,
+    roster: Res<crate::glue_session::roster::Roster>,
     mut file: ResMut<CameraPoseFile>,
     mut rig: ResMut<CameraControl>,
     mut cam: Query<&mut FlyCam, With<WorldCamera>>,
@@ -183,9 +183,15 @@ pub(super) fn plugin(app: &mut App) {
     app.init_resource::<CameraPoseFile>()
         .add_systems(
             Update,
-            // Before the controller, so the first in-world frame renders the restored pose. A
-            // capture resolves no state path, so this is inert there.
-            load_camera_pose.before(super::control).in_set(InWorldGated),
+            // Ahead of the frame's input records and packets: the reference reads the file as the
+            // world frame constructs its camera at the interface load (`0x481b4e` → `0x50c0e0`,
+            // `LoadSettings 0x50c5a0` at `0x50c3ea`), before any listener, and `SaveView` reads
+            // what it restores inside its call (`0x50fa30`). A capture resolves no state path, so
+            // this is inert there.
+            load_camera_pose
+                .before(crate::ui_script::UiInput)
+                .before(super::control)
+                .in_set(InWorldGated),
         )
         .add_systems(OnExit(ClientState::InWorld), save_on_session_end);
     // On the exit edge, never `Update`: the close button's `AppExit` is written in `PostUpdate`.
@@ -245,7 +251,7 @@ mod login_tests {
     use bevy::ecs::system::RunSystemOnce;
 
     use super::*;
-    use crate::char_select::Roster;
+    use crate::glue_session::roster::Roster;
     use crate::local_state::test_env::{EnvGuard, ENV_LOCK};
 
     fn roster(name: &str, guid: u64) -> Roster {
@@ -262,6 +268,7 @@ mod login_tests {
                 hair_color: 0,
                 facial_hair: 0,
                 level: 1,
+                new_character: false,
                 zone: 0,
                 map: 0,
                 position: benilla_protocol::wire::Vector3d {

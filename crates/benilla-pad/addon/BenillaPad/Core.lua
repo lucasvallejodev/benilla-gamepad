@@ -59,8 +59,6 @@ P.DEFAULTS = {
     -- The experience bar along the bottom of the screen, and its numbers.
     xpBar = true,
     xpText = true,
-    -- Interact loots a whole corpse at once.
-    interactLootAll = true,
     -- A row above the bar with the cooldowns of the layers not held.
     layerCooldowns = true,
 }
@@ -328,6 +326,79 @@ function P.TintIcon(strips, r, g, b)
     end
 end
 
+-- A round cooldown sweep. The stock CooldownFrameTemplate is an M2 drawn over a square, and 1.12
+-- has no mask to round it, so two half-width quads, left and right of the centre, each show the
+-- half-disc art turned with an 8-point texcoord; the quad's edge clips it to a pie. The shade
+-- covers what is still cooling, clockwise from twelve, as the stock sweep does.
+local function sweepHalf(t, x0, x1, degrees)
+    local a = math.rad(degrees)
+    local c, s = math.cos(a), math.sin(a)
+    -- The texel at (x, y) of the button comes from (x, y) turned back by the angle; the 0.7071
+    -- keeps every corner inside the texture.
+    local function uv(x, y)
+        local k = 0.7071
+        return 0.5 + (x * c - y * s) * k, 0.5 - (x * s + y * c) * k
+    end
+    local ulx, uly = uv(x0, 0.5)
+    local llx, lly = uv(x0, -0.5)
+    local urx, ury = uv(x1, 0.5)
+    local lrx, lry = uv(x1, -0.5)
+    t:SetTexCoord(ulx, uly, llx, lly, urx, ury, lrx, lry)
+end
+
+local function sweepUpdate(sweep)
+    local done = (GetTime() - sweep.start) / sweep.duration
+    if done >= 1 then
+        sweep:Hide()
+        return
+    end
+    local degrees = 360 * math.max(done, 0)
+    if degrees < 180 then
+        -- The left half is all shade; the right one shades from the edge round to six.
+        sweepHalf(sweep.right, 0, 0.5, degrees)
+        sweepHalf(sweep.left, -0.5, 0, 180)
+        sweep.right:Show()
+    else
+        sweep.right:Hide()
+        sweepHalf(sweep.left, -0.5, 0, degrees)
+    end
+end
+
+-- A sweep of diameter d over the centre of parent, above its textures.
+function P.NewRoundSweep(parent, d)
+    local sweep = CreateFrame("Frame", nil, parent)
+    sweep:SetWidth(d)
+    sweep:SetHeight(d)
+    sweep:SetPoint("CENTER", parent, "CENTER", 0, 0)
+    sweep:SetFrameLevel(parent:GetFrameLevel() + 1)
+    local function half(point)
+        local t = sweep:CreateTexture(nil, "ARTWORK")
+        t:SetTexture(P.ART .. "Sweep")
+        t:SetVertexColor(0, 0, 0, 0.6)
+        t:SetWidth(d / 2)
+        t:SetHeight(d)
+        t:SetPoint(point, sweep, point, 0, 0)
+        return t
+    end
+    sweep.left = half("LEFT")
+    sweep.right = half("RIGHT")
+    sweep:SetScript("OnUpdate", function() sweepUpdate(this) end)
+    sweep:Hide()
+    return sweep
+end
+
+-- CooldownFrame_SetTimer's contract (Cooldown.lua), for the round sweep.
+function P.SetSweep(sweep, start, duration, enable)
+    if start > 0 and duration > 0 and enable > 0 then
+        sweep.start = start
+        sweep.duration = duration
+        sweep:Show()
+        sweepUpdate(sweep)
+    else
+        sweep:Hide()
+    end
+end
+
 -- A game action's icon; some change with the bags (the quest item).
 function P.ActionIcon(id)
     local action = P.Actions and P.Actions[id]
@@ -377,8 +448,7 @@ end
 -- The settings the Rust side applies: deadzone, look speed, invert Y, shoulder zoom, cursor speed.
 function BenillaPad_Settings()
     return P.Setting("deadzone"), P.Setting("lookSpeed"), P.Setting("invertY") and true or false,
-        P.Setting("shoulderZoom") and true or false, P.Setting("cursorSpeed"),
-        P.Setting("interactLootAll") and true or false
+        P.Setting("shoulderZoom") and true or false, P.Setting("cursorSpeed")
 end
 
 -- The face symbols to draw: the setting, or the pad's own.
@@ -430,13 +500,10 @@ end
 
 local core = CreateFrame("Frame", "BenillaPadCore")
 core:RegisterEvent("ADDON_LOADED")
-core:RegisterEvent("BENILLAPAD_CONNECTED")
-core:RegisterEvent("BENILLAPAD_DISCONNECTED")
-core:RegisterEvent("BENILLAPAD_LAYER")
-core:RegisterEvent("BENILLAPAD_BUTTON")
-core:RegisterEvent("BENILLAPAD_NAV")
-core:RegisterEvent("BENILLAPAD_STICK")
-core:SetScript("OnEvent", function()
+
+-- The pad's own events. 1.12's RegisterEvent ignores a name off the client's event table, so the
+-- Rust side calls this directly, with the event and its arguments as an OnEvent would see them.
+function BenillaPad_Signal(event, arg1, arg2, arg3, arg4)
     if event == "ADDON_LOADED" then
         if arg1 ~= "BenillaPad" then
             return
@@ -465,6 +532,10 @@ core:SetScript("OnEvent", function()
             break
         end
     end
+end
+
+core:SetScript("OnEvent", function()
+    BenillaPad_Signal(event, arg1, arg2, arg3, arg4)
 end)
 
 -- The Key Bindings window's names for this addon's rows.

@@ -158,7 +158,11 @@ fn a_comma_list_is_one_name_and_a_single_name_still_chains() {
             .unwrap(),
         (50.0, 60.0)
     );
-    assert_eq!(s.eval::<f32>("return One:GetAlpha()").unwrap(), 0.25);
+    // `alpha="0.25"` is the byte 63 (`0x769a82`).
+    assert_eq!(
+        s.eval::<f64>("return One:GetAlpha()").unwrap(),
+        63.0 / 255.0
+    );
     assert!(s.take_errors().is_empty());
     assert!(s.take_warnings().is_empty());
 
@@ -338,6 +342,8 @@ fn a_scroll_child_element_gives_the_frame_a_real_scroll_range() {
           </Ui>"#,
     );
     s.resolve();
+    // `SetScrollChild` marked the range; the frame's update measures it.
+    s.tick(0.016);
 
     // `$parent` names the child against the scroll frame (`0x76c5b0`).
     assert!(s.eval::<bool>("return RollerChild ~= nil").unwrap());
@@ -345,14 +351,14 @@ fn a_scroll_child_element_gives_the_frame_a_real_scroll_range() {
         .eval::<bool>("return Roller:GetScrollChild() == RollerChild")
         .unwrap());
     // The range is the overhang: a 400-tall child in a 100-tall window scrolls 300.
-    assert_eq!(
+    crate::assert_near!(
         s.eval::<f64>("return Roller:GetVerticalScrollRange()")
             .unwrap(),
         300.0,
         "no child means range 0, which is the silent failure this element fixes"
     );
     s.run("Roller:SetVerticalScroll(120)").unwrap();
-    assert_eq!(
+    crate::assert_near!(
         s.eval::<f64>("return Roller:GetVerticalScroll()").unwrap(),
         120.0
     );
@@ -387,22 +393,24 @@ fn the_scroll_range_is_the_childs_whole_subtree() {
           </Ui>"#,
     );
     s.resolve();
+    s.tick(0.016);
 
-    assert_eq!(
+    crate::assert_near!(
         s.eval::<f64>("return Reader:GetVerticalScrollRange()")
             .unwrap(),
         204.0,
         "the 304-tall page inside the 10-tall child, less the 100-tall window"
     );
-    assert_eq!(
+    crate::assert_near!(
         s.eval::<f64>("return ReaderChild:GetHeight()").unwrap(),
         10.0,
         "and the child itself really is the reference's 10 — the range does not come from it"
     );
 
     // A hidden branch adds nothing: the reference guards both list walks on visibility.
-    s.run("Page:Hide()").unwrap();
+    s.run("Page:Hide() Reader:UpdateScrollChildRect()").unwrap();
     s.resolve();
+    s.tick(0.016);
     assert_eq!(
         s.eval::<f64>("return Reader:GetVerticalScrollRange()")
             .unwrap(),
@@ -411,7 +419,8 @@ fn the_scroll_range_is_the_childs_whole_subtree() {
     );
 }
 
-/// The reference reports an empty `<ScrollChild>` as an error (`0x786bc0`) and keeps the frame.
+/// An empty `<ScrollChild>` logs `Frame %s: Scroll frame created without scroll child` at
+/// severity 1 (`0x87a68c`, `0x786c0c`-`0x786c30`), raises nothing, and keeps the frame.
 #[test]
 fn an_empty_scroll_child_is_reported() {
     let s = script();
@@ -420,13 +429,231 @@ fn an_empty_scroll_child_is_reported() {
     )
     .expect("valid FrameXML");
     let report = crate::loader::load(&s, &doc, &|_| None);
-    assert!(
-        report
-            .errors
-            .iter()
-            .any(|e| e.contains("<ScrollChild> is empty")),
-        "errors: {:?}",
-        report.errors
+    assert!(report.errors.is_empty(), "errors: {:?}", report.errors);
+    assert_eq!(
+        report.status.lines(),
+        ["Frame Hollow: Scroll frame created without scroll child"]
     );
     assert!(s.eval::<bool>("return Hollow ~= nil").unwrap());
+}
+
+/// `CreateFrame` builds through the same instantiator as the XML, `0x6ee280` (called at
+/// `0x70628b`), so its post-load hook `0x76a2f0` fires a visible frame's template OnShow once,
+/// after its OnLoad (`0x76a3b3`); one created under a hidden parent gets none.
+#[test]
+fn a_runtime_template_fires_its_onshow_after_its_onload_when_visible() {
+    let s = script();
+    register(
+        &s,
+        r#"<Ui>
+             <Frame name="ShowProbeTemplate" virtual="true">
+               <Scripts>
+                 <OnLoad>table.insert(LOG, this:GetName() .. ":load")</OnLoad>
+                 <OnShow>table.insert(LOG, this:GetName() .. ":show")</OnShow>
+               </Scripts>
+             </Frame>
+           </Ui>"#,
+    );
+    s.run(
+        r#"
+        LOG = {}
+        CreateFrame("Frame", "Seen", nil, "ShowProbeTemplate")
+        local hidden = CreateFrame("Frame", "HiddenHost")
+        hidden:Hide()
+        CreateFrame("Frame", "Unseen", hidden, "ShowProbeTemplate")
+    "#,
+    )
+    .unwrap();
+    assert_eq!(
+        s.eval::<String>("return table.concat(LOG, ',')").unwrap(),
+        "Seen:load,Seen:show,Unseen:load"
+    );
+    assert!(s.errors().is_empty(), "{:?}", s.errors());
+}
+
+/// A template's OnLoad runs under the error function as a file's does (`CreateFrame` builds through
+/// `0x6ee280`, OnLoad through `0x704d50`): a raise reaches the chosen error handler as the bare
+/// message, and `CreateFrame` still returns the frame.
+#[test]
+fn a_raising_template_onload_reaches_the_error_handler() {
+    let mut s = script();
+    s.set_screen_size(800.0, 600.0);
+    register(
+        &s,
+        r#"<Ui>
+             <Frame name="RaisingTemplate" virtual="true">
+               <Scripts><OnLoad>this:NoSuchMethod()</OnLoad></Scripts>
+             </Frame>
+           </Ui>"#,
+    );
+    s.run(
+        "caught = {} seterrorhandler(function(m) table.insert(caught, m) end) \
+         made = CreateFrame('Frame', 'Raised', UIParent, 'RaisingTemplate')",
+    )
+    .unwrap();
+    let caught: Vec<String> = s.eval("return caught").unwrap();
+    assert_eq!(caught.len(), 1, "{caught:?}");
+    assert!(
+        caught[0].ends_with("attempt to call method `NoSuchMethod' (a nil value)")
+            && !caught[0].contains('\n'),
+        "{:?}",
+        caught[0]
+    );
+    let made: bool = s
+        .eval("return made ~= nil and made:GetName() == 'Raised'")
+        .unwrap();
+    assert!(
+        made,
+        "CreateFrame returns the frame after its OnLoad raised"
+    );
+}
+
+/// The load order the tests below read: a Lua `Order` string the OnLoads append to.
+const LOG: &str = r#"<Script>Order = ""; function Log(w) Order = Order .. w .. ";" end</Script>"#;
+
+/// A ScrollFrame's `LoadXML` (`0x786bc0`) runs the base load (`0x769820`), then builds its
+/// `<ScrollChild>` through `Instantiate 0x6ee280` at `0x786bf4`: the child's whole lifecycle,
+/// its own `<Frames>` and OnLoad included, is over before the post-load hook `0x76a2f0` builds
+/// the ScrollFrame's `<Frames>` (`0x76a36f`) and fires its OnLoad. `SetScrollChild` (`0x786ce0`)
+/// follows the child's return, so the child's own OnLoad sees none and `<Frames>` sees it.
+#[test]
+fn a_scroll_child_is_built_before_the_frames_and_the_scroll_frames_onload() {
+    let mut s = script();
+    s.set_screen_size(1024.0, 768.0);
+    register(
+        &s,
+        &format!(
+            r#"<Ui>{LOG}
+            <ScrollFrame name="Roller">
+              <Size><AbsDimension x="200" y="100"/></Size>
+              <Anchors><Anchor point="TOPLEFT"/></Anchors>
+              <Frames>
+                <Frame name="$parentBar">
+                  <Scripts><OnLoad>Log("bar:" .. tostring(this:GetParent():GetScrollChild() ~= nil))</OnLoad></Scripts>
+                </Frame>
+              </Frames>
+              <ScrollChild>
+                <Frame name="$parentChild">
+                  <Size><AbsDimension x="200" y="400"/></Size>
+                  <Frames>
+                    <Frame name="$parentInner">
+                      <Scripts><OnLoad>Log("inner")</OnLoad></Scripts>
+                    </Frame>
+                  </Frames>
+                  <Scripts><OnLoad>Log("child:" .. tostring(this:GetParent():GetScrollChild() ~= nil))</OnLoad></Scripts>
+                </Frame>
+              </ScrollChild>
+              <Scripts>
+                <OnLoad>Log("scroll:" .. tostring(this:GetScrollChild() == RollerChild))</OnLoad>
+              </Scripts>
+            </ScrollFrame>
+          </Ui>"#
+        ),
+    );
+
+    assert_eq!(
+        s.eval::<String>("return Order").unwrap(),
+        "inner;child:false;bar:true;scroll:true;",
+        "the scroll child's subtree, then <Frames>, then the ScrollFrame's own OnLoad"
+    );
+    assert!(s.errors().is_empty(), "{:?}", s.errors());
+}
+
+/// The same order when the `<Frames>` come from a template, which is how
+/// `UIPanelScrollFrameTemplate`'s ScrollBar meets an instance's `<ScrollChild>`: the template's
+/// `<Frames>` are built by the post-load hook, after every `LoadXML` level (`0x76a060`).
+#[test]
+fn a_templates_frames_load_after_the_instances_scroll_child() {
+    let mut s = script();
+    s.set_screen_size(1024.0, 768.0);
+    register(
+        &s,
+        &format!(
+            r#"<Ui>{LOG}
+            <ScrollFrame name="PanelScrollTemplate" virtual="true">
+              <Frames>
+                <Slider name="$parentScrollBar">
+                  <Scripts><OnLoad>Log("bar")</OnLoad></Scripts>
+                </Slider>
+              </Frames>
+              <Scripts><OnLoad>Log("template-scroll")</OnLoad></Scripts>
+            </ScrollFrame>
+            <ScrollFrame name="ViaXml" inherits="PanelScrollTemplate">
+              <Size><AbsDimension x="200" y="100"/></Size>
+              <Anchors><Anchor point="TOPLEFT"/></Anchors>
+              <ScrollChild>
+                <Frame name="$parentChild">
+                  <Size><AbsDimension x="200" y="400"/></Size>
+                  <Scripts><OnLoad>Log("child")</OnLoad></Scripts>
+                </Frame>
+              </ScrollChild>
+            </ScrollFrame>
+          </Ui>"#
+        ),
+    );
+    assert_eq!(
+        s.eval::<String>("return Order").unwrap(),
+        "child;bar;template-scroll;",
+        "through inherits= in XML"
+    );
+    assert!(s
+        .eval::<bool>("return ViaXml:GetScrollChild() == ViaXmlChild")
+        .unwrap());
+
+    // The runtime door builds through the same instantiator.
+    s.run(
+        r#"Order = ""
+           ViaLua = CreateFrame("ScrollFrame", "ViaLua", nil, "PanelScrollTemplate")
+           local c = CreateFrame("Frame", "ViaLuaChild", ViaLua)
+           ViaLua:SetScrollChild(c)"#,
+    )
+    .unwrap();
+    assert_eq!(
+        s.eval::<String>("return Order").unwrap(),
+        "bar;template-scroll;"
+    );
+    assert!(s.errors().is_empty(), "{:?}", s.errors());
+}
+
+/// A `<ScrollChild>` the template declares is built by the template's own `LoadXML` level
+/// (`0x76985c` re-enters the virtual `LoadXML`, which is `0x786bc0` for a ScrollFrame), so it is
+/// also ahead of `<Frames>`; an instance's own follows it and wins `SetScrollChild`.
+#[test]
+fn a_template_scroll_child_loads_ahead_of_the_frames_and_the_instances_wins() {
+    let mut s = script();
+    s.set_screen_size(1024.0, 768.0);
+    register(
+        &s,
+        &format!(
+            r#"<Ui>{LOG}
+            <ScrollFrame name="StockishTemplate" virtual="true">
+              <Frames>
+                <Frame name="$parentBar">
+                  <Scripts><OnLoad>Log("bar")</OnLoad></Scripts>
+                </Frame>
+              </Frames>
+              <ScrollChild>
+                <Frame name="$parentFromTemplate">
+                  <Scripts><OnLoad>Log("from-template")</OnLoad></Scripts>
+                </Frame>
+              </ScrollChild>
+            </ScrollFrame>
+            <ScrollFrame name="Both" inherits="StockishTemplate">
+              <ScrollChild>
+                <Frame name="$parentFromInstance">
+                  <Scripts><OnLoad>Log("from-instance")</OnLoad></Scripts>
+                </Frame>
+              </ScrollChild>
+            </ScrollFrame>
+          </Ui>"#
+        ),
+    );
+    assert_eq!(
+        s.eval::<String>("return Order").unwrap(),
+        "from-template;from-instance;bar;"
+    );
+    assert!(s
+        .eval::<bool>("return Both:GetScrollChild() == BothFromInstance")
+        .unwrap());
+    assert!(s.errors().is_empty(), "{:?}", s.errors());
 }

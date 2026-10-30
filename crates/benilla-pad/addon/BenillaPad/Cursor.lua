@@ -45,36 +45,38 @@ function Cursor.Wanted()
     return any
 end
 
--- Whether `f` sits inside one of `open`.
-local function inside(f, open)
-    local depth = 0
-    while f and depth < 12 do
-        if open[f] then
-            return true
+-- Add the visible buttons under `f` to `list`. Only shown frames are entered, so a window's
+-- hidden tabs and pages cost nothing.
+local function collect(f, list, depth)
+    local children = { f:GetChildren() }
+    for i = 1, table.getn(children) do
+        local c = children[i]
+        if c:IsVisible() then
+            local kind = c:GetObjectType()
+            if kind == "Button" or kind == "CheckButton" then
+                local left, bottom = c:GetLeft(), c:GetBottom()
+                local w, h = c:GetWidth(), c:GetHeight()
+                if left and bottom and w > 4 and h > 4 then
+                    local s = c:GetEffectiveScale()
+                    table.insert(list, { x = (left + w / 2) * s, y = (bottom + h / 2) * s, frame = c })
+                end
+            end
+            if depth < 8 then
+                collect(c, list, depth + 1)
+            end
         end
-        f = f:GetParent()
-        depth = depth + 1
     end
-    return false
 end
 
 -- The clickable buttons of the open windows, as { x, y } centres in absolute units (UI units
--- times the effective scale; 768 is the screen's height).
+-- times the effective scale; 768 is the screen's height). It walks each open window's own
+-- children: a walk over every frame in the game (EnumerateFrames) costs tens of milliseconds a
+-- press once addons have made thousands of them.
 function Cursor.Targets()
     local open = Cursor.Open()
     local list = {}
-    local f = EnumerateFrames()
-    while f do
-        local kind = f:GetObjectType()
-        if (kind == "Button" or kind == "CheckButton") and f:IsVisible() and inside(f, open) then
-            local left, bottom = f:GetLeft(), f:GetBottom()
-            local w, h = f:GetWidth(), f:GetHeight()
-            if left and bottom and w > 4 and h > 4 then
-                local s = f:GetEffectiveScale()
-                table.insert(list, { x = (left + w / 2) * s, y = (bottom + h / 2) * s, frame = f })
-            end
-        end
-        f = EnumerateFrames(f)
+    for f in pairs(open) do
+        collect(f, list, 1)
     end
     return list
 end

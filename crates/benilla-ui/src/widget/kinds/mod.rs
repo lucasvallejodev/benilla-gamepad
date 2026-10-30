@@ -1,11 +1,14 @@
 //! Widget kinds: [`FrameKind`], [`RegionKind`] and the per-kind state, [`KindState`].
 
+use crate::layout::Len;
 use std::collections::{HashSet, VecDeque};
 
 use super::{FrameHandle, RegionHandle};
 
+mod character;
 mod editbox;
 mod messageframe;
+pub use character::*;
 pub use editbox::*;
 pub use messageframe::*;
 
@@ -47,6 +50,57 @@ pub enum FrameKind {
     GameTooltip,
     /// The `<Minimap>` widget, a game-layer factory (`0x495940`) the app draws the map into.
     Minimap,
+}
+
+/// A kind's own per-frame update: the `vtable+0x38` override the update walk calls in the frame's
+/// place (`0x765710`), which fires the frame's `OnUpdate` (`0x76b2c0`) first and then does the
+/// kind's engine work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KindUpdate {
+    /// `CSimpleEditBox`'s `0x77a790`: the flush, then the caret blink.
+    EditBox,
+    /// `CGameTooltip`'s `0x530b20`: the fade.
+    Tooltip,
+    /// `CSimpleModel`'s `0x76d7f0`, in the slot of every model kind's vtable (`0x81c608`,
+    /// `0x8084f8`, `0x8083a8`, `0x808260`): the scene clock and the completions it reports.
+    Model,
+    /// `CSimpleMessageFrame`'s `0x786200` (slot `0x81cca0`): the cap to the lines that fit, then
+    /// the line fades.
+    MessageFrame,
+    /// `CSimpleMessageScrollFrame`'s `0x788460` (slot `0x81ce50`): the line fades.
+    ScrollingMessageFrame,
+    /// `CSimpleStatusBar`'s `0x7833c0`: the bar texture's coordinates, when the fill is marked.
+    StatusBar,
+    /// `CSimpleScrollFrame`'s `0x787140` (slot `0x81cd78`): a marked range's recompute.
+    ScrollFrame,
+}
+
+impl FrameKind {
+    /// A `CSimpleModel` kind, carrying a [`ModelState`].
+    pub fn is_model(self) -> bool {
+        matches!(
+            self,
+            FrameKind::Model
+                | FrameKind::PlayerModel
+                | FrameKind::DressUpModel
+                | FrameKind::TabardModel
+        )
+    }
+
+    /// The kind's own update, run in the walk after the frame's `OnUpdate`. The reference
+    /// overrides the slot on more kinds; benilla models these.
+    pub fn kind_update(self) -> Option<KindUpdate> {
+        match self {
+            FrameKind::EditBox => Some(KindUpdate::EditBox),
+            FrameKind::GameTooltip => Some(KindUpdate::Tooltip),
+            FrameKind::MessageFrame => Some(KindUpdate::MessageFrame),
+            FrameKind::ScrollingMessageFrame => Some(KindUpdate::ScrollingMessageFrame),
+            FrameKind::ScrollFrame => Some(KindUpdate::ScrollFrame),
+            FrameKind::StatusBar => Some(KindUpdate::StatusBar),
+            k if k.is_model() => Some(KindUpdate::Model),
+            _ => None,
+        }
+    }
 }
 
 /// The kind of a [`Region`] leaf, the client's `CScriptRegion`-derived non-frame objects.
@@ -93,11 +147,77 @@ pub enum KindState {
 }
 
 impl KindState {
+    /// The owner's region-removed hook, frame vtable `+0x2c`, which `0x77fd10` runs on the old
+    /// parent whenever a region leaves it, freed, reparented or detached (`0x77fd55`): a kind
+    /// that keeps a region in a slot drops it there, so no slot names a dead region. Button
+    /// `0x778cb0`, CheckButton `0x785230`, StatusBar `0x783110`, Slider `0x789790` and ColorSelect
+    /// `0x78b530` override it; every other kind keeps the base unlink `0x76a7f0` alone.
+    pub fn region_removed(&mut self, rh: RegionHandle) {
+        let clear = |slot: &mut Option<RegionHandle>| {
+            if *slot == Some(rh) {
+                *slot = None;
+            }
+        };
+        match self {
+            KindState::Button(bs) => bs.region_removed(rh),
+            // The bar texture, `+0x324`.
+            KindState::StatusBar(sb) => clear(&mut sb.bar),
+            // The thumb, `+0x328`.
+            KindState::Slider(sl) => clear(&mut sl.thumb),
+            // The four art slots, `+0x318` to `+0x324`.
+            KindState::ColorSelect(cs) => {
+                clear(&mut cs.wheel);
+                clear(&mut cs.wheel_thumb);
+                clear(&mut cs.value_strip);
+                clear(&mut cs.value_thumb);
+            }
+            _ => {}
+        }
+    }
+
     /// The display lines of either message-frame class, which share the [`MessageLine`] record.
     pub fn message_lines(&self) -> Option<&VecDeque<MessageLine>> {
         match self {
             KindState::ScrollingMessage(smf) => Some(&smf.lines),
             KindState::Message(mf) => Some(&mf.lines),
+            _ => None,
+        }
+    }
+
+    /// The message kinds' font holder ([`ScrollingMessageState::font_region`]).
+    pub(crate) fn message_font_region_mut(
+        &mut self,
+    ) -> Option<&mut Option<crate::widget::RegionHandle>> {
+        match self {
+            KindState::ScrollingMessage(smf) => Some(&mut smf.font_region),
+            KindState::Message(mf) => Some(&mut mf.font_region),
+            _ => None,
+        }
+    }
+
+    /// The message kinds' text insets ([`ScrollingMessageState::insets`]).
+    pub fn message_insets(&self) -> Option<[crate::layout::Len; 4]> {
+        match self {
+            KindState::ScrollingMessage(smf) => Some(smf.insets),
+            KindState::Message(mf) => Some(mf.insets),
+            _ => None,
+        }
+    }
+
+    /// [`Self::message_insets`], mutably, for the XML `<TextInsets>`.
+    pub fn message_insets_mut(&mut self) -> Option<&mut [crate::layout::Len; 4]> {
+        match self {
+            KindState::ScrollingMessage(smf) => Some(&mut smf.insets),
+            KindState::Message(mf) => Some(&mut mf.insets),
+            _ => None,
+        }
+    }
+
+    /// The message kinds' XML `<FontString bytes>` line length, mutably.
+    pub fn message_line_bytes_mut(&mut self) -> Option<&mut LineBytes> {
+        match self {
+            KindState::ScrollingMessage(smf) => Some(&mut smf.line_bytes),
+            KindState::Message(mf) => Some(&mut mf.line_bytes),
             _ => None,
         }
     }
@@ -131,7 +251,8 @@ impl KindState {
 /// A tooltip's anchor mode (`+0x318`), set by `SetOwner` (`0x5310d0`), which reads a missing or
 /// unknown mode as [`TooltipAnchor::Left`] (`0x53120d`). The ids follow `GetAnchorType`'s table
 /// (`0x5313e0`, `0x531530`), not the setter's compare order. Placement (`0x52fe90`): modes 0..5
-/// clear the anchors and point, 6 and 7 only clear, 8 does neither.
+/// clear the anchors and point, 6 and 7 only clear (7 not when the sizer places, `0x530a45`), 8
+/// does neither.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum TooltipAnchor {
     /// `ANCHOR_LEFT`: the plate's right edge on the owner's left.
@@ -171,50 +292,76 @@ impl TooltipAnchor {
     }
 }
 
-/// A `GameTooltip`'s state. Its lines are FontString regions named `<name>TextLeftN`/`TextRightN`,
-/// made on demand and published as Lua globals, as the stock template's 30 pairs are.
+/// A `GameTooltip`'s state. Its lines are the FontString pairs named `<name>TextLeftN`/`TextRightN`
+/// that its template declares, Lua globals as the stock template's 30 pairs are.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct TooltipState {
     /// Lines currently filled (`NumLines`). Regions past this index exist but are hidden.
     pub num_lines: usize,
-    /// The left-column FontString pool, index i = line i+1, grown on demand with no line cap.
+    /// The left-column FontString array (`+0x32c`), index i = line i+1: the `<name>TextLeft<n>`
+    /// pairs the post-load pass found (`0x529650`), then one per `AddFontStrings` (`0x529940`). Its
+    /// length is the line limit (`+0x320`), `0x530270` adding no line past it (`0x530291`).
     pub left_lines: Vec<RegionHandle>,
     /// The right-column pool (the `AddDoubleLine`/`TextRightN` half), parallel to `left_lines`.
     pub right_lines: Vec<RegionHandle>,
-    /// `SetOwner`'s frame, dropped on hide.
-    pub owner: Option<FrameHandle>,
-    /// The last `SetOwner`'s mode, read back by `GetAnchorType()`.
+    /// `SetOwner`'s object by its id, a frame or a region: the reference keeps its layout
+    /// (`+0x314`, the object's `+0x24`, `0x5313c9`) with no type test. Dropped on hide.
+    pub owner: Option<crate::layout::Handle>,
+    /// `SetOwner`'s x and y offsets (`+0x3c4`, `+0x3c8`, stored by the core at `0x53001c`), which
+    /// every anchor apply reads.
+    pub owner_offset: (f32, f32),
+    /// The anchor mode (`+0x318`), read back by `GetAnchorType()`: the last `SetOwner`'s while
+    /// owned, `None` (mode 7) since a hide.
     pub anchor: TooltipAnchor,
-    /// `SetMinimumWidth`: a floor on the auto-sized width, cleared with the content.
+    /// Each line's wrap flag (`+0x344`), parallel to `left_lines`: the line core stores it
+    /// (`0x53036f`) and the clear zeroes it (`0x530236`).
+    pub wrapped: Vec<bool>,
+    /// `SetMinimumWidth` (`+0x3c0`): the sizer's starting widest (`0x530665`), zeroed by the clear
+    /// (`0x530258`).
     pub min_width: f32,
-    /// `FadeOut()`'s start on the `GetTime` clock; any fresh content or `Show` cancels the fade.
-    pub fade_start: Option<f64>,
+    /// `FadeOut()`'s countdown in seconds (`[+0x3b4]` armed, `[+0x3b8]` left): the tooltip's own
+    /// update counts it down by its elapsed, so it stands still while the tooltip is not walked.
+    /// `FadeOut` arms it; the show, the SetOwner core (so every hide) and a cursor-mode `FadeOut`
+    /// disarm it, and nothing else.
+    pub fade_left: Option<f32>,
     /// The guid of the unit this tooltip shows (`+0x368`/`+0x36c`, stored at `0x52a070`), whose
     /// health watcher (`0x467e70`, registered at `0x52a0a8`) drives the bar; a `set_unit` push of
     /// that unit, under any token, re-drives it.
     pub unit_guid: Option<u64>,
-    /// Shows world-hover content, which fades when the hover is lost; a window hover never fades.
-    pub world_owned: bool,
+    /// The unit's health as the bar was last driven with it: the watcher's copy of the field
+    /// (`0x4667a0`), which a values update compares before calling it (`0x4655bb`).
+    pub unit_health: u32,
     /// Armed for a compare render: the next `SetInventoryItem` prepends "Currently Equipped"
     /// (`[arg+0x18]`, not the compact `[arg+0x14]`), surviving the stock caller's `SetOwner` in
     /// between (`MerchantFrame.xml:67-72`); the reference's route to `0x52b650` is untraced.
     pub equipped_header_armed: bool,
-    /// `SetPadding`: extra width past the content (`ItemRef.xml:40` sets 16 for the close button).
+    /// `SetPadding` (`+0x3bc`), in layout units (`0x530fba`): extra plate width past the content
+    /// (`0x5309f4`), which the clear keeps (`ItemRef.xml:40` sets 16 for the close button).
     pub padding: f32,
-    /// Line 1 came from XML (`ShoppingTooltipTemplate`), so later lines clone the previous fonts.
-    pub xml_declared_lines: bool,
+    /// Benilla-only: a sizing ran in a VM with no font engine before its lines were measured, so
+    /// the next resolve runs it again ([`crate::script::tooltip`]'s headless fallback).
+    pub relayout_owed: bool,
 }
 
-/// The plate's text inset: the stock template seats `TextLeft1` at TOPLEFT (10, −10).
-pub const TOOLTIP_PAD: f32 = 10.0;
-/// The line gap: each `TextLeftN` hangs at the previous line's BOTTOMLEFT (0, −2).
+/// The plate's pad on each side of its content, `0x808e74` and `0x808e78` = 10.24 (`0x4123d70a`).
+pub const TOOLTIP_PLATE_PAD: f32 = 10.24;
+/// The gap the sizer counts between shown lines, `0x808e6c` = 2.0.
 pub const TOOLTIP_LINE_GAP: f32 = 2.0;
-/// The least double-line column gap, the stock `TextRightN` offset; the reference's is untraced.
-pub const TOOLTIP_DOUBLE_GAP: f32 = 40.0;
-/// `FadeOut`'s ramp length in seconds; the reference's constant is untraced.
-pub const TOOLTIP_FADE_SECS: f64 = 0.5;
-/// A wrap-flagged line's width, pinned when it is appended; the reference's column is untraced.
-pub const TOOLTIP_WRAP_WIDTH: f32 = 260.0;
+/// The gap the sizer counts between a double line's texts, `0x808e70` = 38.4 (`0x4219999a`).
+pub const TOOLTIP_COLUMN_GAP: f32 = 38.4;
+/// `FadeOut`'s duration in seconds, `[0x808e7c]` = 2.0: the plate holds full alpha for the first
+/// half and ramps over the second.
+pub const TOOLTIP_FADE_SECS: f32 = 2.0;
+/// The width a wrapped line is split at when its text is wider, `0x808e80` = 230.4 (`0x43666666`).
+pub const TOOLTIP_WRAP_WIDTH: f32 = 230.4;
+
+/// One frame's advance of a model pane's scene clock in whole milliseconds: `elapsed · 1000`
+/// truncated toward zero with no `+0.5` (`0x76d846`, then `__ftol` `0x40a2b0`), where the world's
+/// clock rounds (`0x483659`), so each frame's sub-millisecond remainder is dropped with no carry.
+/// A negative or NaN `elapsed` advances nothing.
+pub fn pane_clock_step_ms(elapsed: f32) -> u64 {
+    (elapsed * 1000.0).trunc().max(0.0) as u64
+}
 
 /// A model pane's scene: the `CSimpleModel` (`0x76c8e0`) members every model kind carries, read
 /// and written by `Model`'s 23 methods (table `0x878948`); the render is the app's.
@@ -222,8 +369,9 @@ pub const TOOLTIP_WRAP_WIDTH: f32 = 260.0;
 pub struct ModelState {
     /// `SetModel`'s path as written (`.mdx`); the app's loader maps it to the shipped `.m2`.
     pub path: Option<String>,
-    /// `PlayerModel:SetUnit`'s unit (`0x505d70`); it and [`Self::path`] each clear the other.
-    pub unit: Option<String>,
+    /// The `CGCharacterModelBase` half (`0x505680`) of a `PlayerModel`, `DressUpModel` or
+    /// `TabardModel`; `None` on a plain `Model`, which has no `SetUnit`.
+    pub character: Option<CharacterPane>,
     /// The last `SetSequence` id (`[bone0 block + 0xf8]`); what plays is [`Self::armed`].
     pub sequence: i32,
     /// The pane's own scene clock in ms (`0x76cfc0`): its `OnUpdate` (`0x76d7f0`) adds
@@ -247,9 +395,9 @@ pub struct ModelState {
     /// The camera index still to install (`+0x320`): the ctor's `Some(0)`, or a `SetCamera` made
     /// before the facts (`0x76cec0`). While it is `Some` the pane draws nothing (`0x76d5f0`).
     pub camera_pending: Option<i32>,
-    /// The installed camera (`+0x31c`): a raw camera-table index, never via `cameraLookup`, drawn
-    /// in perspective; `None`, the NULL camera an out-of-range index installs, draws orthographic.
-    pub camera: Option<u32>,
+    /// The installed camera (`+0x31c`), drawn in perspective; `None`, the NULL camera an
+    /// out-of-range index installs, draws orthographic.
+    pub camera: Option<InstalledCamera>,
     /// `SetPosition`: the model's offset within the pane's scene.
     pub position: (f32, f32, f32),
     pub light: ModelLight,
@@ -263,6 +411,21 @@ pub struct ModelState {
     pub fog_near: f32,
     /// Fog far (`+0x3b0`), shaped like [`Self::fog_near`]; the ctor's is `1.0`.
     pub fog_far: f32,
+    /// A `ModelFFX`, the glue's `CSimpleModelFFX` (`0x46fa00`). Its vtable differs from
+    /// `CSimpleModel`'s in two slots past the destructor: its OnShow (`0x46fa60`) installs the glue
+    /// glow pass (`0x6cde60` with `[0xb414c4]`) and pins `LightParams.glow` to `*0x8380b4` (0.30),
+    /// and its layer-2 paint callback (`0x46fad0`, registered by `0x46fa90`) brackets the model
+    /// paint `0x76d240` with the full-screen-effect pass pair `0x6cd890`/`0x6cda70`.
+    pub ffx: bool,
+    /// The scene's fill callback is the select screen's (`0x472150`, installed by
+    /// `SetCharSelectBackground` at `0x472144`) in place of the fog callback `SetModel` installs
+    /// (`0x76cd96` → `0x76d680`): the scene draws unfogged whatever the fog fields hold. The
+    /// callback rides the model instance, so the next `SetModel` or `ClearModel` drops it.
+    pub select_fill: bool,
+    /// The number of the instance the last `SetModel` made: `0x76cce0` builds a new one on every
+    /// call (`0x76ccf5`-`0x76cd0d`), its scene starting over, even for the file it held. 0 for
+    /// none.
+    pub instance: u64,
 }
 
 /// A model pane's armed fog, all the renderer needs ([`ModelState::armed_fog`]).
@@ -283,9 +446,10 @@ impl ModelFog {
     }
 }
 
-/// A model pane's embedded `CGLight` (`+0x324`), its only light (`0x76d680`): off on a plain
-/// `<Model>` until Lua enables it, so a lit batch draws black (`0x71bf90`), and on for a
-/// `PlayerModel` (ctor `0x505680`). Colours are stored times their intensity.
+/// A model pane's embedded `CGLight` (`+0x324`), the light `0x76d680` adds to its file's own
+/// (`0x718960`): off on a plain `<Model>` until Lua enables it, so a file with no lights draws
+/// black (`0x71bf90`), and on for a `PlayerModel` (ctor `0x505680`). Colours are stored times
+/// their intensity.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ModelLight {
     /// `+0x60`: set by a nonzero `SetLight` (`0x76e1e0`) first argument; `SetLight(0, …)` is inert.
@@ -313,12 +477,31 @@ impl Default for ModelLight {
     }
 }
 
+impl ModelLight {
+    /// The `CGCharacterModelBase` ctor's light (`0x505680`), over the `<Model>` one it chains to:
+    /// directional (`0x71b620(0)` at `0x5056c9`), ambient 0.7 (`+0x30`, `0x50572e`), diffuse
+    /// (0.8, 0.8, 0.64) (`+0x3c`, `0x505702`) and enabled (`0x71b780(1)` at `0x50576a`). The
+    /// direction is the second `0x71b6a0` write, `(0, 1, 0)` at `0x505761`, which overwrites the
+    /// `(0, −√½, −√½)` of the first at `0x5056e9`. `PlayerModel`'s factory `0x495bd0` runs this
+    /// ctor, and `DressUpModel` and `TabardModel` subclass it; no 1.12 FrameXML calls `SetLight`,
+    /// so every stock window draws in this light.
+    pub fn character() -> Self {
+        Self {
+            enabled: true,
+            omni: false,
+            vector: [0.0, 1.0, 0.0],
+            ambient: [0.7; 3],
+            diffuse: [0.8, 0.8, 0.64],
+        }
+    }
+}
+
 /// A fresh pane as the `CSimpleModel` ctor leaves it.
 impl Default for ModelState {
     fn default() -> Self {
         Self {
             path: None,
-            unit: None,
+            character: None,
             sequence: 0,
             clock_ms: 0,
             armed: None,
@@ -335,6 +518,9 @@ impl Default for ModelState {
             fog: false,
             fog_near: 0.0,
             fog_far: 1.0,
+            ffx: false,
+            select_fill: false,
+            instance: 0,
         }
     }
 }
@@ -371,6 +557,17 @@ pub struct SequenceFacts {
     pub duration_ms: u32,
     /// Loops; a clamped sequence holds its last frame.
     pub looping: bool,
+}
+
+/// A pane's installed camera (`+0x31c`): raw record `index` of the camera table (never via
+/// `cameraLookup`) of `file`, the file the pane held when the camera was resolved (`0x76ceef` →
+/// `0x713590`). The pane holds the camera itself, so a later `SetModel` keeps aiming through the
+/// old file's camera (`0x76cd30` leaves `+0x31c`, and the new file's ready hook installs nothing
+/// while none is pending, `0x76ce44`-`0x76ce47`) until the next `SetCamera`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InstalledCamera {
+    pub file: String,
+    pub index: u32,
 }
 
 /// What a pane needs from its model file, which the reference reads off the resident `MD20`; the
@@ -417,38 +614,58 @@ impl ModelFileFacts {
     }
 }
 
-/// A model path's key: case-folded, forward slashes, no extension, so `.mdx` and `.m2` match.
+/// A model path's key, the file the model cache opens for it: case-folded, forward slashes, the
+/// extension at the last dot made `.m2` when it is `.mdx`, `.mdl` or `.m2` (`0x706a80`-`0x706adf`),
+/// so those spellings match. A path the cache refuses keys as the error cube it stands
+/// (`0x70737f`), never as a twin with a valid extension. A key is its own key.
 pub fn model_key(path: &str) -> String {
     let p = path.to_ascii_lowercase().replace('\\', "/");
-    let stem = p
-        .strip_suffix(".mdx")
-        .or_else(|| p.strip_suffix(".mdl"))
-        .or_else(|| p.strip_suffix(".m2"))
-        .unwrap_or(&p);
-    stem.to_string()
+    match p.rsplit_once('.') {
+        Some((stem, "mdx" | "mdl" | "m2")) => format!("{stem}.m2"),
+        _ => "spells/errorcube.m2".to_string(),
+    }
 }
 
 impl ModelState {
-    /// `SetModel` (`0x76cce0`): a fresh instance, dropping unit, icon override and arm, seeded now
-    /// if the file is resident, else when it lands (`0x70ebd0`); the scene clock runs on.
+    /// A fresh `PlayerModel`, `DressUpModel` or `TabardModel`: the `Model` ctor's state, then the
+    /// `CGCharacterModelBase` ctor's (`0x505680`): its members zeroed and its light switched on.
+    pub fn character() -> Self {
+        Self {
+            character: Some(CharacterPane::default()),
+            light: ModelLight::character(),
+            ..Self::default()
+        }
+    }
+
+    /// `SetModel` (`0x76cce0`): a fresh instance, dropping icon override and arm, seeded now if the
+    /// file is resident, else when it lands (`0x70ebd0`); the scene clock runs on. On a character
+    /// pane the file replaces the copy at `+0x318` (slot 37), while the stored subject stays for
+    /// the next build.
     pub fn set_file(&mut self, path: String, facts: Option<&ModelFileFacts>) {
         self.path = Some(path);
-        self.unit = None;
+        if let Some(c) = &mut self.character {
+            c.overtake();
+        }
         self.icon = None;
         self.armed = None;
         self.pending_seed = true;
+        self.select_fill = false;
         if let Some(facts) = facts {
             self.seed_from_facts(facts);
         }
     }
 
-    /// `ClearModel`: releases the instance.
+    /// `ClearModel`: releases the instance, a character pane's copy included (slot 36 with null),
+    /// which leaves its stored subject (`+0x3e0`, `+0x3f0`) as it was.
     pub fn clear_file(&mut self) {
         self.path = None;
-        self.unit = None;
+        if let Some(c) = &mut self.character {
+            c.overtake();
+        }
         self.icon = None;
         self.armed = None;
         self.pending_seed = false;
+        self.select_fill = false;
     }
 
     /// `SetSequence`/`SetSequenceTime` (`0x7121a0`): interrupts what plays, with no
@@ -502,12 +719,26 @@ impl ModelState {
         })
     }
 
+    /// The fog the scene draws with: the armed fog under the fog callback `SetModel` installs
+    /// (`0x76d680`), none under the select screen's ([`Self::select_fill`]).
+    pub fn scene_fog(&self) -> Option<ModelFog> {
+        if self.select_fill {
+            None
+        } else {
+            self.armed_fog()
+        }
+    }
+
     /// `SetCamera` by raw index (`0x76cec0`): deferred until the facts are known, then installed
-    /// or answered with the NULL camera, either clearing the pending index (`0x76ce80`).
+    /// from the file held now (`0x713590`) or answered with the NULL camera, either clearing the
+    /// pending index (`0x76ce80`). The facts are always those of [`Self::path`].
     pub fn install_camera(&mut self, idx: i32, facts: Option<&ModelFileFacts>) {
         match facts {
             Some(f) => {
-                self.camera = f.camera_at(idx);
+                self.camera = f
+                    .camera_at(idx)
+                    .zip(self.path.clone())
+                    .map(|(index, file)| InstalledCamera { file, index });
                 self.camera_pending = None;
             }
             None => self.camera_pending = Some(idx),
@@ -553,42 +784,81 @@ impl ModelState {
     }
 }
 
-/// The Minimap widget's state. The client keeps two zoom indices, outdoor (`0x86f698`, CVar
-/// `minimapZoom`) and indoor (`0x86f69c`, CVar `minimapInsideZoom`, radii `{150,120,90,60,40,25}`
-/// yd); the WMO-interior flag `0xceaa60` picks which one `GetZoom`/`SetZoom` use.
-#[derive(Clone, Debug, PartialEq)]
+/// A Minimap frame's own state: its engine children and the sizes its ctor froze. Everything else
+/// the minimap shows is one process-wide set of statics ([`MinimapStatics`]), as the reference
+/// keeps it.
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct MinimapState {
-    /// The outdoor zoom index, 0 widest to 5 tightest; `SetZoom` clamps at 5 (`0x6daa10`).
-    pub zoom: u8,
-    pub inside_zoom: u8,
-    /// Inside a WMO interior, which picks the index; pushed by the app, which owns that test.
-    pub inside: bool,
-    /// `Minimap:SetMaskTexture`'s mask, write-only from Lua; `None` is [`MINIMAP_DEFAULT_MASK`].
-    pub mask_texture: Option<String>,
+    /// The party and pet arrows (`[Minimap+0x320]`), engine children 1 to 5.
+    pub group_arrows: Vec<FrameHandle>,
+    /// The landmark and static-blip rim arrows (`[Minimap+0x314]`), engine children 6 to 8.
+    pub rim_arrows: Vec<FrameHandle>,
     /// The player-arrow `Model` (`[Minimap+0x338]`), reached by `SetPlayerFacing` (`0x4eb8e0`).
     pub player_arrow: Option<FrameHandle>,
+    /// The minimap's level plus 3 (`+0x334`, `0x4ede48`, again at `0x4ee1a3`), the rim arrows'
+    /// level base.
+    pub level_base: i32,
+    /// The ctor's `G48 · 5/3` (`0x4edc42`, `0x4edc47`), about 1 at 4:3, every blip size's factor.
+    pub base: f32,
+    /// The disc, `[0xbc7970]` (`0x4edcaf`), in layout units: the arrow frames' size and the rim
+    /// arrows' orbit.
+    pub disc: f32,
+}
+
+/// `[0x807a44]`, the disc's factor on the unstored `G48 · 5/3` (`0x4edca9`); the disc itself is
+/// [`MinimapState::disc`].
+pub const MINIMAP_DISC: f32 = 0.11;
+
+/// The arrow frames' model scale, `[0x807a28]` (`0x4edeb2`).
+pub const MINIMAP_ARROW_SCALE: f32 = 0.6;
+
+/// The minimap's statics, one set for every Minimap frame: the zoom cells, outdoor `0x86f698`
+/// (CVar `minimapZoom`) and indoor `0x86f69c` (CVar `minimapInsideZoom`, radii
+/// `{150,120,90,60,40,25}` yd), the indoor byte `0xceaa60` that picks between them, and the mask
+/// `0xbc7968` with the icon atlases. `GetZoomLevels`, `GetZoom`, `SetZoom` and `GetPingPosition` read and write them
+/// with no `this` lookup (`0x4eebe0`, `0x4eec20`, `0x4eec60`, `0x4eefd0`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct MinimapStatics {
+    /// The outdoor zoom index, 0 widest to 5 tightest; the world entry copies the CVar's integer
+    /// in raw (`0x6d9013`), so it can hold any `u32`, and `GetZoom` answers it unsigned (`0x4eec31`).
+    pub zoom: u32,
+    pub inside_zoom: u32,
+    /// Inside a WMO interior, which picks the index; pushed by the app, which owns that test.
+    pub inside: bool,
+    /// What each texture setter last left in its handle, with the call's stamp, so the host
+    /// applies a call once; `None` until this VM sets that slot.
+    pub art: [Option<(u64, MinimapArt)>; 3],
+    /// The stamp the next setter call takes.
+    pub art_stamp: u64,
+    /// The one ping, a WoW world `(x, y)` (`0xbc787c`, `0xbc7880`): zero from the static
+    /// initializer (`0x4ea1f0`), never cleared.
+    pub ping: (f32, f32),
+    /// The active player's WoW world `(x, y)`, pushed by the app every frame; `None` with no player
+    /// object, when the ping methods do nothing (`0x4eecdf`, `0x4eeff6`).
+    pub player: Option<(f32, f32)>,
 }
 
 /// Both zoom CVars register with `"3"` (`0x48fc5a`/`0x48fc76`) and the reset copies the CVar in;
 /// a higher index zooms in, 3 being a 60 yd indoor radius and a 133.3 yd outdoor half-extent.
-pub const MINIMAP_DEFAULT_ZOOM: u8 = 3;
+pub const MINIMAP_DEFAULT_ZOOM: u32 = 3;
 
-impl Default for MinimapState {
+impl Default for MinimapStatics {
     fn default() -> Self {
         Self {
             zoom: MINIMAP_DEFAULT_ZOOM,
             inside_zoom: MINIMAP_DEFAULT_ZOOM,
             inside: false,
-            mask_texture: None,
-            // Set by `WidgetArena::create` on insert, as the ctor builds its children.
-            player_arrow: None,
+            art: [None, None, None],
+            art_stamp: 0,
+            ping: (0.0, 0.0),
+            player: None,
         }
     }
 }
 
-impl MinimapState {
-    /// The index `GetZoom`/`SetZoom` act on now.
-    pub fn active_zoom(&self) -> u8 {
+impl MinimapStatics {
+    /// The index `GetZoom`/`SetZoom` act on now (`0x6da980`).
+    pub fn active_zoom(&self) -> u32 {
         if self.inside {
             self.inside_zoom
         } else {
@@ -596,13 +866,105 @@ impl MinimapState {
         }
     }
 
-    /// Writes the index the inside flag selects.
-    pub fn set_active_zoom(&mut self, zoom: u8) {
-        if self.inside {
-            self.inside_zoom = zoom;
+    /// The view radius in yards at the live zoom (`0x6da9b0`).
+    pub fn radius_yd(&self) -> f32 {
+        minimap_radius_yd(self.zoom, self.inside_zoom, self.inside)
+    }
+
+    /// The ping's offset from the player over the zoom diameter `D`, `(−dy/D, dx/D)` with `dx`,
+    /// `dy` the point less the player's position; `None` with no player.
+    fn ping_fraction(&self) -> Option<(f64, f64)> {
+        let player = self.player?;
+        let k = 1.0 / (2.0 * f64::from(self.radius_yd()));
+        let dx = f64::from(self.ping.0) - f64::from(player.0);
+        let dy = f64::from(self.ping.1) - f64::from(player.1);
+        Some((-dy * k, dx * k))
+    }
+
+    /// `GetPingPosition` (`0x4eefd0`), anew from the stored point every call: `(0, 0)` with no
+    /// player (`0x4eeff6`), the second value rounded to a float (`0x4ef05b`), the first not.
+    pub fn ping_position(&self) -> (f64, f64) {
+        self.ping_fraction()
+            .map_or((0.0, 0.0), |(a, b)| (a, f64::from(b as f32)))
+    }
+
+    /// `MinimapApplyPing` (`0x4ee330`): store the point (`0x4ee366`, `0x4ee373`) and give
+    /// `MINIMAP_PING`'s two numbers, the first rounded to a float before it is negated
+    /// (`0x4ee473`), the second a double (`0x4ee476`); `None`, nothing stored, with no player.
+    pub fn apply_ping(&mut self, world: (f32, f32)) -> Option<(f64, f64)> {
+        self.player?;
+        self.ping = world;
+        self.ping_fraction()
+            .map(|(a, b)| (-f64::from((-a) as f32), b))
+    }
+
+    /// `SetZoomIndex` (`0x6da8e0`) on the `__ftol` of a level: the cell the indoor byte picks takes
+    /// it capped by an unsigned compare against 5 (`0x6da8fd`, `0x6da902`), so a negative level is
+    /// 5. Only a change writes, and names the CVar the reference then sets with `%d`
+    /// (`minimapInsideZoom` or `minimapZoom`, `0x6da909`).
+    pub fn set_zoom_index(&mut self, level: i32) -> Option<&'static str> {
+        let index = (level as u32).min(u32::from(MINIMAP_ZOOM_LEVELS - 1));
+        let (cell, cvar) = if self.inside {
+            (&mut self.inside_zoom, "minimapInsideZoom")
         } else {
-            self.zoom = zoom;
+            (&mut self.zoom, "minimapZoom")
+        };
+        if *cell == index {
+            return None;
         }
+        *cell = index;
+        Some(cvar)
+    }
+}
+
+/// One of the minimap's three process-wide textures, each loaded at world entry (`0x4ed810`) and
+/// replaced by its setter: the disc mask (`0xbc7968`), the landmark icon atlas (`0xbc827c`) and the
+/// dot atlas (`0xbc822c`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MinimapArtSlot {
+    Mask = 0,
+    Icons = 1,
+    Blips = 2,
+}
+
+/// What a minimap texture setter left in its handle: `TextureCreate` (`0x449d90`) with a status
+/// object and file flag 1, so a loose file loads too.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MinimapArt {
+    /// The file the setter named, which the host loads.
+    File(String),
+    /// A name that did not resolve: `TextureCreate`'s 8×8 solid `0xff00ff00` (`[0x90582c]`),
+    /// stored before the setter raises.
+    Missing,
+    /// An empty name: `TextureCreate` returns no texture and logs nothing (`0x449db1`).
+    Null,
+}
+
+impl MinimapStatics {
+    /// Store a setter's result in its slot under a fresh stamp.
+    pub fn set_art(&mut self, slot: MinimapArtSlot, art: MinimapArt) {
+        self.art_stamp += 1;
+        self.art[slot as usize] = Some((self.art_stamp, art));
+    }
+}
+
+/// The outdoor zoom table (`0x8116d0`): the view diameter in map chunks per zoom index.
+pub const MINIMAP_ZOOM_CHUNKS: [f32; 6] = [14.0, 12.0, 10.0, 8.0, 6.0, 4.0];
+
+/// The indoor view radius in yards per indoor zoom index, table `0x8116e8`.
+pub const MINIMAP_INDOOR_RADII: [f32; 6] = [150.0, 120.0, 90.0, 60.0, 40.0, 25.0];
+
+/// The minimap's radius in yards (`0x6da9b0`): with the indoor byte set the indoor table at the
+/// indoor index (`0x6da9bf`), else the outdoor chunk count times 0.5 and 33.333332 (`0x6da9e9`,
+/// `0x6da9ef`). The ping, the blips and the dots all use it. Deviation: an index past 5 reads the
+/// last entry, where 1.12.1 reads past both six-entry tables (`0x6da9d5`, `0x6da9c4`), a client
+/// fault a hand-edited CVar reaches.
+pub fn minimap_radius_yd(zoom: u32, inside_zoom: u32, inside: bool) -> f32 {
+    let at = |z: u32| z.min(u32::from(MINIMAP_ZOOM_LEVELS - 1)) as usize;
+    if inside {
+        MINIMAP_INDOOR_RADII[at(inside_zoom)]
+    } else {
+        MINIMAP_ZOOM_CHUNKS[at(zoom)] * 0.5 * 33.333_332
     }
 }
 
@@ -617,17 +979,32 @@ pub const MINIMAP_DEFAULT_MASK: &str = "Textures\\MinimapMask";
 /// addons (Questie, pfQuest) read `({Minimap:GetChildren()})[9]` as the player arrow.
 pub const MINIMAP_ENGINE_CHILDREN: usize = 9;
 
+/// The `[Minimap+0x320]` group's size, the party and pet arrows.
+pub const MINIMAP_GROUP_ARROWS: usize = 5;
+
+/// The `[Minimap+0x314]` group's size, the landmark rim arrows.
+pub const MINIMAP_RIM_ARROWS: usize = 3;
+
 /// The default `minimapArrowModel` (`0x84c768`), applied to engine children 1 to 8 (`0x4ee170`).
 pub const MINIMAP_DEFAULT_ARROW_MODEL: &str = "Interface\\Minimap\\Rotating-MinimapArrow.mdx";
 
 /// The default `minimapPlayerModel` (`0x8453c0`), applied to engine child 9 alone (`0x4ee260`).
 pub const MINIMAP_DEFAULT_PLAYER_MODEL: &str = "Interface\\Minimap\\MinimapArrow.mdx";
 
-/// A `CSimpleScrollFrame`'s members (`+0x318`/`+0x324`/`+0x328`); the ranges are measured live.
+/// A `CSimpleScrollFrame`'s members (`+0x314`..`+0x328`), all zero from the ctor (`0x786a51`).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ScrollFrameState {
     /// `SetScrollChild`'s frame, which pans within this frame's rect.
     pub child: Option<FrameHandle>,
+    /// `[+0x31c]`, `[+0x320]`: the horizontal and vertical ranges in layout units over the frame's
+    /// scale, as the last recompute stored them (`0x786eaa`, `0x786ed1`); the getters convert them.
+    pub range: [f32; 2],
+    /// `[+0x314]`: the ranges are out of date. `UpdateScrollChildRect`, `SetScrollChild` and a
+    /// change in the frame's size set it; the frame's update recomputes and clears it.
+    pub range_dirty: bool,
+    /// The frame's width and height in layout units when its update last ran, from which that
+    /// update sees a resize (`0x7871f0`'s mark); the ctor's empty rect until then.
+    pub seen_size: [f32; 2],
     /// `SetHorizontalScroll`'s offset in px, unclamped; `0x787100` anchors the child at
     /// `(+horizontal, +vertical)`, so scrolling right takes a negative offset, down a positive.
     pub horizontal: f32,
@@ -636,16 +1013,12 @@ pub struct ScrollFrameState {
     pub vertical: f32,
 }
 
-/// `Button:SetFont`'s record, one for the client's three embedded fonts (`+0x33c`, `+0x434`,
-/// `+0x3b8`), since `SetFont` (`0x780880`) sets all three alike and no Lua call parts them.
-#[derive(Clone, Debug, PartialEq)]
-pub struct ButtonFont {
-    pub path: String,
-    /// The font height in logical px.
-    pub height: f32,
-    /// The normalized outline, `""`, `"OUTLINE"` or `"THICKOUTLINE"`, as `GetFont` answers it; an
-    /// omitted `flags` clears it, where the reference's handling is untraced.
-    pub flags: String,
+/// A Button's three embedded fonts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ButtonFonts {
+    pub(crate) normal: crate::script::font::FontId,
+    pub(crate) highlight: crate::script::font::FontId,
+    pub(crate) disabled: crate::script::font::FontId,
 }
 
 /// A button's state, `[CSimpleButton+0x328]`: 0 DISABLED, 1 NORMAL, 2 PUSHED, also the index into
@@ -661,6 +1034,23 @@ pub enum ButtonVisualState {
     Pushed,
 }
 
+/// The writes to regions' shown bit (`+0xc4`) a Button's state machine makes, in order. The bit
+/// is the region's own, the one `Show`/`Hide` write and `IsShown` and the draw read, so the
+/// machine hands its writes back for the caller to apply to the regions.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[must_use = "the caller writes these bits into the regions"]
+pub struct ShownWrites(pub Vec<(RegionHandle, bool)>);
+
+impl ShownWrites {
+    fn hide(&mut self, rh: Option<RegionHandle>) {
+        self.0.extend(rh.map(|rh| (rh, false)));
+    }
+
+    fn show(&mut self, rh: Option<RegionHandle>) {
+        self.0.extend(rh.map(|rh| (rh, true)));
+    }
+}
+
 /// A button's state. The drawn state texture is latched, not derived: the shown pointer
 /// (`+0x4c4`) moves only on a transition into a state that has a texture ([`Self::set_state`]).
 #[derive(Clone, Debug, PartialEq)]
@@ -673,6 +1063,9 @@ pub struct ButtonState {
     pub loot_slot: Option<u32>,
     /// A CheckButton's checked flag (`+0x4dc`, XML `checked`).
     pub checked: bool,
+    /// A `CSimpleHyperlinkButton`'s link (`+0x4dc`) and text (`+0x4e0`), which its enter, leave
+    /// and click hand to its text frame (`script::hyperlink`); `None` on any other Button.
+    pub hyperlink: Option<(String, String)>,
     /// `<NormalTexture>`/`SetNormalTexture` (`+0x4bc`).
     pub normal: Option<RegionHandle>,
     /// `<PushedTexture>` (`+0x4c0`); a button with none keeps what it showed ([`Self::set_state`]).
@@ -690,30 +1083,22 @@ pub struct ButtonState {
     pub text: Option<RegionHandle>,
     /// `RegisterForClicks`' names, the transitions that reach `OnClick`; default `"LeftButtonUp"`.
     pub registered_clicks: HashSet<String>,
-    /// The normal state's label font object (`<NormalFont>`); `None` keeps the label's own paint.
-    pub normal_font: Option<String>,
-    /// [`ButtonState::normal_font`] when highlighted; `None` keeps the normal one, colour and all.
-    pub highlight_font: Option<String>,
-    /// [`ButtonState::normal_font`] for the disabled state.
-    pub disabled_font: Option<String>,
-    /// `<NormalFont justifyH=>`, local to the normal font (`+0x33c`) and kept over
-    /// `SetTextFontObject`; `SetFontString` (`0x778d20`) anchors an unanchored label by it.
-    pub normal_justify_h: Option<crate::script::JustifyH>,
-    /// `<HighlightFont justifyH=>` (`+0x3b8`); paint only, the label anchor reads the normal one.
-    pub highlight_justify_h: Option<crate::script::JustifyH>,
-    /// `<DisabledFont justifyH=>` (`+0x434`); paint only.
-    pub disabled_justify_h: Option<crate::script::JustifyH>,
-    /// `Button:SetFont`'s face, kept on the button since `SetFont` never touches the label
-    /// (`+0x338`) and so creates none; extract applies it to whatever label there is.
-    pub font: Option<ButtonFont>,
-    /// `SetTextColor`'s label colour for the normal state, painted over the state font's own.
-    pub normal_color: Option<[f32; 4]>,
-    /// [`ButtonState::normal_color`] for the highlighted state, which never falls back to it.
-    pub highlight_color: Option<[f32; 4]>,
-    /// [`ButtonState::normal_color`] for the disabled state.
-    pub disabled_color: Option<[f32; 4]>,
+    /// The three embedded fonts the label follows by state (`0x779810`), normal `+0x33c`,
+    /// highlight `+0x3b8` and disabled `+0x434`, made on first use (`script::button::fonts`).
+    /// Each is a real font: `<NormalFont>` and kin load into it, `Set*FontObject` link it,
+    /// `SetFont` and `Set*TextColor` write it and push to the label.
+    pub(crate) fonts: Option<ButtonFonts>,
     /// `LockHighlight()`: highlighted regardless of hover, both the texture and the label font.
     pub locked_highlight: bool,
+    /// `<PushedTextOffset>`/`SetPushedTextOffset` (`+0x4b0`/`+0x4b4`), x and y, script numbers
+    /// stored by `S`; the ctor's (0.001, -0.001) layout units (`0x778740`, `0x77874a`), about 1.28
+    /// UI units right and down at 4:3. Only [`Self::refresh_label`] puts it on the label.
+    pub pushed_text_offset: [Len; 2],
+    /// The label's text offset (`CSimpleFontString::SetTextOffset` `0x772100`, `+0x110`/`+0x114`):
+    /// it moves the drawn text, never the label's rect.
+    label_offset: [Len; 2],
+    /// A real state change happened since the label last relinked ([`Self::take_relink`]).
+    relink_due: bool,
     /// The shown state texture (`+0x4c4`), written only by `set_state` and `set_state_slot`.
     shown: Option<RegionHandle>,
     /// The state (`+0x328`), a latch moved only by edges: the enter and leave notifies
@@ -727,6 +1112,7 @@ impl Default for ButtonState {
             loot_slot: None,
             locked: false,
             checked: false,
+            hyperlink: None,
             normal: None,
             pushed: None,
             disabled: None,
@@ -735,17 +1121,14 @@ impl Default for ButtonState {
             disabled_checked: None,
             text: None,
             registered_clicks: HashSet::from(["LeftButtonUp".to_string()]),
-            normal_font: None,
-            highlight_font: None,
-            disabled_font: None,
-            normal_justify_h: None,
-            highlight_justify_h: None,
-            disabled_justify_h: None,
-            font: None,
-            normal_color: None,
-            highlight_color: None,
-            disabled_color: None,
+            fonts: None,
             locked_highlight: false,
+            pushed_text_offset: [
+                Len::Layout(f32::from_bits(0x3a83_126f)),
+                Len::Layout(f32::from_bits(0xba83_126f)),
+            ],
+            label_offset: [Len::Layout(0.0); 2],
+            relink_due: false,
             shown: None,
             state: ButtonVisualState::Normal,
         }
@@ -764,22 +1147,82 @@ impl ButtonState {
 
     /// `SetState` (`0x779790`): entering a state with no texture keeps the shown one
     /// (`0x7797be`/`0x7797e2`). A button is NORMAL before `LoadXML` adds its art (ctor
-    /// `0x7786a0`), so a press or `Disable()` without its own texture keeps the normal art.
-    fn set_state(&mut self, new: ButtonVisualState) {
+    /// `0x7786a0`), so a press or `Disable()` without its own texture keeps the normal art. The
+    /// hide of the old (`0x7797c0`) runs only when the new state has a texture too, and the show of
+    /// the new (`0x7797ea`) writes its bit.
+    fn set_state(&mut self, new: ButtonVisualState) -> ShownWrites {
         if new == self.state {
-            return;
+            return ShownWrites::default();
         }
         self.state = new;
+        let mut w = ShownWrites::default();
         if let Some(slot) = self.state_slot(new) {
+            w.hide(self.shown);
             self.shown = Some(slot);
+            w.show(Some(slot));
         }
+        // The label refresh closes every real change (`0x7797fc`); its font half is the model's.
+        self.refresh_label();
+        self.relink_due = true;
+        w
+    }
+
+    /// Whether a real state change since the last call owes the label its font relink, the half
+    /// of the refresh (`0x779878`) that needs the model; an unchanged state returns before it
+    /// (`0x7797a9`).
+    pub(crate) fn take_relink(&mut self) -> bool {
+        std::mem::take(&mut self.relink_due)
+    }
+
+    /// The label refresh's offset half (`0x779810`): PUSHED puts the pushed text offset on the
+    /// label (`0x779829`-`0x779837`), any other state zero (`0x77984f`). It runs on a state change,
+    /// an enabled enter or leave (`0x7794ab`, `0x779502`), `Lock`/`UnlockHighlight` (`0x495a98`)
+    /// and a label install (`0x778daa`), so a `SetPushedTextOffset` on a held button shows at the
+    /// next of these.
+    pub fn refresh_label(&mut self) {
+        self.label_offset = if self.state == ButtonVisualState::Pushed {
+            self.pushed_text_offset
+        } else {
+            [Len::Layout(0.0); 2]
+        };
+    }
+
+    /// The offset the label's text draws at, in layout units under `units`
+    /// ([`Self::refresh_label`]).
+    pub fn label_offset(&self, units: crate::layout::LayoutUnits) -> [f32; 2] {
+        self.label_offset.map(|l| l.layout(units))
     }
 
     /// `SetButtonState(state, locked)` (`0x779790`), the one writer: the lock is stored before the
     /// equal-state early-out (`0x77979d`), so it is set or cleared even when the state holds.
-    pub fn set_button_state(&mut self, new: ButtonVisualState, locked: bool) {
+    pub fn set_button_state(&mut self, new: ButtonVisualState, locked: bool) -> ShownWrites {
         self.locked = locked;
-        self.set_state(new);
+        self.set_state(new)
+    }
+
+    /// `CSimpleCheckbox::Refresh` (`0x7854c0`): clears both checked textures' bits, then shows
+    /// the one the checked flag and the state pick (`0x785538`), the disabled pair's when DISABLED
+    /// and it exists, else the checked texture. `force` is its second argument: without it a flag
+    /// that holds does nothing (`0x7854d0`). Only `SetChecked`, a click, `SetEnabled`, the two
+    /// checked setters and the XML `checked=` attribute (`0x7851a6`) reach it; a state switch alone
+    /// leaves the pair. The reference's `checked=` runs before the checked textures exist, so it
+    /// shows nothing and each setter's refresh shows its texture; benilla's loader calls
+    /// `SetChecked` after the textures, which ends in the same state.
+    pub fn refresh_checked(&mut self, checked: bool, force: bool) -> ShownWrites {
+        if !force && checked == self.checked {
+            return ShownWrites::default();
+        }
+        self.checked = checked;
+        let mut w = ShownWrites::default();
+        w.hide(self.checked_tex);
+        w.hide(self.disabled_checked);
+        if checked {
+            w.show(match self.disabled_checked {
+                Some(dc) if !self.enabled() => Some(dc),
+                _ => self.checked_tex,
+            });
+        }
+        w
     }
 
     /// `IsEnabled` (`0x7800b0`): the state alone; the class has no enabled flag.
@@ -796,111 +1239,239 @@ impl ButtonState {
     // Six of `0x779790`'s seven call sites, all passing `locked = 0`; the seventh is Lua's.
 
     /// `SetEnabled` (`0x779160`): a no-op if nothing changes (`0x779175`/`0x77919c`), so enabling a
-    /// pushed button neither un-pushes nor unlocks it; returns whether it ran.
-    pub fn set_enabled(&mut self, on: bool) -> bool {
-        if on == self.enabled() {
-            return false;
-        }
-        self.set_button_state(
-            if on {
-                ButtonVisualState::Normal
-            } else {
-                ButtonVisualState::Disabled
-            },
-            false,
-        );
-        true
+    /// pushed button neither un-pushes nor unlocks it. A CheckButton's override (`0x785490`) then
+    /// refreshes the checked pair whether or not it changed, which a Button, with no checked
+    /// textures, does not notice.
+    pub fn set_enabled(&mut self, on: bool) -> ShownWrites {
+        let mut w = if on == self.enabled() {
+            ShownWrites::default()
+        } else {
+            self.set_button_state(
+                if on {
+                    ButtonVisualState::Normal
+                } else {
+                    ButtonVisualState::Disabled
+                },
+                false,
+            )
+        };
+        w.0.extend(self.refresh_checked(self.checked, true).0);
+        w
     }
 
     /// The hide edge (`0x7791e0`): an unlocked, enabled button goes NORMAL; `<OnHide>` still fires.
-    pub fn on_hide(&mut self) {
+    pub fn on_hide(&mut self) -> ShownWrites {
         if self.state != ButtonVisualState::Disabled && !self.locked {
-            self.set_button_state(ButtonVisualState::Normal, false);
+            self.set_button_state(ButtonVisualState::Normal, false)
+        } else {
+            ShownWrites::default()
         }
     }
 
     /// The press edge (`0x779210`), past the registration and hit gates, so a registered click
     /// pushes the button even when the click itself does nothing.
-    pub fn on_mouse_down(&mut self) {
+    pub fn on_mouse_down(&mut self) -> ShownWrites {
         if !self.locked && self.state != ButtonVisualState::Disabled {
-            self.set_button_state(ButtonVisualState::Pushed, false);
+            self.set_button_state(ButtonVisualState::Pushed, false)
+        } else {
+            ShownWrites::default()
         }
     }
 
     /// The release edge (`0x7792d0`): a pushed, unlocked button goes NORMAL wherever the cursor
     /// is, even one Lua pushed. The caller skips it when the release ends a drag (`0x7792df`).
-    pub fn on_mouse_up(&mut self) {
+    pub fn on_mouse_up(&mut self) -> ShownWrites {
         if !self.locked && self.state == ButtonVisualState::Pushed {
-            self.set_button_state(ButtonVisualState::Normal, false);
+            self.set_button_state(ButtonVisualState::Normal, false)
+        } else {
+            ShownWrites::default()
         }
     }
 
     /// The drag-start edge (`0x7793f0`), before `<OnDragStart>`: it fires at the drag threshold
     /// (0.01 frame units, `0x81c468`) on a `RegisterForDrag` frame, not at the rect edge.
-    pub fn on_drag_start(&mut self) {
+    pub fn on_drag_start(&mut self) -> ShownWrites {
         if !self.locked && self.state != ButtonVisualState::Disabled {
-            self.set_button_state(ButtonVisualState::Normal, false);
+            self.set_button_state(ButtonVisualState::Normal, false)
+        } else {
+            ShownWrites::default()
         }
     }
 
-    /// `SetNormalTexture` and kin (`0x778fd0`): stores the slot, shown only if it is the current
-    /// state's (`0x779027`). The reference destroys a displaced texture (`0x77900a`); here the
-    /// region is made once and repainted, so a held `GetNormalTexture()` stays live.
-    pub fn set_state_slot(&mut self, state: ButtonVisualState, rh: Option<RegionHandle>) {
-        match state {
-            ButtonVisualState::Disabled => self.disabled = rh,
-            ButtonVisualState::Normal => self.normal = rh,
-            ButtonVisualState::Pushed => self.pushed = rh,
+    /// `SetNormalTexture` and kin (`0x778fd0`): stores the slot; the state it is for being the
+    /// current one, the texture becomes the shown one and its bit is written (`0x779027`..
+    /// `0x779037`). A shown pointer at the displaced texture is dropped first (`0x778fe9`). The
+    /// reference destroys a displaced texture (`0x77900a`); the caller frees it.
+    pub fn set_state_slot(
+        &mut self,
+        state: ButtonVisualState,
+        rh: Option<RegionHandle>,
+    ) -> ShownWrites {
+        let slot = match state {
+            ButtonVisualState::Disabled => &mut self.disabled,
+            ButtonVisualState::Normal => &mut self.normal,
+            ButtonVisualState::Pushed => &mut self.pushed,
+        };
+        let old = std::mem::replace(slot, rh);
+        if self.shown == old {
+            self.shown = None;
         }
-        if state == self.state {
+        let mut w = ShownWrites::default();
+        if state == self.state && rh.is_some() {
             self.shown = rh;
+            w.show(rh);
+        }
+        w
+    }
+
+    /// The region-removed hook: a CheckButton drops its checked pair (`0x785230`, `+0x4e0` and
+    /// `+0x4e4`), then every button its label (`+0x338`), its three state slots (`+0x4b8` to
+    /// `+0x4c0`), the shown one (`+0x4c4`) and its highlight (`+0x4c8`) (`0x778cb0`).
+    fn region_removed(&mut self, rh: RegionHandle) {
+        for slot in [
+            &mut self.checked_tex,
+            &mut self.disabled_checked,
+            &mut self.text,
+            &mut self.disabled,
+            &mut self.normal,
+            &mut self.pushed,
+            &mut self.shown,
+            &mut self.highlight,
+        ] {
+            if *slot == Some(rh) {
+                *slot = None;
+            }
         }
     }
 
-    /// Whether a region of this button draws: a state texture only when shown, the highlight
-    /// while hovered or locked, the checked pair by their rule, anything else always.
-    pub fn region_visible(&self, rh: RegionHandle, hovered: bool) -> bool {
-        let some = Some(rh);
-        if some == self.normal || some == self.pushed || some == self.disabled {
-            return some == self.shown;
-        }
-        if some == self.highlight {
-            // No `enabled` term: `Disable()` turns the whole HIGHLIGHT layer off before this.
-            return hovered || self.locked_highlight;
-        }
-        if some == self.checked_tex {
-            return self.checked && (self.enabled() || self.disabled_checked.is_none());
-        }
-        if some == self.disabled_checked {
-            return self.checked && !self.enabled();
-        }
-        true
+    /// Whether the Highlight region draws: while hovered or locked. The reference gates it by its
+    /// layer's enable (`0x76b6a0`/`0x76b6f0`), not by its shown bit, which it keeps from the
+    /// link (`0x779139`); every other region of a Button draws by its own bit alone.
+    pub fn highlight_draws(&self, rh: RegionHandle, hovered: bool) -> bool {
+        // No `enabled` term: `Disable()` turns the whole HIGHLIGHT layer off before this.
+        Some(rh) != self.highlight || hovered || self.locked_highlight
     }
 }
 
-/// A StatusBar's value and fill texture, zero-initialized like the client's members.
+/// A StatusBar's value and fill texture (`CSimpleStatusBar`, ctor `0x782d80`). The value fields
+/// are private: every write goes through [`Self::set_min_max`] or [`Self::set_value`], which keep
+/// the flag bits the client keeps at `+0x314`.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct StatusBarState {
-    /// `SetMinMaxValues` low bound (XML `minValue`); the loader swaps a reversed pair (`0x782ef0`).
-    pub min: f32,
-    /// `SetMinMaxValues` high bound (XML `maxValue`).
-    pub max: f32,
-    /// The current value (`SetValue`/XML `defaultValue`), clamped into `[min, max]`.
-    pub value: f32,
-    /// VERTICAL fills bottom-up; HORIZONTAL, the default, left to right (enum `0x811b00`).
-    pub vertical: bool,
-    /// The fill texture (`<BarTexture>`), cropped to [`Self::fraction`] along the orientation axis.
+    /// The low bound (`+0x318`).
+    min: f32,
+    /// The high bound (`+0x31c`).
+    max: f32,
+    /// The held value (`+0x320`), clamped into `[min, max]`.
+    value: f32,
+    /// `+0x314 & 2`, set by `SetMinMaxValues` (`0x78329a`); until then `SetValue` is a no-op.
+    range_valid: bool,
+    /// `+0x314 & 4`, set by the first stored value (`0x783347`).
+    has_value: bool,
+    /// `+0x314 & 1`, the fill to redo: set by the range (`0x78329a`), a stored value (`0x783347`),
+    /// the orientation (`0x78325c`) and a bar texture installed (`0x783230`); cleared by the
+    /// update that writes the coordinates ([`Self::take_fill`], `0x78344e`).
+    fill_dirty: bool,
+    /// `+0x328`: VERTICAL fills bottom-up; HORIZONTAL, the default, left to right (enum
+    /// `0x811b00`).
+    vertical: bool,
+    /// The fill texture (`<BarTexture>`, `+0x324`), whose coordinates the update writes.
     pub bar: Option<RegionHandle>,
 }
 
 impl StatusBarState {
-    /// The fill fraction `(value − min) / (max − min)` in `[0, 1]`; `0.0` when `max <= min`.
+    /// The range, `(min, max)`, as `GetMinMaxValues` answers it.
+    pub fn min_max(&self) -> (f32, f32) {
+        (self.min, self.max)
+    }
+
+    /// The held value, as `GetValue` answers it.
+    pub fn value(&self) -> f32 {
+        self.value
+    }
+
+    /// `CSimpleStatusBar::SetMinMaxValues` (`0x783270`), the one setter the Lua binding, the XML
+    /// loader and the engine's health watchers all call: the low bound is `max` when `min > max`
+    /// (`fcom; test ah,0x41`, so NaN keeps `min`), never a swap. With a value held it clears `& 4`
+    /// and re-sets the value (`0x7832af`, `0x7832bc`), so `OnValueChanged` fires on every call
+    /// once the bar has a value; the returned value is that fire.
+    pub fn set_min_max(&mut self, min: f32, max: f32) -> Option<f32> {
+        self.min = if min > max { max } else { min };
+        self.max = max;
+        self.range_valid = true;
+        self.fill_dirty = true;
+        if !self.has_value {
+            return None;
+        }
+        self.has_value = false;
+        self.set_value(self.value)
+    }
+
+    /// `CSimpleStatusBar::SetValue` (`0x7832d0`), op for op: nothing without a range
+    /// (`0x7832dc`); the value raised to `min` (`0x7832e8`), then lowered to `max` when `max` is
+    /// below that (`0x783303`); with a value held, an equal one returns (`0x783342`; NaN is never
+    /// equal). Otherwise it is stored and returned, the caller firing `OnValueChanged`.
+    pub fn set_value(&mut self, v: f32) -> Option<f32> {
+        if !self.range_valid {
+            return None;
+        }
+        let lo = if self.min > v { self.min } else { v };
+        let v = if self.max < lo { self.max } else { lo };
+        if self.has_value && v == self.value {
+            return None;
+        }
+        self.value = v;
+        self.has_value = true;
+        self.fill_dirty = true;
+        Some(v)
+    }
+
+    /// VERTICAL, as `GetOrientation` answers it.
+    pub fn vertical(&self) -> bool {
+        self.vertical
+    }
+
+    /// `CSimpleStatusBar::SetOrientation` (`0x783250`): stores it and marks the fill.
+    pub fn set_orientation(&mut self, vertical: bool) {
+        self.vertical = vertical;
+        self.fill_dirty = true;
+    }
+
+    /// `InstallBarTexture` (`0x7831f0`) past its same-texture return (`0x783202`): the slot takes
+    /// `bar` and the fill is marked (`0x783230`).
+    pub fn install_bar(&mut self, bar: Option<RegionHandle>) {
+        self.bar = bar;
+        self.fill_dirty = true;
+    }
+
+    /// The fill fraction `(value − min) / (max − min)` (`0x783380`), `0.0` when `max − min` is not
+    /// above 0.
     pub fn fraction(&self) -> f32 {
-        if self.max > self.min {
+        if self.max - self.min > 0.0 {
             ((self.value - self.min) / (self.max - self.min)).clamp(0.0, 1.0)
         } else {
             0.0
         }
+    }
+
+    /// The update `CSimpleStatusBar::OnFrameUpdate` (`0x7833c0`) runs after the frame's
+    /// `OnUpdate`: with the fill marked, a bar texture, a range and a value (`0x7833d8`-`0x7833ea`)
+    /// it clears the mark (`0x78344e`) and answers the coordinates it builds from scratch for
+    /// `SetTexCoordRect` (`0x770410`), `[left, right, top, bottom]`: 0 to the fill across and 0 to
+    /// 1 down when HORIZONTAL (`0x78340e`-`0x78341e`), 0 to 1 across and 0 to the fill down when
+    /// VERTICAL (`0x78342f`-`0x783436`), so a vertical bar shows the top of its art. Otherwise it
+    /// answers `None` and the texture keeps whatever coordinates it holds.
+    pub fn take_fill(&mut self) -> Option<[f32; 4]> {
+        if !(self.fill_dirty && self.bar.is_some() && self.range_valid && self.has_value) {
+            return None;
+        }
+        self.fill_dirty = false;
+        let f = self.fraction();
+        Some(if self.vertical {
+            [0.0, 1.0, 0.0, f]
+        } else {
+            [0.0, f, 0.0, 1.0]
+        })
     }
 }
 
@@ -1012,6 +1583,18 @@ pub fn slider_set_value(v: f32, min: f32, span: f32, step: f32) -> f32 {
 }
 
 impl SliderState {
+    /// The span `SetMinMaxValues` stores beside the min, `f32(max - min)` (`0x7898ff`-`0x78990d`).
+    pub fn span(&self) -> f32 {
+        (f64::from(self.max) - f64::from(self.min)) as f32
+    }
+
+    /// `GetMinMaxValues` (`0x7906e0`): the min, then the double `span + min`, never the max as
+    /// given (`0x790778`-`0x79078c`), so `(0.1, 1)` reads back 0.9999999776482582.
+    pub fn min_max_values(&self) -> (f64, f64) {
+        let min = f64::from(self.min);
+        (min, f64::from(self.span()) + min)
+    }
+
     /// The value fraction in `[0, 1]`; `0.0` when `max <= min`, the thumb at the track's start.
     pub fn fraction(&self) -> f32 {
         if self.max > self.min {
@@ -1028,8 +1611,7 @@ impl SliderState {
         if !self.range_valid {
             return None;
         }
-        let span = (f64::from(self.max) - f64::from(self.min)) as f32;
-        let settled = slider_set_value(v, self.min, span, self.step);
+        let settled = slider_set_value(v, self.min, self.span(), self.step);
         let first = !self.has_value;
         self.has_value = true;
         (first || settled != self.value).then(|| {
@@ -1046,8 +1628,7 @@ impl SliderState {
         if !self.range_valid {
             return None;
         }
-        let span = (f64::from(self.max) - f64::from(self.min)) as f32;
-        let max = (f64::from(span) + f64::from(self.min)) as f32;
+        let max = (f64::from(self.span()) + f64::from(self.min)) as f32;
         self.set_min_max(self.min, max)
     }
 

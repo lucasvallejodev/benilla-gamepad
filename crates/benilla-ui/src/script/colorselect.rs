@@ -8,13 +8,13 @@
 
 use mlua::{Lua, Table, Value};
 
-use super::object::{draw_layer_from_str, frame_handle_of};
+use super::object::frame_handle_of;
 use super::pointer::point_in_rect;
-use super::region::region_wrapper;
-use super::{event, Model, RegionData};
+use super::region::{install_into_slot, load_path_leg, region_wrapper, slot_arg, SlotArg};
+use super::{event, Model};
 use crate::layout::Rect;
 use crate::order::DrawLayer;
-use crate::widget::{ColorSelectState, FrameHandle, KindState, RegionHandle, RegionKind};
+use crate::widget::{ColorSelectState, FrameHandle, KindState, RegionHandle};
 
 /// Registry key of the ColorSelect method table (the MAXCSTACK discipline: a Lua-side root).
 pub(super) const REG_COLORSELECT_METHODS: &str = "__benilla_colorselect_methods";
@@ -34,7 +34,7 @@ fn with_colorselect<T>(
         .ok_or_else(|| mlua::Error::runtime("stale frame handle"))?;
     match &mut frame.kind_state {
         KindState::ColorSelect(s) => Ok(f(s)),
-        _ => Err(mlua::Error::runtime("not a ColorSelect")),
+        _ => Err(mlua::Error::runtime(crate::script::object::ERR_WRONG_TYPE)),
     }
 }
 
@@ -58,14 +58,13 @@ impl Slot {
         }
     }
 
-    fn set(self, s: &mut ColorSelectState, rh: RegionHandle) {
-        let slot = match self {
-            Slot::Wheel => &mut s.wheel,
-            Slot::WheelThumb => &mut s.wheel_thumb,
-            Slot::ValueStrip => &mut s.value_strip,
-            Slot::ValueThumb => &mut s.value_thumb,
-        };
-        *slot = Some(rh);
+    fn set_opt(self, s: &mut ColorSelectState, rh: Option<RegionHandle>) {
+        match self {
+            Slot::Wheel => s.wheel = rh,
+            Slot::WheelThumb => s.wheel_thumb = rh,
+            Slot::ValueStrip => s.value_strip = rh,
+            Slot::ValueThumb => s.value_thumb = rh,
+        }
     }
 
     /// The layer a slot's region is born on: ARTWORK for the art (the wheel's layer 2, through
@@ -78,11 +77,84 @@ impl Slot {
     }
 }
 
-/// Get-or-create one slot's texture region, `layer` re-layering an existing one; returns its id.
-fn ensure_slot(lua: &Lua, this: &Table, slot: Slot, layer: Option<DrawLayer>) -> mlua::Result<u32> {
+impl Slot {
+    /// Whether the slot has a path leg: the markers do (`0x78b7b0`), the wheel and the strip take
+    /// an object or nil alone (`0x78de90`, `0x78e450`).
+    fn has_path_leg(self) -> bool {
+        matches!(self, Slot::WheelThumb | Slot::ValueThumb)
+    }
+
+    fn of_tag(tag: &str) -> Option<Slot> {
+        Some(match tag {
+            "ColorWheelTexture" => Slot::Wheel,
+            "ColorWheelThumbTexture" => Slot::WheelThumb,
+            "ColorValueTexture" => Slot::ValueStrip,
+            "ColorValueThumbTexture" => Slot::ValueThumb,
+            _ => return None,
+        })
+    }
+}
+
+/// Install `incoming` into `slot`, or clear it, through the slot hooks: the wheel `0x78b580` and
+/// the strip `0x78b8a0` link on ARTWORK and replace the texture's image with the generated one
+/// (`0x770300`), so it ends file-less here, where the renderer paints it; the markers
+/// `0x78b850`/`0x78ba90` link on OVERLAY and clear their anchors (`0x767ed0`).
+fn install_slot_model(
+    model: &mut Model,
+    h: FrameHandle,
+    slot: Slot,
+    incoming: Option<RegionHandle>,
+) -> mlua::Result<()> {
+    if !matches!(
+        model.arena.frame(h).map(|f| &f.kind_state),
+        Some(KindState::ColorSelect(_))
+    ) {
+        return Err(mlua::Error::runtime(crate::script::object::ERR_WRONG_TYPE));
+    }
+    let thumb = matches!(slot, Slot::WheelThumb | Slot::ValueThumb);
+    let changed = install_into_slot(
+        model,
+        h,
+        incoming,
+        slot.layer(),
+        true,
+        thumb,
+        |ks| match ks {
+            KindState::ColorSelect(s) => slot.get(s),
+            _ => None,
+        },
+        |ks, rh| {
+            if let KindState::ColorSelect(s) = ks {
+                slot.set_opt(s, rh);
+            }
+        },
+    )?;
+    // The same texture returned at the first compare (`0x78b598`) and keeps what it was set to.
+    if let (true, Some(rh), false) = (changed, incoming, thumb) {
+        super::region::clear_texture(model, rh);
+    }
+    Ok(())
+}
+
+/// A ColorSelect element's texture child (`0x78b3f0`): the texture the texture adder built,
+/// installed as the slot's object. The wheel and the strip are painted by the renderer whatever
+/// file or colour the element names.
+pub(super) fn install_loaded(
+    model: &mut Model,
+    h: FrameHandle,
+    tag: &str,
+    rh: RegionHandle,
+) -> mlua::Result<()> {
+    let slot = Slot::of_tag(tag)
+        .ok_or_else(|| mlua::Error::runtime(format!("not a ColorSelect texture: {tag}")))?;
+    install_slot_model(model, h, slot, Some(rh))
+}
+
+/// A marker's path leg (`0x78b7b0`, [`load_path_leg`]): a marker that exists has its file swapped
+/// and nothing else; with none, a texture that loads is installed.
+fn set_marker_path(lua: &Lua, this: &Table, slot: Slot, path: &str) -> mlua::Result<()> {
     let h = frame_handle_of(lua, this)?;
     let mut model = lua.app_data_mut::<Model>().expect("model app_data");
-
     let existing = match &model
         .arena
         .frame(h)
@@ -90,37 +162,19 @@ fn ensure_slot(lua: &Lua, this: &Table, slot: Slot, layer: Option<DrawLayer>) ->
         .kind_state
     {
         KindState::ColorSelect(s) => slot.get(s),
-        _ => return Err(mlua::Error::runtime("not a ColorSelect")),
+        _ => return Err(mlua::Error::runtime(crate::script::object::ERR_WRONG_TYPE)),
     };
-
-    let rh = match existing {
-        Some(rh) => {
-            if let (Some(l), Some(region)) = (layer, model.arena.region_mut(rh)) {
-                region.draw_layer = l;
-            }
-            rh
-        }
-        None => {
-            let rh = model
-                .arena
-                .create_region(h, RegionKind::Texture, layer.unwrap_or(slot.layer()), 0)
-                .ok_or_else(|| mlua::Error::runtime("stale frame handle"))?;
-            model.region_data.insert(rh, RegionData::default());
-            model.touch_layout(); // a region entered the layout gate's read set
-            if let Some(frame) = model.arena.frame_mut(h) {
-                if let KindState::ColorSelect(s) = &mut frame.kind_state {
-                    slot.set(s, rh);
-                }
-            }
-            rh
-        }
-    };
-    Ok(model.region_id(rh))
+    if let Some(rh) = load_path_leg(&mut model, h, existing, slot.layer(), path)? {
+        install_slot_model(&mut model, h, slot, Some(rh))?;
+    }
+    Ok(())
 }
 
-/// `Set<Slot>Texture([path [, drawLayer]] | r, g, b [, a])`, plus an empty form that only creates
-/// the region: what `<ColorWheelTexture/>` means. A file-less slot is where the app renderer paints
-/// the disc and strip the reference computes (`0x78b580`, `0x78b8a0`).
+/// `Set<Slot>Texture(texture or "texture" or nil)` for the markers (`0x78e160`, `0x78e720`), a
+/// path leg beside the object and nil ones; the wheel and the strip (`0x78de90`, `0x78e450`) have
+/// `(texture or nil)` alone. No argument raises the usage, and there is no colour form. A file-less
+/// wheel or strip is where the app renderer paints the disc and strip the reference computes
+/// (`0x78b580`, `0x78b8a0`).
 fn install_slot_texture(
     lua: &Lua,
     m: &Table,
@@ -128,44 +182,29 @@ fn install_slot_texture(
     setter: &str,
     getter: &str,
 ) -> mlua::Result<()> {
+    let method = setter.to_string();
+    let usage = if slot.has_path_leg() {
+        format!(r#"{setter}(texture or "texture" or nil)"#)
+    } else {
+        format!("{setter}(texture or nil)")
+    };
     m.set(
         setter,
-        lua.create_function(
-            move |lua, (this, a1, a2, a3, a4): (Table, Value, Value, Value, Value)| {
-                let layer = match &a2 {
-                    Value::String(s) => s.to_str().ok().and_then(|l| draw_layer_from_str(&l)),
-                    _ => None,
-                };
-                let id = ensure_slot(lua, &this, slot, layer)?;
-                let rh = {
-                    let model = lua.app_data_ref::<Model>().expect("model app_data");
-                    *model.id_to_region.get(&id).expect("colorselect region id")
-                };
-                let mut model = lua.app_data_mut::<Model>().expect("model app_data");
-                let data = model.region_data.entry(rh).or_default();
-                match &a1 {
-                    Value::String(s) => {
-                        data.texture = Some(s.to_str()?.to_string());
-                        data.fill = None;
-                    }
-                    Value::Number(_) | Value::Integer(_) => {
-                        data.texture = None;
-                        data.fill = Some([
-                            num_f32(&a1),
-                            num_f32(&a2),
-                            num_f32(&a3),
-                            match &a4 {
-                                Value::Nil => 1.0,
-                                v => num_f32(v),
-                            },
-                        ]);
-                    }
-                    // The empty form: the region now exists and stays file-less.
-                    _ => {}
+        lua.create_function(move |lua, (this, args): (Table, mlua::MultiValue)| {
+            let arg = slot_arg(lua, &this, &args, &usage, &method, slot.has_path_leg())?;
+            let h = frame_handle_of(lua, &this)?;
+            match arg {
+                SlotArg::Object(rh) => {
+                    let mut model = lua.app_data_mut::<Model>().expect("model app_data");
+                    install_slot_model(&mut model, h, slot, Some(rh))
                 }
-                Ok(())
-            },
-        )?,
+                SlotArg::Clear => {
+                    let mut model = lua.app_data_mut::<Model>().expect("model app_data");
+                    install_slot_model(&mut model, h, slot, None)
+                }
+                SlotArg::Path(path) => set_marker_path(lua, &this, slot, &path),
+            }
+        })?,
     )?;
     m.set(
         getter,
@@ -184,14 +223,6 @@ fn install_slot_texture(
     Ok(())
 }
 
-fn num_f32(v: &Value) -> f32 {
-    match v {
-        Value::Number(n) => *n as f32,
-        Value::Integer(i) => *i as f32,
-        _ => 0.0,
-    }
-}
-
 pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     let m = lua.create_table()?;
 
@@ -200,9 +231,9 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         // Shape C on r, g, b (`ColorSelect:SetColorRGB 0x78eae0`, `2=C 3=C 4=C 5=B`).
         lua.create_function(|lua, (this, r, g, b): (Table, Value, Value, Value)| {
             let (r, g, b) = (
-                crate::script::object::as_f64(&r),
-                crate::script::object::as_f64(&g),
-                crate::script::object::as_f64(&b),
+                crate::script::object::tonumber_f64(lua, &r),
+                crate::script::object::tonumber_f64(lua, &g),
+                crate::script::object::tonumber_f64(lua, &b),
             );
             // Store through the client's quantizer, then fire with what the widget now holds: the
             // round-tripped values, identical to the next `GetColorRGB`, not the raw arguments.
@@ -216,6 +247,29 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     m.set(
         "GetColorRGB",
         lua.create_function(|lua, this: Table| with_colorselect(lua, &this, |s| s.rgb_f64()))?,
+    )?;
+    m.set(
+        "SetColorHSV",
+        // A bare `lua_tonumber` on h, s, v (`0x78e9b2`-`0x78e9d0`), each stored as f32 with no
+        // clamp, then the same redraw and `OnColorSelect` tail as SetColorRGB (`0x78e9f1`).
+        lua.create_function(|lua, (this, h, s, v): (Table, Value, Value, Value)| {
+            let [h, s, v] = [h, s, v].map(|x| crate::script::object::tonumber_f64(lua, &x) as f32);
+            let (qr, qg, qb) = with_colorselect(lua, &this, |c| {
+                c.set_hsv(h, s, v);
+                c.rgb_f64()
+            })?;
+            fire_color_select(lua, &this, qr, qg, qb)
+        })?,
+    )?;
+    m.set(
+        "GetColorHSV",
+        // The three stored floats widened (`0x78ea9c`-`0x78eacd`): hue in degrees, unclamped.
+        lua.create_function(|lua, this: Table| {
+            with_colorselect(lua, &this, |c| {
+                let [h, s, v] = c.hsv.map(f64::from);
+                (h, s, v)
+            })
+        })?,
     )?;
 
     // The four texture accessors (`0x78de90`, `0x78e160`, `0x78e450`, `0x78e720`; getters
@@ -268,7 +322,7 @@ fn fire_color_select(lua: &Lua, this: &Table, r: f64, g: f64, b: f64) -> mlua::R
     ) {
         lua.app_data_mut::<Model>()
             .expect("model app_data")
-            .record_script_error(e.to_string());
+            .record_lua_error(&e);
     }
     Ok(())
 }
@@ -352,7 +406,7 @@ fn hit_rects(model: &Model, h: FrameHandle) -> (Option<Rect>, Option<Rect>) {
         Some(KindState::ColorSelect(s)) => (s.wheel, s.value_strip),
         _ => (None, None),
     };
-    let rect = |rh: Option<RegionHandle>| rh.and_then(|rh| model.region_resolved.get(&rh).copied());
+    let rect = |rh: Option<RegionHandle>| rh.and_then(|rh| model.region_rect(rh));
     (rect(wheel), rect(strip))
 }
 
@@ -548,6 +602,53 @@ mod tests {
         assert_eq!(from_handler, from_getter);
     }
 
+    /// `SetColorHSV` stores three raw f32s (`0x78e9b7`-`0x78e9d5`), coercing a non-number to 0
+    /// with no clamp and no gate, and fires on every call; `GetColorHSV` answers them widened.
+    #[test]
+    fn the_hsv_pair_stores_raw_floats_and_fires_every_time() {
+        let s = UiScript::new().unwrap();
+        s.run(
+            r#"
+            fired = {}
+            cs = CreateFrame("ColorSelect", "TestColorSelectHsv")
+            cs:SetScript("OnColorSelect", function()
+                table.insert(fired, arg1 .. "," .. arg2 .. "," .. arg3)
+            end)
+        "#,
+        )
+        .unwrap();
+        assert_eq!(s.arity("cs:GetColorHSV()").unwrap(), 3);
+        assert_eq!(s.arity("cs:SetColorHSV(1, 1, 1)").unwrap(), 0);
+        s.run("fired = {}").unwrap();
+
+        s.run("cs:SetColorHSV(0.1, 0.5, 0.25)").unwrap();
+        let hsv: (f64, f64, f64) = s.eval("return cs:GetColorHSV()").unwrap();
+        assert_eq!(hsv, (f64::from(0.1f32), 0.5, 0.25), "stored as f32");
+        assert_ne!(hsv.0, 0.1);
+
+        s.run("cs:SetColorHSV(400, 2, -1)").unwrap();
+        let hsv: (f64, f64, f64) = s.eval("return cs:GetColorHSV()").unwrap();
+        assert_eq!(hsv, (400.0, 2.0, -1.0), "no clamp");
+
+        s.run(r#"cs:SetColorHSV("x")"#).unwrap();
+        let hsv: (f64, f64, f64) = s.eval("return cs:GetColorHSV()").unwrap();
+        assert_eq!(hsv, (0.0, 0.0, 0.0), "a non-number reads 0");
+
+        s.run("fired = {} cs:SetColorHSV(120, 1, 1) cs:SetColorHSV(120, 1, 1)")
+            .unwrap();
+        assert_eq!(s.eval::<usize>("return table.getn(fired)").unwrap(), 2);
+        let (from_handler, from_getter): (String, String) = s
+            .eval("local r, g, b = cs:GetColorRGB() return fired[2], r .. \",\" .. g .. \",\" .. b")
+            .unwrap();
+        assert_eq!(from_handler, from_getter);
+        assert_eq!(from_handler, "0,1,0");
+
+        // An RGB grey stores hue -1 (`0x7bbccd`), readable through the HSV getter.
+        s.run("cs:SetColorRGB(0.5, 0.5, 0.5)").unwrap();
+        assert_eq!(s.eval::<f64>("return (cs:GetColorHSV())").unwrap(), -1.0);
+        assert!(s.errors().is_empty(), "{:?}", s.errors());
+    }
+
     #[test]
     fn the_methods_do_not_leak_onto_other_kinds() {
         let s = UiScript::new().unwrap();
@@ -614,7 +715,7 @@ mod tests {
         assert_eq!((w, h), (128.0, 128.0), "the wheel is 128 square");
         // TOPLEFT (16, −32) inside a 365×200 frame seated at the screen's bottom-left.
         assert_eq!(l, 16.0);
-        assert_eq!(b, 200.0 - 32.0 - 128.0);
+        crate::assert_near!(b, 200.0 - 32.0 - 128.0);
         let (sl, sw, sh): (f32, f32, f32) = s
             .eval(
                 "local r = TestPicker:GetColorValueTexture(); \
@@ -622,7 +723,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!((sw, sh), (32.0, 128.0), "the strip is 32×128");
-        assert_eq!(sl, 16.0 + 128.0 + 24.0, "seated 24 right of the wheel");
+        crate::assert_near!(sl, 16.0 + 128.0 + 24.0, "seated 24 right of the wheel");
         // The thumbs exist and carry the one BLP in the window.
         let file: String = s
             .eval("return TestPicker:GetColorWheelThumbTexture():GetTexture()")
@@ -796,6 +897,20 @@ mod tests {
                 sb + v * sh
             );
         }
+    }
+
+    /// The markers are textures of the picker, sized in its units, so a half-scale picker draws
+    /// them at half size: 5 and 24 on screen.
+    #[test]
+    fn the_markers_scale_with_the_picker() {
+        let mut s = picker();
+        s.run("TestPicker:SetScale(0.5); TestPicker:SetColorRGB(1, 0, 0)")
+            .unwrap();
+        s.resolve();
+        let wheel = marker_rect(&s, 5.0).expect("the wheel marker, 10 units at half scale");
+        assert!((wheel.top - wheel.bottom - 5.0).abs() < 0.01, "{wheel:?}");
+        let value = marker_rect(&s, 24.0).expect("the value marker, 48 units at half scale");
+        assert!((value.top - value.bottom - 7.0).abs() < 0.01, "{value:?}");
     }
 
     /// The extracted rect of the marker `width` wide: the two share one BLP and differ by size, 10

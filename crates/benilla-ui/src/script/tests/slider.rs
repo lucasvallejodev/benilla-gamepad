@@ -37,14 +37,14 @@ fn slider_thumb_draws_at_value_fraction_along_the_track() {
     s.resolve();
     // value=min puts the thumb flush at the track top (a scrollbar at 0 is scrolled up); travel
     // 100 - 16 = 84, thumb centered on x=108 -> [100,116], top edge at 200.
-    assert_eq!(
+    crate::assert_near!(
         thumb_rect(&s.extract(), "Knob"),
         (100.0, 116.0, 184.0, 200.0),
         "value=min: thumb flush at track top, centered on the cross-axis"
     );
 
     s.run(r#"SlRender:SetValue(100)"#).unwrap();
-    assert_eq!(
+    crate::assert_near!(
         thumb_rect(&s.extract(), "Knob"),
         (100.0, 116.0, 100.0, 116.0),
         "value=max: thumb flush at track bottom"
@@ -52,7 +52,7 @@ fn slider_thumb_draws_at_value_fraction_along_the_track() {
 
     s.run(r#"SlRender:SetValue(50)"#).unwrap();
     let (_, _, bottom, top) = thumb_rect(&s.extract(), "Knob");
-    assert_eq!(
+    crate::assert_near!(
         (bottom, top),
         (142.0, 158.0),
         "value=mid: thumb centered in the track"
@@ -82,18 +82,19 @@ fn slider_thumb_drag_maps_cursor_to_value() {
     s.mouse_button(108.0, 192.0, "LeftButton", true);
     s.mouse_move(108.0, 150.0);
     let v: f32 = s.eval("return SlDrag:GetValue()").unwrap();
-    assert_eq!(v, 50.0, "cursor halfway down the track -> value 50");
+    crate::assert_near!(v, 50.0, "cursor halfway down the track -> value 50");
     s.mouse_move(108.0, 108.0);
     let v: f32 = s.eval("return SlDrag:GetValue()").unwrap();
-    assert_eq!(
-        v, 100.0,
+    crate::assert_near!(
+        v,
+        100.0,
         "cursor at the track bottom -> value 100 (clamped)"
     );
 
     s.mouse_button(108.0, 108.0, "LeftButton", false);
     s.mouse_move(108.0, 192.0);
     let v: f32 = s.eval("return SlDrag:GetValue()").unwrap();
-    assert_eq!(v, 100.0, "no capture after release");
+    crate::assert_near!(v, 100.0, "no capture after release");
 }
 
 #[test]
@@ -207,6 +208,22 @@ fn slider_value_clamps_and_does_not_swap_minmax() {
     .unwrap();
 }
 
+/// `GetMinMaxValues` (`0x7906e0`) answers the min and the double `f32(max - min) + min`
+/// (`0x790778`-`0x79078c`), not the max as given (benilla-re `ui::minmax_max_value`).
+#[test]
+fn slider_get_min_max_values_derives_the_max_from_the_span() {
+    let s = script();
+    let (min, max) = s
+        .eval::<(f64, f64)>(
+            r#"local sl = CreateFrame("Slider")
+            sl:SetMinMaxValues(0.1, 1)
+            return sl:GetMinMaxValues()"#,
+        )
+        .unwrap();
+    assert_eq!(min, f64::from(0.1f32));
+    assert_eq!(max, 0.9999999776482582);
+}
+
 #[test]
 fn slider_setvalue_fires_onvaluechanged_only_on_change() {
     let s = script();
@@ -299,7 +316,8 @@ fn slider_scrollbar_wiring_does_not_recurse() {
         r#"
         bar:SetValue(50)
         assert(bar:GetValue() == 50, "slider settled at 50")
-        assert(SlSF:GetVerticalScroll() == 50, "scroll followed the slider")
+        -- The offset reads back through the law, `G(S(50))` at 4:3.
+        assert(SlSF:GetVerticalScroll() == 49.999999254941955, "scroll followed the slider")
     "#,
     )
     .unwrap();
@@ -416,7 +434,7 @@ fn a_thumb_with_no_authored_size_takes_its_arts_texel_span_and_still_drags() {
 
     // host y ∈ [100, 270] ⇒ the bar is centred on y=185, 128 tall ⇒ track y ∈ [121, 249];
     // x: host left 100 + 15 ⇒ [115, 131], so the thumb centres on x=123.
-    assert_eq!(
+    crate::assert_near!(
         thumb_rect(&s.extract(), "UI-SliderBar-Button-Vertical"),
         (107.0, 139.0, 217.0, 249.0),
         "a sizeless thumb is its art's 32×32, flush at the track top — not the whole 16×128 track"
@@ -627,4 +645,38 @@ fn a_step_before_any_range_is_the_whole_call() {
     assert_eq!(s.eval::<i64>("return fires").unwrap(), 0);
     let (min, max): (f32, f32) = s.eval("return SlNoRange:GetMinMaxValues()").unwrap();
     assert_eq!((min, max), (0.0, 0.0), "no range was pushed");
+}
+
+/// The thumb is a texture of the slider, sized in its units, so it draws at the slider's
+/// effective scale; the drag reads its unscaled size against the scaled track, as the bytes do.
+#[test]
+fn a_scaled_sliders_thumb_scales_with_it() {
+    let mut s = script();
+    s.set_screen_size(1024.0, 768.0);
+    s.run(
+        r#"
+        local sl = CreateFrame("Slider", "SlHalf")
+        sl:SetScale(0.5)
+        -- The render test's scrollbar at half scale: on screen 8 wide, 50 tall, from (50, 50).
+        sl:SetPoint("BOTTOMLEFT", nil, "BOTTOMLEFT", 100, 100)
+        sl:SetWidth(16); sl:SetHeight(100)
+        sl:SetThumbTexture("Interface\\Buttons\\UI-ScrollBar-Knob")
+        local t = sl:GetThumbTexture()
+        t:SetWidth(16); t:SetHeight(16)
+        sl:SetMinMaxValues(0, 100)
+        sl:SetValue(0)
+    "#,
+    )
+    .unwrap();
+    s.resolve();
+    crate::assert_near!(
+        thumb_rect(&s.extract(), "Knob"),
+        (50.0, 58.0, 92.0, 100.0),
+        "a 16-unit thumb of a half-scale slider is 8 on screen, flush at the track top"
+    );
+    // The drag (`0x789ba0`) takes the thumb's own unscaled 16 from the scaled 50-tall track: a
+    // press 40 below the track top is (40 - 8) of the 34 travel.
+    s.mouse_button(54.0, 60.0, "LeftButton", true);
+    let v = s.eval::<f64>("return SlHalf:GetValue()").unwrap();
+    assert!((v - 100.0 * 32.0 / 34.0).abs() < 1e-3, "value {v}");
 }
