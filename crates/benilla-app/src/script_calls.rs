@@ -1196,7 +1196,7 @@ pub(crate) fn lent<R>(
 /// system that holds the VM takes, so whatever Lua it runs (an event's handlers, a widget's
 /// script, an `OnUpdate`, a chunk) makes calls that apply inside the verb.
 #[derive(SystemParam)]
-pub(crate) struct HostedVm<'w, 's> {
+pub struct HostedVm<'w, 's> {
     script: Option<NonSendMut<'w, UiScript>>,
     host: Option<ScriptCallHost<'w, 's>>,
 }
@@ -1204,7 +1204,7 @@ pub(crate) struct HostedVm<'w, 's> {
 impl HostedVm<'_, '_> {
     /// Run `f` on the VM with the host lent around all of it ([`hosted`]); `f` gets `None` with
     /// no VM.
-    pub(crate) fn run<R>(&mut self, f: impl FnOnce(Option<&mut UiScript>) -> R) -> R {
+    pub fn run<R>(&mut self, f: impl FnOnce(Option<&mut UiScript>) -> R) -> R {
         hosted(&mut self.script, &mut self.host, f)
     }
 }

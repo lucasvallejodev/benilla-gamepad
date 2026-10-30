@@ -210,6 +210,9 @@ pub use bevy::app::AppExit;
 pub use benilla_protocol::{messages::ObjectType, ObjectFields};
 pub use net::Objects;
 pub use target::Interact;
+// A crate on top of benilla runs Lua on the UI VM through this, so the verbs its chunks and bindings
+// call apply inside the call, as every system of benilla's own does.
+pub use script_calls::HostedVm;
 
 /// Builds and runs the client app. `build` is the launcher's compile-time git stamp, passed in as
 /// data so the sha lives in the shim's fingerprint and a commit does not recompile this crate.

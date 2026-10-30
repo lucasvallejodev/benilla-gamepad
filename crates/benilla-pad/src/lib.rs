@@ -23,13 +23,16 @@ pub mod addon;
 pub mod interact;
 pub mod map;
 
+use bevy::ecs::system::SystemParam;
 use bevy::input::keyboard::{Key, KeyboardInput};
+use bevy::input::mouse::MouseButtonInput;
 use bevy::input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll, MouseScrollUnit};
 use bevy::input::ButtonState;
 use bevy::input::InputSystems;
 use bevy::prelude::*;
-use bevy::window::PrimaryWindow;
+use bevy::window::{PrimaryWindow, WindowEvent};
 
+use benilla_app::HostedVm;
 use benilla_ui::script::{ScriptValue, UiScript};
 
 /// The gamepad plugin: re-enables bevy's gilrs backend, which benilla's boot disables, keeps the
@@ -42,8 +45,13 @@ impl Plugin for PadPlugin {
         app.add_plugins(bevy::gilrs::GilrsPlugin)
             .insert_resource(PadSettings::from_env())
             .init_resource::<PadState>()
+            .init_resource::<PadWrites>()
+            .init_resource::<PadCursorTo>()
             .add_systems(Startup, addon::install_addon)
-            .add_systems(PreUpdate, drive_pad.after(InputSystems));
+            .add_systems(
+                PreUpdate,
+                (drive_pad, apply_pad_writes).chain().after(InputSystems),
+            );
     }
 }
 
@@ -60,8 +68,6 @@ pub struct PadSettings {
     pub shoulder_zoom: bool,
     /// The pad cursor's speed at full tilt, logical pixels a second.
     pub cursor_speed: f32,
-    /// Interact's loot window takes everything at once.
-    pub loot_all: bool,
     /// Which of the three an environment variable pinned.
     pinned: [bool; 3],
 }
@@ -74,7 +80,6 @@ impl Default for PadSettings {
             invert_y: false,
             shoulder_zoom: true,
             cursor_speed: 1100.0,
-            loot_all: true,
             pinned: [false; 3],
         }
     }
@@ -107,9 +112,7 @@ impl PadSettings {
         invert_y: bool,
         zoom: bool,
         cursor_speed: f32,
-        loot_all: bool,
     ) {
-        self.loot_all = loot_all;
         self.shoulder_zoom = zoom;
         self.cursor_speed = cursor_speed.max(50.0);
         if !self.pinned[0] {
@@ -172,18 +175,34 @@ struct PadState {
     /// An Interact on a target the object mirror had not streamed yet, retried until this
     /// `Time::elapsed_secs`.
     interact_retry: Option<f32>,
-    /// We hold Shift for an Interact's loot-all (1.12's auto-loot is the Shift held as the loot
-    /// window opens), until this `Time::elapsed_secs` or the window shows.
-    loot_shift: Option<f32>,
 }
 
-/// How long an Interact waits for its target to be streamed, and how long its Shift is held for
-/// the loot window, in seconds.
+/// How long an Interact waits for its target to be streamed, in seconds.
 const INTERACT_RETRY_SECS: f32 = 0.3;
-const LOOT_SHIFT_SECS: f32 = 1.5;
 
-fn fire(script: &mut UiScript, event: &str, args: Vec<ScriptValue>) {
-    script.fire_event(event, args);
+/// Signal one of the addon's own events. 1.12's `RegisterEvent` ignores a name off the client's
+/// event table, so these reach the addon as a call to `BenillaPad_Signal`, not through
+/// `fire_event`.
+pub(crate) fn fire(script: &mut UiScript, event: &str, args: Vec<ScriptValue>) {
+    let mut chunk = format!(
+        "if BenillaPad_Signal then BenillaPad_Signal({}",
+        map::lua_str(event)
+    );
+    for arg in args {
+        chunk.push_str(", ");
+        match arg {
+            ScriptValue::Nil => chunk.push_str("nil"),
+            ScriptValue::Bool(b) => chunk.push_str(if b { "true" } else { "false" }),
+            ScriptValue::Int(n) => chunk.push_str(&n.to_string()),
+            ScriptValue::Number(n) if n.is_finite() => chunk.push_str(&n.to_string()),
+            ScriptValue::Number(_) => chunk.push('0'),
+            ScriptValue::Str(s) => chunk.push_str(&map::lua_str(&s)),
+        }
+    }
+    chunk.push_str(") end");
+    if let Err(e) = script.run(&chunk) {
+        warn!("pad: {event} failed: {e}");
+    }
 }
 
 fn press(script: &UiScript, command: &str) {
@@ -243,20 +262,53 @@ fn resolve(
     }
 }
 
-/// The whole gamepad, once a frame. A focused EditBox blocks presses, never releases.
+/// The whole gamepad, once a frame, on the UI VM with benilla's call host lent around all of it:
+/// a verb a binding or chunk calls (`TargetNearestEnemy`, `InteractUnit`, the spellbook's reads)
+/// applies inside that call and raises "no call host" without it.
+#[allow(clippy::too_many_arguments)]
 fn drive_pad(
-    script: Option<NonSendMut<UiScript>>,
+    mut vm: HostedVm,
+    pads: Query<(Entity, &Gamepad)>,
+    settings: ResMut<PadSettings>,
+    time: Res<Time>,
+    state: ResMut<PadState>,
+    interacting: interact::Interacting,
+    windows: Query<&Window, With<PrimaryWindow>>,
+    cursor_to: ResMut<PadCursorTo>,
+    scroll: ResMut<AccumulatedMouseScroll>,
+    input: SynthInput,
+    glue: Local<Vec<(GamepadButton, GlueInput)>>,
+) {
+    vm.run(|script| {
+        drive(
+            script,
+            pads,
+            settings,
+            time,
+            state,
+            interacting,
+            windows,
+            cursor_to,
+            scroll,
+            input,
+            glue,
+        );
+    });
+}
+
+/// [`drive_pad`]'s body. A focused EditBox blocks presses, never releases.
+#[allow(clippy::too_many_arguments)]
+fn drive(
+    script: Option<&mut UiScript>,
     pads: Query<(Entity, &Gamepad)>,
     mut settings: ResMut<PadSettings>,
     time: Res<Time>,
-    mut motion: ResMut<AccumulatedMouseMotion>,
     mut state: ResMut<PadState>,
     mut interacting: interact::Interacting,
-    mut windows: Query<&mut Window, With<PrimaryWindow>>,
-    mut mouse: ResMut<ButtonInput<MouseButton>>,
+    windows: Query<&Window, With<PrimaryWindow>>,
+    mut cursor_to: ResMut<PadCursorTo>,
     mut scroll: ResMut<AccumulatedMouseScroll>,
-    mut keys: ResMut<ButtonInput<KeyCode>>,
-    mut key_events: MessageWriter<KeyboardInput>,
+    mut input: SynthInput,
     mut glue: Local<Vec<(GamepadButton, GlueInput)>>,
 ) {
     // Before the world (login, realm list, character select) the VM is the boot one, with no
@@ -273,32 +325,28 @@ fn drive_pad(
             .ok()
         })
         .unwrap_or((false, None, None));
-    let Some(mut script) = script.filter(|_| in_world) else {
-        if state.loot_shift.is_some() {
-            keys.release(KeyCode::ShiftLeft);
-        }
+    let Some(script) = script.filter(|_| in_world) else {
         *state = PadState::default();
         drive_glue(
             pads.iter().next().map(|(_, g)| g),
             &settings,
             &time,
-            windows.single_mut().ok().as_deref_mut(),
-            &mut mouse,
-            &mut keys,
-            &mut key_events,
+            windows
+                .single()
+                .ok()
+                .map(|w| CursorWindow::new(w, &mut cursor_to.0))
+                .as_mut(),
+            &mut input,
             &mut glue,
         );
         return;
     };
     // Entering the world with a glue key still held: let go of it.
-    for (_, input) in glue.drain(..) {
-        release_glue(input, &mut mouse, &mut keys, &mut key_events);
+    for (_, held) in glue.drain(..) {
+        release_glue(held, &mut input);
     }
     let session = script.session();
     if state.session != Some(session) {
-        if state.loot_shift.is_some() {
-            keys.release(KeyCode::ShiftLeft);
-        }
         *state = PadState {
             session: Some(session),
             layer: "bare",
@@ -313,7 +361,7 @@ fn drive_pad(
         Some((entity, gamepad)) if state.announced != Some(entity) => {
             let style = map::style(gamepad.vendor_id());
             fire(
-                &mut script,
+                script,
                 "BENILLAPAD_CONNECTED",
                 vec![ScriptValue::Str(style.to_string())],
             );
@@ -321,7 +369,7 @@ fn drive_pad(
             state.announced = Some(entity);
         }
         None if state.announced.is_some() => {
-            fire(&mut script, "BENILLAPAD_DISCONNECTED", Vec::new());
+            fire(script, "BENILLAPAD_DISCONNECTED", Vec::new());
             info!("pad: controller disconnected");
             state.announced = None;
         }
@@ -336,10 +384,9 @@ fn drive_pad(
     // The addon's own windows (menu, wheel, keybinds) take every button; the cursor mode plays on.
     let world = mode == "world" || cursor;
     if gen.is_some() && gen != state.settings_gen {
-        if let Ok((deadzone, look, invert, zoom, speed, loot_all)) =
-            script.eval::<(f32, f32, bool, Option<bool>, Option<f32>, Option<bool>)>(
-                "return BenillaPad_Settings()",
-            )
+        if let Ok((deadzone, look, invert, zoom, speed)) =
+            script
+                .eval::<(f32, f32, bool, Option<bool>, Option<f32>)>("return BenillaPad_Settings()")
         {
             settings.apply_addon(
                 deadzone,
@@ -347,16 +394,18 @@ fn drive_pad(
                 invert,
                 zoom.unwrap_or(true),
                 speed.unwrap_or(1100.0),
-                loot_all.unwrap_or(true),
             );
         }
         state.settings_gen = gen;
     }
-    let mut window = windows.single_mut().ok();
+    let mut window = windows
+        .single()
+        .ok()
+        .map(|w| CursorWindow::new(w, &mut cursor_to.0));
     // Entering the cursor mode: onto an open popup's first button, if there is one.
     if cursor && !state.cursor {
-        if let Some(w) = window.as_deref_mut() {
-            snap(&script, w, "enter");
+        if let Some(w) = window.as_mut() {
+            snap(script, w, "enter");
         }
     }
     state.cursor = cursor;
@@ -372,15 +421,6 @@ fn drive_pad(
             state.interact_retry = None;
         }
     }
-    if let Some(until) = state.loot_shift {
-        let open = script
-            .eval::<bool>("return LootFrame ~= nil and LootFrame:IsVisible() ~= nil")
-            .unwrap_or(false);
-        if open || now > until {
-            keys.release(KeyCode::ShiftLeft);
-            state.loot_shift = None;
-        }
-    }
 
     // ── Layer ──
     let layer = pad.map_or("bare", |p| {
@@ -392,7 +432,7 @@ fn drive_pad(
     if layer != state.layer {
         state.layer = layer;
         fire(
-            &mut script,
+            script,
             "BENILLAPAD_LAYER",
             vec![ScriptValue::Str(layer.to_string())],
         );
@@ -405,13 +445,13 @@ fn drive_pad(
         if pad.is_none_or(|p| !p.pressed(button)) {
             let (_, _, latched) = state.buttons.swap_remove(i);
             match latched {
-                Latched::Command(command) => release(&script, &command),
+                Latched::Command(command) => release(script, &command),
                 Latched::Nav => fire(
-                    &mut script,
+                    script,
                     "BENILLAPAD_NAV",
                     vec![ScriptValue::Str(name.to_string()), ScriptValue::Bool(false)],
                 ),
-                Latched::Mouse(b) => mouse.release(b),
+                Latched::Mouse(b) => input.button(b, false),
                 Latched::Done => {}
             }
         } else {
@@ -422,7 +462,7 @@ fn drive_pad(
         for (button, name) in map::BUTTONS {
             if pad.just_released(button) {
                 fire(
-                    &mut script,
+                    script,
                     "BENILLAPAD_BUTTON",
                     vec![ScriptValue::Str(name.to_string()), ScriptValue::Bool(false)],
                 );
@@ -431,13 +471,13 @@ fn drive_pad(
                 continue;
             }
             fire(
-                &mut script,
+                script,
                 "BENILLAPAD_BUTTON",
                 vec![ScriptValue::Str(name.to_string()), ScriptValue::Bool(true)],
             );
             if !world {
                 fire(
-                    &mut script,
+                    script,
                     "BENILLAPAD_NAV",
                     vec![ScriptValue::Str(name.to_string()), ScriptValue::Bool(true)],
                 );
@@ -445,13 +485,9 @@ fn drive_pad(
                 continue;
             }
             if cursor {
-                if let Some(latched) = cursor_press(
-                    &script,
-                    name,
-                    window.as_deref_mut(),
-                    &mut mouse,
-                    &mut scroll,
-                ) {
+                if let Some(latched) =
+                    cursor_press(script, name, window.as_mut(), &mut input, &mut scroll)
+                {
                     state.buttons.push((button, name, latched));
                     continue;
                 }
@@ -459,7 +495,7 @@ fn drive_pad(
             if typing {
                 continue;
             }
-            let latched = match resolve(&script, &mut state, addon, name, layer) {
+            let latched = match resolve(script, &mut state, addon, name, layer) {
                 Some(command) if command == "@INTERACT" => {
                     let now = time.elapsed_secs();
                     // The UI knows at once whether there is a target; the mirror's own record of
@@ -475,15 +511,7 @@ fn drive_pad(
                     } else {
                         interacting.with_soft_target(state.last_target);
                     }
-                    // Loot everything: hold Shift over the loot window's opening, unless
-                    // benilla's own auto-loot is on, where Shift would turn it off.
-                    let auto = script
-                        .eval::<bool>("return GetCVar('autoLootDefault') == '1'")
-                        .unwrap_or(false);
-                    if settings.loot_all && !auto && state.loot_shift.is_none() {
-                        keys.press(KeyCode::ShiftLeft);
-                        state.loot_shift = Some(now + LOOT_SHIFT_SECS);
-                    }
+                    // A plain right-click: the game's own auto-loot setting decides the loot.
                     Latched::Done
                 }
                 Some(command) if command.starts_with('@') => {
@@ -491,7 +519,7 @@ fn drive_pad(
                     Latched::Done
                 }
                 Some(command) => {
-                    press(&script, &command);
+                    press(script, &command);
                     Latched::Command(command)
                 }
                 None => Latched::Done,
@@ -505,10 +533,10 @@ fn drive_pad(
 
     // ── Outside the world mode the sticks belong to the addon's window ──
     if !world {
-        release_moves(&script, &mut state);
-        set_look(&script, &mut state, false);
+        release_moves(script, &mut state);
+        set_look(script, &mut state, false);
         fire(
-            &mut script,
+            script,
             "BENILLAPAD_STICK",
             vec![
                 ScriptValue::Number(left.x as f64),
@@ -524,10 +552,10 @@ fn drive_pad(
     let want = map::move_commands(left, settings.deadzone);
     for (k, command) in map::MOVES.iter().enumerate() {
         if state.moves[k] && !want[k] {
-            release(&script, command);
+            release(script, command);
             state.moves[k] = false;
         } else if !state.moves[k] && want[k] && !typing {
-            press(&script, command);
+            press(script, command);
             state.moves[k] = true;
         }
     }
@@ -535,8 +563,8 @@ fn drive_pad(
     // ── Right stick ── in the cursor mode, the mouse cursor.
     let right_live = right.length() >= settings.deadzone;
     if cursor {
-        set_look(&script, &mut state, false);
-        if let (Some(w), true) = (window.as_deref_mut(), right_live) {
+        set_look(script, &mut state, false);
+        if let (Some(w), true) = (window.as_mut(), right_live) {
             move_cursor(w, right, &settings, &time);
         }
         return;
@@ -561,7 +589,7 @@ fn drive_pad(
         }
     }
     set_look(
-        &script,
+        script,
         &mut state,
         (right_live || left_live) && !typing && !zooming,
     );
@@ -571,7 +599,7 @@ fn drive_pad(
         let units = settings.look_speed * time.delta_secs() / LOOK_RAD_PER_UNIT * mag;
         // Mouse +y is down, which pitches the view down; stick +y is up.
         let y = if settings.invert_y { dir.y } else { -dir.y };
-        motion.delta += Vec2::new(dir.x, y) * units;
+        input.writes.motion += Vec2::new(dir.x, y) * units;
     }
 }
 
@@ -600,42 +628,133 @@ fn glue_input(button: GamepadButton) -> Option<GlueInput> {
     })
 }
 
-/// A key edge as the keyboard would send it: the button plane for `just_pressed` readers and the
-/// message for the ones that read events (Tab on the login screen).
-fn glue_key(
-    key: KeyCode,
-    down: bool,
-    keys: &mut ButtonInput<KeyCode>,
-    events: &mut MessageWriter<KeyboardInput>,
-) {
-    if down {
-        keys.press(key);
-    } else {
-        keys.release(key);
-    }
-    events.write(KeyboardInput {
-        key_code: key,
-        logical_key: Key::Unidentified(bevy::input::keyboard::NativeKey::Unidentified),
-        state: if down {
+/// The keyboard and mouse as the pad plays them: each edge goes on bevy's button plane, as a typed
+/// message, and as a window event, which benilla's input records are read from in arrival order.
+#[derive(SystemParam)]
+struct SynthInput<'w> {
+    /// The key plane and the look motion, which benilla's call host reads: written by
+    /// [`apply_pad_writes`] after the hosted pass.
+    writes: ResMut<'w, PadWrites>,
+    mouse: ResMut<'w, ButtonInput<MouseButton>>,
+    key_events: MessageWriter<'w, KeyboardInput>,
+    button_events: MessageWriter<'w, MouseButtonInput>,
+    window_events: MessageWriter<'w, WindowEvent>,
+}
+
+impl SynthInput<'_> {
+    fn state(down: bool) -> ButtonState {
+        if down {
             ButtonState::Pressed
         } else {
             ButtonState::Released
-        },
-        text: None,
-        repeat: false,
-        window: Entity::PLACEHOLDER,
-    });
+        }
+    }
+
+    /// A key held or let go on bevy's plane alone, as [`apply_pad_writes`] applies it.
+    fn plane(&mut self, key: KeyCode, down: bool) {
+        self.writes.keys.push((key, down));
+    }
+
+    /// A key edge as the keyboard would send it.
+    fn key(&mut self, key: KeyCode, down: bool) {
+        self.plane(key, down);
+        let ev = KeyboardInput {
+            key_code: key,
+            logical_key: Key::Unidentified(bevy::input::keyboard::NativeKey::Unidentified),
+            state: Self::state(down),
+            text: None,
+            repeat: false,
+            window: Entity::PLACEHOLDER,
+        };
+        self.key_events.write(ev.clone());
+        self.window_events.write(WindowEvent::KeyboardInput(ev));
+    }
+
+    /// A mouse button edge at the window's cursor, as the mouse would send it.
+    fn button(&mut self, button: MouseButton, down: bool) {
+        if down {
+            self.mouse.press(button);
+        } else {
+            self.mouse.release(button);
+        }
+        let ev = MouseButtonInput {
+            button,
+            state: Self::state(down),
+            window: Entity::PLACEHOLDER,
+        };
+        self.button_events.write(ev);
+        self.window_events.write(WindowEvent::MouseButtonInput(ev));
+    }
 }
 
-fn release_glue(
-    input: GlueInput,
-    mouse: &mut ButtonInput<MouseButton>,
-    keys: &mut ButtonInput<KeyCode>,
-    events: &mut MessageWriter<KeyboardInput>,
+/// What the hosted pass leaves for [`apply_pad_writes`]: benilla's call host reads the key plane and
+/// the mouse motion, so the system that lends it may not write them.
+#[derive(Resource, Default)]
+struct PadWrites {
+    keys: Vec<(KeyCode, bool)>,
+    motion: Vec2,
+}
+
+/// Where the hosted pass moved the cursor, for [`apply_pad_writes`]: the call host reads the window.
+#[derive(Resource, Default)]
+struct PadCursorTo(Option<Vec2>);
+
+/// The window as the hosted pass sees it: its size and cursor, with a move it makes kept in
+/// [`PadCursorTo`] and read back by the pass's later steps.
+struct CursorWindow<'a> {
+    window: &'a Window,
+    to: &'a mut Option<Vec2>,
+}
+
+impl<'a> CursorWindow<'a> {
+    fn new(window: &'a Window, to: &'a mut Option<Vec2>) -> Self {
+        Self { window, to }
+    }
+
+    fn width(&self) -> f32 {
+        self.window.width()
+    }
+
+    fn height(&self) -> f32 {
+        self.window.height()
+    }
+
+    fn cursor_position(&self) -> Option<Vec2> {
+        self.to.or_else(|| self.window.cursor_position())
+    }
+
+    fn set_cursor_position(&mut self, at: Option<Vec2>) {
+        *self.to = at;
+    }
+}
+
+/// The hosted pass's writes to what benilla's call host reads, applied after it in the same frame.
+fn apply_pad_writes(
+    mut writes: ResMut<PadWrites>,
+    mut cursor_to: ResMut<PadCursorTo>,
+    mut keys: ResMut<ButtonInput<KeyCode>>,
+    mut motion: ResMut<AccumulatedMouseMotion>,
+    mut windows: Query<&mut Window, With<PrimaryWindow>>,
 ) {
-    match input {
-        GlueInput::Key(k) => glue_key(k, false, keys, events),
-        GlueInput::Mouse(b) => mouse.release(b),
+    for (key, down) in writes.keys.drain(..) {
+        if down {
+            keys.press(key);
+        } else {
+            keys.release(key);
+        }
+    }
+    motion.delta += std::mem::take(&mut writes.motion);
+    if let Some(at) = cursor_to.0.take() {
+        if let Ok(mut window) = windows.single_mut() {
+            window.set_cursor_position(Some(at));
+        }
+    }
+}
+
+fn release_glue(held: GlueInput, input: &mut SynthInput) {
+    match held {
+        GlueInput::Key(k) => input.key(k, false),
+        GlueInput::Mouse(b) => input.button(b, false),
     }
 }
 
@@ -644,17 +763,15 @@ fn drive_glue(
     pad: Option<&Gamepad>,
     settings: &PadSettings,
     time: &Time,
-    window: Option<&mut Window>,
-    mouse: &mut ButtonInput<MouseButton>,
-    keys: &mut ButtonInput<KeyCode>,
-    events: &mut MessageWriter<KeyboardInput>,
+    window: Option<&mut CursorWindow>,
+    synth: &mut SynthInput,
     held: &mut Vec<(GamepadButton, GlueInput)>,
 ) {
     let mut i = 0;
     while i < held.len() {
         let (button, input) = held[i];
         if pad.is_none_or(|p| !p.pressed(button)) {
-            release_glue(input, mouse, keys, events);
+            release_glue(input, synth);
             held.swap_remove(i);
         } else {
             i += 1;
@@ -669,8 +786,8 @@ fn drive_glue(
         }
         if let Some(input) = glue_input(button) {
             match input {
-                GlueInput::Key(k) => glue_key(k, true, keys, events),
-                GlueInput::Mouse(b) => mouse.press(b),
+                GlueInput::Key(k) => synth.key(k, true),
+                GlueInput::Mouse(b) => synth.button(b, true),
             }
             held.push((button, input));
         }
@@ -682,7 +799,7 @@ fn drive_glue(
 }
 
 /// The right stick as the mouse cursor: faster the further it is pushed.
-fn move_cursor(w: &mut Window, right: Vec2, settings: &PadSettings, time: &Time) {
+fn move_cursor(w: &mut CursorWindow, right: Vec2, settings: &PadSettings, time: &Time) {
     let speed = settings.cursor_speed * deflection(right.length(), settings.deadzone).powf(1.5);
     let at = w
         .cursor_position()
@@ -699,17 +816,17 @@ fn move_cursor(w: &mut Window, right: Vec2, settings: &PadSettings, time: &Time)
 fn cursor_press(
     script: &UiScript,
     name: &str,
-    window: Option<&mut Window>,
-    mouse: &mut ButtonInput<MouseButton>,
+    window: Option<&mut CursorWindow>,
+    input: &mut SynthInput,
     scroll: &mut AccumulatedMouseScroll,
 ) -> Option<Latched> {
     match name {
         "A" => {
-            mouse.press(MouseButton::Left);
+            input.button(MouseButton::Left, true);
             Some(Latched::Mouse(MouseButton::Left))
         }
         "X" => {
-            mouse.press(MouseButton::Right);
+            input.button(MouseButton::Right, true);
             Some(Latched::Mouse(MouseButton::Right))
         }
         "B" => {
@@ -733,7 +850,7 @@ fn cursor_press(
 }
 
 /// Move the cursor to the button `BenillaPad_Snap(dir, x, y)` names, if it names one.
-fn snap(script: &UiScript, window: &mut Window, dir: &str) {
+fn snap(script: &UiScript, window: &mut CursorWindow, dir: &str) {
     let h = window.height();
     let px_per_unit = h / UI_HEIGHT;
     let at = window

@@ -94,8 +94,8 @@ fn every_addon_command_has_a_binding_row() {
     }
 }
 
-/// Every event the Rust side fires reaches the addon's listeners through `fire_event`, the path
-/// the game takes (a direct call would skip the frame's `RegisterEvent`).
+/// Every event the Rust side fires reaches the addon's listeners through [`crate::fire`]: 1.12's
+/// `RegisterEvent` ignores the pad's own names, so `fire_event` would reach no one.
 #[test]
 fn every_fired_event_reaches_the_listeners() {
     use benilla_ui::script::ScriptValue;
@@ -113,7 +113,7 @@ fn every_fired_event_reaches_the_listeners() {
         ("BENILLAPAD_DISCONNECTED", Vec::new()),
     ];
     for (event, args) in fired {
-        script.fire_event(event, args);
+        crate::fire(&mut script, event, args);
         assert!(
             script
                 .eval::<bool>(&format!("return BenillaPadSeen['{event}'] == true"))
@@ -121,6 +121,42 @@ fn every_fired_event_reaches_the_listeners() {
             "{event} never reached the addon"
         );
     }
+}
+
+/// The round cooldown sweep follows `CooldownFrame_SetTimer`'s contract and drops its right half
+/// past six o'clock.
+#[test]
+fn the_round_sweep_shades_what_is_still_cooling() {
+    let mut script = loaded();
+    // A process clock well past zero, as the app seeds it: the contract wants `start > 0`.
+    script.set_now(1000.0);
+    script
+        .run(
+            "SweepHost = CreateFrame('Frame', nil, UIParent) SweepHost:SetWidth(46) \
+             SweepHost:SetHeight(46) Sweep = BenillaPad.NewRoundSweep(SweepHost, 40)",
+        )
+        .expect("build the sweep");
+    let state = |start: &str, enable: u8| {
+        script
+            .eval::<(bool, bool, bool)>(&format!(
+                "BenillaPad.SetSweep(Sweep, {start}, 10, {enable}) \
+                 return Sweep:IsShown() == 1, Sweep.left:IsShown() == 1, \
+                 Sweep.right:IsShown() == 1"
+            ))
+            .expect("set the sweep")
+    };
+    assert_eq!(
+        state("GetTime() - 2", 1),
+        (true, true, true),
+        "a fifth gone"
+    );
+    assert_eq!(state("GetTime() - 7", 1), (true, true, false), "past half");
+    assert_eq!(state("GetTime() - 11", 1), (false, true, false), "over");
+    assert_eq!(
+        state("GetTime() - 2", 0),
+        (false, true, false),
+        "not enabled"
+    );
 }
 
 /// Every art file the Lua names (`ART .. "Name"`) is shipped, so no button draws blank.
@@ -166,4 +202,17 @@ fn a_bare_vm_reads_as_before_the_world() {
     assert!(!script
         .eval::<bool>("return UIParent ~= nil")
         .expect("the check answers"));
+}
+
+/// The pad's systems schedule beside benilla's call host: `drive_pad` lends it, so it may not also
+/// write what the host reads (the key plane, the mouse motion, the window), which Bevy refuses at
+/// startup.
+#[test]
+fn the_pad_systems_take_no_access_the_call_host_conflicts_with() {
+    use bevy::prelude::*;
+    let mut world = World::new();
+    let mut drive = IntoSystem::into_system(crate::drive_pad);
+    drive.initialize(&mut world);
+    let mut apply = IntoSystem::into_system(crate::apply_pad_writes);
+    apply.initialize(&mut world);
 }

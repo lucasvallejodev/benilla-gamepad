@@ -70,8 +70,6 @@ Menu.pages = {
         rows = {
             { label = "Cast spells on press", desc = "On: a spell casts when the button goes down. Off: when it comes up, as 1.12's keys do.",
                 key = "castOnPress" },
-            { label = "Interact loots everything", desc = "X on a corpse takes all its loot at once, as a Shift-click does.",
-                key = "interactLootAll" },
             { label = "A / B / X / Y with no trigger",
                 desc = "Game actions: Jump, Interact, Back, Inspect. Spells: their own action slots, like the D-pad.",
                 key = "faceSpells", values = { { false, "Game actions" }, { true, "Spells" } } },
