@@ -262,6 +262,14 @@ pub(crate) fn drive_policy(
                     }
                 }
             }
+        } else if !crate::run_mode::unattended() {
+            // Deviation: the kept credentials (`benilla-config/autologin.txt`), once per start,
+            // for a person at the screen; a scripted run logs in only through the environment.
+            if let Some((user, pass)) = load_autologin() {
+                info!("login: auto-login as {user} from autologin.txt");
+                attempt.intent.creds = Some((user, pass));
+                attempt.intent.retry_at = Some(now);
+            }
         }
     }
 
@@ -396,6 +404,49 @@ fn drive_quit(arm: Option<Res<QuitArm>>, time: Res<Time>, mut exit: MessageWrite
     }
 }
 
+// ── The kept auto-login ──────────────────────────────────────────────────────────────────────────
+
+/// The kept auto-login credentials ([`crate::local_state::autologin_path`]), account then password.
+pub(crate) fn load_autologin() -> Option<(String, String)> {
+    parse_autologin(&std::fs::read_to_string(crate::local_state::autologin_path()?).ok()?)
+}
+
+/// `account=` and `password=` lines, either order; `#` starts a comment. Both must be there.
+fn parse_autologin(text: &str) -> Option<(String, String)> {
+    let field = |key: &str| {
+        text.lines()
+            .map(str::trim)
+            .filter(|l| !l.starts_with('#'))
+            .filter_map(|l| l.strip_prefix(key)?.trim_start().strip_prefix('='))
+            .map(|v| v.trim().to_string())
+            .find(|v| !v.is_empty())
+    };
+    Some((field("account")?, field("password")?))
+}
+
+/// Keep `creds` for the next start, or with `None` forget them.
+pub(crate) fn save_autologin(creds: Option<(&str, &str)>) {
+    let Some(path) = crate::local_state::autologin_path() else {
+        return;
+    };
+    let result = match creds {
+        Some((user, pass)) => {
+            let text = format!(
+                "# benilla logs in with these at start (the login screen's \"Log in \
+                 automatically\").\naccount={user}\npassword={pass}\n"
+            );
+            path.parent()
+                .map_or(Ok(()), std::fs::create_dir_all)
+                .and_then(|()| std::fs::write(&path, text))
+        }
+        None if path.exists() => std::fs::remove_file(&path),
+        None => Ok(()),
+    };
+    if let Err(e) = result {
+        warn!("login: could not update {}: {e}", path.display());
+    }
+}
+
 // ── The login shot ───────────────────────────────────────────────────────────────────────────────
 
 /// `WOW_LOGIN_SHOT_OUT=<path>`: one PNG of the login screen once it has settled.
@@ -428,6 +479,19 @@ fn debug_login_shot(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `autologin.txt` takes either order, spaces round `=` and comments; both lines or nothing.
+    #[test]
+    fn the_autologin_file_reads_account_and_password() {
+        let both = "# mine\npassword = hunter2\naccount=user\n";
+        assert_eq!(
+            parse_autologin(both),
+            Some(("user".to_string(), "hunter2".to_string()))
+        );
+        assert_eq!(parse_autologin("account=user\n"), None);
+        assert_eq!(parse_autologin("account=user\npassword=\n"), None);
+        assert_eq!(parse_autologin("#account=user\npassword=x\n"), None);
+    }
 
     /// `drive_policy` alone with the env fast path spent, so an ambient `WOW_USER` cannot seed
     /// credentials.

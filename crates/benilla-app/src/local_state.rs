@@ -283,6 +283,13 @@ pub(crate) fn legacy_account_path() -> Option<PathBuf> {
     home().map(|h| h.join("account"))
 }
 
+/// `benilla-config/autologin.txt`: the account and password a start logs in with by itself
+/// (`account=` and `password=` lines, plain text), written by the login screen's "Log in
+/// automatically" tick or by hand. Deviation: 1.12 remembers the account name only.
+pub(crate) fn autologin_path() -> Option<PathBuf> {
+    home().map(|h| h.join("autologin.txt"))
+}
+
 /// `benilla-config/chat/<realm>-<character>.txt`: the chat setup, the whole record of the
 /// reference's per-character `chat-cache.txt` (its channels, colours and windows), in its grammar;
 /// [`crate::ui_chat`] owns the shape.

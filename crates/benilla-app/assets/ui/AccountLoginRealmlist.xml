@@ -88,7 +88,77 @@
                 GlueDialog_Show("BENILLA_REALMLIST", nil, BENILLA_REALMLIST);
             end
         end
+
+        -- Deviation: "Log in automatically", on the row of the stock "Remember Account Name"
+        -- tick (1.12 remembers the name only). The host keeps BENILLA_AUTOLOGIN: 1 when it holds
+        -- credentials; ticked, the next login's are kept in benilla-config/autologin.txt and a
+        -- start logs in with them; unticking sets BENILLA_AUTOLOGIN_FORGET, which drops them.
+        function BenillaAutoLogin_OnLoad()
+            local check = this;
+            local kids = { AccountLoginUI:GetChildren() };
+            for i = 1, table.getn(kids) do
+                local kid = kids[i];
+                if ( kid ~= check and kid:GetObjectType() == "CheckButton" ) then
+                    check:SetWidth(kid:GetWidth());
+                    check:SetHeight(kid:GetHeight());
+                    check:ClearAllPoints();
+                    check:SetPoint("LEFT", kid, "LEFT", 200, 0);
+                    return;
+                end
+            end
+        end
+
+        function BenillaAutoLogin_OnClick()
+            if ( this:GetChecked() ) then
+                BENILLA_AUTOLOGIN = 1;
+                PlaySound("igMainMenuOptionCheckBoxOff");
+            else
+                BENILLA_AUTOLOGIN = 0;
+                BENILLA_AUTOLOGIN_FORGET = 1;
+                PlaySound("igMainMenuOptionCheckBoxOn");
+            end
+        end
     </Script>
+    <CheckButton name="BenillaAutoLoginButton" parent="AccountLoginUI">
+        <Size>
+            <AbsDimension x="32" y="32"/>
+        </Size>
+        <Anchors>
+            <Anchor point="BOTTOMLEFT">
+                <Offset>
+                    <AbsDimension x="224" y="140"/>
+                </Offset>
+            </Anchor>
+        </Anchors>
+        <Layers>
+            <Layer level="ARTWORK">
+                <FontString name="BenillaAutoLoginText" inherits="GlueFontNormalSmall" text="Log in automatically">
+                    <Anchors>
+                        <Anchor point="LEFT" relativePoint="RIGHT">
+                            <Offset>
+                                <AbsDimension x="-2" y="0"/>
+                            </Offset>
+                        </Anchor>
+                    </Anchors>
+                </FontString>
+            </Layer>
+        </Layers>
+        <Scripts>
+            <OnLoad>
+                BenillaAutoLogin_OnLoad();
+            </OnLoad>
+            <OnShow>
+                this:SetChecked(BENILLA_AUTOLOGIN == 1);
+            </OnShow>
+            <OnClick>
+                BenillaAutoLogin_OnClick();
+            </OnClick>
+        </Scripts>
+        <NormalTexture file="Interface\Buttons\UI-CheckBox-Up"/>
+        <PushedTexture file="Interface\Buttons\UI-CheckBox-Down"/>
+        <HighlightTexture file="Interface\Buttons\UI-CheckBox-Highlight" alphaMode="ADD"/>
+        <CheckedTexture file="Interface\Buttons\UI-CheckBox-Check"/>
+    </CheckButton>
     <Button name="BenillaRealmlistButton" inherits="GlueButtonSmallTemplate" parent="AccountLoginUI" text="Realmlist">
         <Anchors>
             <Anchor point="BOTTOM" relativeTo="AccountLoginCinematicsButton" relativePoint="TOP">

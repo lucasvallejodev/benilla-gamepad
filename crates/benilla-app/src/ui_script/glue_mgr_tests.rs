@@ -1872,6 +1872,39 @@ fn default_server_login_opens_its_dialog_in_the_call() {
     assert!(matches!(m.login_out.as_slice(), [GlueLogin::Submit { .. }]));
 }
 
+/// A login typed with "Log in automatically" ticked is kept in `autologin.txt` once the frame
+/// runs, though the verb reached the seated manager inside Lua; unticked, nothing is kept.
+#[test]
+fn a_ticked_login_is_kept_for_the_next_start() {
+    use crate::local_state::test_env::{EnvGuard, ENV_LOCK};
+    let _lock = ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = std::env::temp_dir().join(format!("benilla-autologin-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let _home = EnvGuard::set("BENILLA_HOME", dir.to_str().unwrap());
+    let _capture = EnvGuard::unset("WOW_CAPTURE");
+    let shared = SharedGlueMgr::default();
+    let s = seated(&shared);
+    s.set_glue_notice(GlueNotice::Tos, NoticeState::from_cvar("1"));
+    s.set_glue_notice(GlueNotice::Eula, NoticeState::from_cvar("1"));
+
+    s.run("BENILLA_AUTOLOGIN = 0 DefaultServerLogin('lucas', 'pw')")
+        .unwrap();
+    keep_typed_login(&mut shared.get_mut(), &s);
+    assert_eq!(crate::glue_session::login::load_autologin(), None);
+
+    shared.get_mut().state = ScreenState::Idle;
+    s.run("BENILLA_AUTOLOGIN = 1 DefaultServerLogin('lucas', 'pw')")
+        .unwrap();
+    keep_typed_login(&mut shared.get_mut(), &s);
+    assert_eq!(
+        crate::glue_session::login::load_autologin(),
+        Some(("lucas".to_string(), "pw".to_string()))
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// `StatusDialogClick` (`0x46d270` → `0x46b720`): in state 9 the list is asked again
 /// (`0x46b767` → `0x46b880`), state 3 and its dialog in the call; in state 2 the operation is
 /// cancelled and the roster torn down (`0x46b754` → `0x472580`), its two events in the call.

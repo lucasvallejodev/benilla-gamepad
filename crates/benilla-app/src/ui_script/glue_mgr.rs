@@ -588,6 +588,9 @@ impl Default for LoginCells {
 #[derive(Default)]
 pub(crate) struct GlueMgr {
     pub(crate) state: ScreenState,
+    /// The last typed login's account and password, for the frame to keep when the "Log in
+    /// automatically" tick is on ([`keep_autologin`]); the verb runs inside Lua, with no VM here.
+    typed_login: Option<(String, String)>,
     cells: LoginCells,
     /// Authenticated, waiting for the next tick (`[0xb41e18]`).
     auth_final: bool,
@@ -758,6 +761,7 @@ impl GlueMgr {
             self.open("OKAY", Some(Text::Key("LOGIN_ENTER_PASSWORD")));
             return;
         }
+        self.typed_login = Some((account.clone(), password.clone()));
         self.begin_logon();
         self.outbox.push(Outgoing::Begin(Step::Logon {
             account,
@@ -2055,6 +2059,8 @@ pub(crate) fn drive_glue_mgr(
                 for call in s.take_glue_calls() {
                     mgr.call(call);
                 }
+                keep_typed_login(&mut mgr, s);
+                keep_autologin(s, false);
                 for request in s.take_glue_requests() {
                     match request {
                         GlueRequest::PlayGlueMusic(file) => {
@@ -2293,6 +2299,46 @@ fn seat_glue(
     }
     mgr.take_refusal();
     seed(&mut mgr, s, realmlist);
+    keep_autologin(s, true);
+}
+
+/// The "Log in automatically" tick (`AccountLoginRealmlist.xml`) is the global
+/// `BENILLA_AUTOLOGIN`, 1 or 0. A new glue VM gets 1 when credentials are kept; unticking also
+/// sets `BENILLA_AUTOLOGIN_FORGET`, which forgets them once.
+fn keep_autologin(script: &UiScript, seat: bool) {
+    let g = script.lua().globals();
+    if seat {
+        let kept = crate::glue_session::login::load_autologin().is_some();
+        let _ = g.set("BENILLA_AUTOLOGIN", i64::from(kept));
+    } else if g
+        .get::<Option<i64>>("BENILLA_AUTOLOGIN_FORGET")
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        let _ = g.set("BENILLA_AUTOLOGIN_FORGET", None::<i64>);
+        crate::glue_session::login::save_autologin(None);
+    }
+}
+
+/// A login the screen typed (inside its verb, or queued before the VM was seated), kept for the
+/// next start when the tick is on.
+pub(super) fn keep_typed_login(mgr: &mut GlueMgr, script: &UiScript) {
+    if let Some((account, password)) = mgr.typed_login.take() {
+        if autologin_ticked(script) {
+            crate::glue_session::login::save_autologin(Some((&account, &password)));
+        }
+    }
+}
+
+fn autologin_ticked(script: &UiScript) -> bool {
+    script
+        .lua()
+        .globals()
+        .get::<Option<i64>>("BENILLA_AUTOLOGIN")
+        .ok()
+        .flatten()
+        == Some(1)
 }
 
 /// The glue build's seating ([`seat_glue`]) inside the build, before its first `SET_GLUE_SCREEN`:
