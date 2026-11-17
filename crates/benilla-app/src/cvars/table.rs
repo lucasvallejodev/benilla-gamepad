@@ -903,12 +903,28 @@ pub(crate) const REGISTERED: &[Registered] = &[
     // (`0x82e8c8`), "... the Scanning notice" (`0x82e89c`) and "... the Contest notice"
     // (`0x82e86c`). The glue manager reads them once at startup (`0x46a400`) as accepted (1) and
     // changed (negative), and its `Accept*` writes "1" (`0x46aef0` and its siblings).
-    //
-    // benilla-gamepad fork: the agreements default to accepted. The install carries no loose
-    // `eula.html`/`tos.html`, so the reference's flow showed an empty agreement whose Accept never
-    // enabled (it waits for a scroll to the end), which locked a fresh install out of the login.
-    same("readTOS", "1"),
-    same("readEULA", "1"),
-    same("readScanning", "1"),
-    same("readContest", "1"),
+    deviates(
+        "readTOS",
+        "1",
+        "0",
+        "fork: no loose eula.html in the install, so the agreement showed empty, never acceptable",
+    ),
+    deviates(
+        "readEULA",
+        "1",
+        "0",
+        "fork: no loose eula.html in the install, so the agreement showed empty, never acceptable",
+    ),
+    deviates(
+        "readScanning",
+        "1",
+        "0",
+        "fork: no loose eula.html in the install, so the agreement showed empty, never acceptable",
+    ),
+    deviates(
+        "readContest",
+        "1",
+        "0",
+        "fork: no loose eula.html in the install, so the agreement showed empty, never acceptable",
+    ),
 ];
