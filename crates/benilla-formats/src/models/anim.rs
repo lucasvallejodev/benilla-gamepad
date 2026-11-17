@@ -546,6 +546,11 @@ pub fn parse_m2_animations(b: &[u8]) -> Vec<ModelAnimation> {
     if b.len() < 0x11c || &b[0..4] != b"MD20" {
         return Vec::new();
     }
+    // benilla-gamepad fork: only the 1.12 layouts (versions 256-263). A later one (Project
+    // Reforged ships v264 models) reads these offsets as garbage ranges that can ask for gigabytes.
+    if !(256..=263).contains(&le_u32(b, 4)) {
+        return Vec::new();
+    }
     let (seq_count, seq_ofs) = (le_u32(b, 0x1c) as usize, le_u32(b, 0x20) as usize);
     let (bone_count, bone_ofs) = (le_u32(b, 0x34) as usize, le_u32(b, 0x38) as usize);
     let vec3 = |b: &[u8], o: usize| [le_f32(b, o), le_f32(b, o + 4), le_f32(b, o + 8)];
@@ -786,10 +791,22 @@ pub fn parse_m2_global_sequence_bones(b: &[u8]) -> Vec<GlobalSeqBone> {
 mod tests {
     use super::*;
 
+    /// A post-1.12 layout (v264, Project Reforged's WotLK ports) answers no clips instead of
+    /// reading its header as 1.12's.
+    #[test]
+    fn a_later_model_version_has_no_clips() {
+        let mut b = vec![0u8; 0x200];
+        b[0..4].copy_from_slice(b"MD20");
+        b[4..8].copy_from_slice(&264u32.to_le_bytes());
+        b[0x1c..0x20].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(parse_m2_animations(&b).is_empty());
+    }
+
     #[test]
     fn hostile_event_and_key_counts_reserve_only_what_the_file_holds() {
         let mut b = vec![0u8; 0x11c];
         b[0..4].copy_from_slice(b"MD20");
+        b[4..8].copy_from_slice(&256u32.to_le_bytes());
         // u32::MAX events, of which exactly one is present …
         b[0x114..0x118].copy_from_slice(&u32::MAX.to_le_bytes());
         b[0x118..0x11c].copy_from_slice(&0x11cu32.to_le_bytes());

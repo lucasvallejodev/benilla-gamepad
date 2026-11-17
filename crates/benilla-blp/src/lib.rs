@@ -234,10 +234,14 @@ impl Header<'_> {
         if level > 0 && (sz == 0 || off == 0) {
             return Ok(None);
         }
-        bytes
-            .get(off..off + sz)
-            .map(Some)
-            .ok_or(Error::OutOfBounds { level })
+        match bytes.get(off..off.saturating_add(sz)) {
+            Some(data) => Ok(Some(data)),
+            // benilla-gamepad fork: a mip entry past the file's end (Project Reforged's paletted
+            // hair, its last level at end-of-file with a garbage size) ends the chain there, as the
+            // DXTC path's span does, instead of failing the whole texture.
+            None if level > 0 => Ok(None),
+            None => Err(Error::OutOfBounds { level }),
+        }
     }
 
     /// DXTC level `level` as the reference reads it: `bpp·max(4,w)·max(4,h)/8` bytes from the
