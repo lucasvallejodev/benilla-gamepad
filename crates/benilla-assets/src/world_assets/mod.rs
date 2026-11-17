@@ -1454,7 +1454,7 @@ mod tests {
         );
         for bytes in [
             refused_tga(24, 8, &[0; 24]),
-            refused_tga(2048, 8, &[0; 24]),
+            refused_tga(8192, 8, &[0; 24]),
             refused_tga(4, 8, &[0; 128]),
             refused_tga(0, 8, &[]),
             wide,
@@ -1599,10 +1599,10 @@ mod tests {
             (1, 1),
             (24, 8),
             (8, 24),
-            (1024, 8),
-            (8, 1024),
-            (1024, 1024),
-            (2048, 64),
+            // The fork's cap is 4096 (`makes_device_texture`).
+            (8192, 8),
+            (8, 8192),
+            (16384, 64),
         ] {
             assert_eq!(load(w, h), green(), "{w}x{h} is the solid green");
         }

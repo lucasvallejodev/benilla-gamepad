@@ -576,8 +576,8 @@ mod tests {
             Some((512, 8))
         );
 
-        // A size that is not a power of two below 1024 makes no texture.
-        for (w, h) in [(24, 8), (8, 1024), (1024, 8), (65535, 8), (12, 12)] {
+        // A size that is not a power of two up to the fork's cap (4096) makes no texture.
+        for (w, h) in [(24, 8), (8, 8192), (8192, 8), (65535, 8), (12, 12)] {
             assert_eq!(
                 tga_texture_size(&tga(2, w, h, 32, 0x28, &[0; 8])),
                 None,
