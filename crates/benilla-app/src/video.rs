@@ -328,6 +328,10 @@ pub(crate) struct VideoKnobs<'w> {
     widescreen: ResMut<'w, Widescreen>,
     water_quality: ResMut<'w, benilla_world::liquid::WaterQuality>,
     water_style: ResMut<'w, benilla_world::liquid::WaterStyle>,
+    // benilla-gamepad fork: the Modern look's three knobs.
+    look_model: ResMut<'w, benilla_world::modern::LookModel>,
+    look_quality: ResMut<'w, benilla_world::modern::LookQuality>,
+    auto_exposure: ResMut<'w, benilla_world::modern::look::AutoExposure>,
 }
 
 impl VideoKnobs<'_> {
@@ -352,6 +356,9 @@ impl VideoKnobs<'_> {
             widescreen,
             water_quality,
             water_style,
+            look_model,
+            look_quality,
+            auto_exposure,
         } = self;
         use benilla_world::view::{FARCLIP_RANGE, MSAA_RANGE};
         let v = ev.num();
@@ -383,6 +390,10 @@ impl VideoKnobs<'_> {
             "farclip" => view.farclip = v.clamp(*FARCLIP_RANGE.start(), *FARCLIP_RANGE.end()),
             "waterstyle" => **water_style = benilla_world::liquid::WaterStyle::from_cvar(v),
             "waterquality" => **water_quality = benilla_world::liquid::WaterQuality::from_cvar(v),
+            // benilla-gamepad fork: the Modern look's lanes are rebuilt each frame from these.
+            "lookmodel" => **look_model = benilla_world::modern::LookModel::from_cvar(v),
+            "lookquality" => **look_quality = benilla_world::modern::LookQuality::from_cvar(v),
+            "autoexposure" => auto_exposure.0 = ev.flag(),
             // Clamped, where the reference refuses an out-of-range write and keeps the value
             // (`0x688d90` echoes "NearClip must be in range 0.01 - 0.33" and returns 0).
             "nearclip" => view.set_nearclip(v),

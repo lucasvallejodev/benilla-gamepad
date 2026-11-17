@@ -135,6 +135,8 @@ pub mod mesh_tag;
 pub mod model_fade;
 pub mod model_forms;
 pub mod model_render;
+// benilla-gamepad fork: the Modern look over the reference picture.
+pub mod modern;
 pub mod modkeys;
 pub mod particles;
 pub mod ribbons;

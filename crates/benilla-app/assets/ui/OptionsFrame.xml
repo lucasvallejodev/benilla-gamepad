@@ -453,6 +453,20 @@
             .. "a snapshot taken from the water itself. The mirrors draw the world a second time "
             .. "near water and cost some frame rate."
 
+        -- benilla-gamepad fork: Modern Look and Auto Exposure, the fork's own rows; unchecked
+        -- Modern Look is the client's own picture.
+        BENILLA_TOOLTIP_LOOK_MODEL =
+            "Off presents the world the way the 1.12 client does.\n\n"
+            .. "Modern Look is this build's own: a filmic tone curve that keeps bright skies and "
+            .. "highlights from clipping, a soft bloom around the brightest light, and a gentle "
+            .. "colour grade with a vignette. The world itself is drawn as before; only the "
+            .. "finished picture changes, and the interface is never touched."
+        BENILLA_TOOLTIP_AUTO_EXPOSURE =
+            "Brightens the picture a little when the light is very dark - at night, or in a "
+            .. "gloomy zone - so the world stays visible. Daylight and dusk are left as they are, "
+            .. "and a night still reads as night.\n\n"
+            .. "Has no effect without Modern Look."
+
         -- 1.12's WINDOWED_MODE text describes a checkbox and exclusive-mode gamma.
         BENILLA_TOOLTIP_DISPLAY_MODE =
             "Windowed (Fullscreen) fills the screen with a borderless window; Windowed runs in "
@@ -487,6 +501,8 @@
                 "RowUiScale", "RowFarclip", "RowWorldDetail", "RowSpellDetail", "RowBrightness",
                 "RowWeatherDensity",
                 "RowDisplayMode", "RowVerticalSync", "RowRenderScale", "RowWaterStyle",
+                -- benilla-gamepad fork: the Modern look's rows.
+                "RowLookModel", "RowAutoExposure",
             },
             -- Guild Names and Player Titles are children of Player Names
             -- (UIOptionsFrame.lua:703-709).
@@ -2045,6 +2061,32 @@
                                                 -- materials, so it lands on the click.
                                                 BenillaOptionsRow_OnLoad(this, "waterStyle", "Improved Water",
                                                     "BENILLA_TOOLTIP_WATER_STYLE")
+                                            </OnLoad></Scripts>
+                                        </Frame>
+                                        <Frame name="$parentRowLookModel" inherits="BenillaOptionsCheckboxRowTemplate">
+                                            <Anchors>
+                                                <Anchor point="TOPLEFT" relativeTo="$parentRowWaterStyle" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                                                <Anchor point="TOPRIGHT" relativeTo="$parentRowWaterStyle" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                                            </Anchors>
+                                            <Scripts><OnLoad>
+                                                -- benilla-gamepad fork: Modern Look, `lookModel`.
+                                                -- Unchecked is the reference picture. Not
+                                                -- deferred: the look is the combine's lanes, so it
+                                                -- lands on the click.
+                                                BenillaOptionsRow_OnLoad(this, "lookModel", "Modern Look",
+                                                    "BENILLA_TOOLTIP_LOOK_MODEL")
+                                            </OnLoad></Scripts>
+                                        </Frame>
+                                        <Frame name="$parentRowAutoExposure" inherits="BenillaOptionsCheckboxRowTemplate">
+                                            <Anchors>
+                                                <Anchor point="TOPLEFT" relativeTo="$parentRowLookModel" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                                                <Anchor point="TOPRIGHT" relativeTo="$parentRowLookModel" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                                            </Anchors>
+                                            <Scripts><OnLoad>
+                                                -- benilla-gamepad fork: Auto Exposure,
+                                                -- `autoExposure`, the Modern look's exposure.
+                                                BenillaOptionsRow_OnLoad(this, "autoExposure", "Auto Exposure",
+                                                    "BENILLA_TOOLTIP_AUTO_EXPOSURE")
                                             </OnLoad></Scripts>
                                         </Frame>
                                     </Frames>

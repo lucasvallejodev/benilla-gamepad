@@ -31,6 +31,7 @@ use bevy::render::view::{ExtractedView, ViewDepthTexture, ViewTarget};
 use bevy::render::{Render, RenderApp, RenderStartup, RenderSystems};
 
 use crate::final_pass::FinalPassTarget;
+use crate::modern::LookLanes;
 use crate::view::WorldCamera;
 
 /// A camera running the FFXGlow pass: the frame's one gamma→linear decode, plus the glow add.
@@ -413,6 +414,10 @@ struct FfxGlowPipelines {
     downsample: CachedRenderPipelineId,
     /// Box4 with the water's excess in alpha (`fs_downsample_water`).
     downsample_water: CachedRenderPipelineId,
+    /// benilla-gamepad fork: the Modern look's twins of the two, decoded and unclamped
+    /// (`fs_downsample_hdr`, `fs_downsample_water_hdr`).
+    downsample_hdr: CachedRenderPipelineId,
+    downsample_water_hdr: CachedRenderPipelineId,
     gauss_h: CachedRenderPipelineId,
     gauss_v: CachedRenderPipelineId,
     combine: FfxCombinePipeline,
@@ -442,6 +447,8 @@ struct FfxCombineKey {
     improved: bool,
     /// The preview's water glow over the combine (`WATER_GLOW`).
     water: bool,
+    /// benilla-gamepad fork: the Modern look (`MODERN_LOOK`); `false` is the reference's combine.
+    modern: bool,
 }
 
 impl SpecializedRenderPipeline for FfxCombinePipeline {
@@ -463,6 +470,9 @@ impl SpecializedRenderPipeline for FfxCombinePipeline {
         }
         if key.water {
             shader_defs.push("WATER_GLOW".into());
+        }
+        if key.modern {
+            shader_defs.push("MODERN_LOOK".into());
         }
         RenderPipelineDescriptor {
             label: Some(label.into()),
@@ -529,7 +539,7 @@ fn init_pipelines(
                 texture_2d(TextureSampleType::Float { filterable: true }),
                 sampler(SamplerBindingType::Filtering),
                 texture_2d(TextureSampleType::Float { filterable: true }),
-                uniform_buffer_sized(false, Some(std::num::NonZero::new(32).unwrap())),
+                uniform_buffer_sized(false, Some(std::num::NonZero::new(64).unwrap())),
                 // In every combine's layout, dry included, so both entries share one bind group.
                 texture_2d(TextureSampleType::Float { filterable: true }),
                 sampler(SamplerBindingType::Filtering),
@@ -546,7 +556,7 @@ fn init_pipelines(
                 (2, texture_2d(TextureSampleType::Float { filterable: true })),
                 (
                     3,
-                    uniform_buffer_sized(false, Some(std::num::NonZero::new(32).unwrap())),
+                    uniform_buffer_sized(false, Some(std::num::NonZero::new(64).unwrap())),
                 ),
                 (4, texture_2d(TextureSampleType::Float { filterable: true })),
                 (5, sampler(SamplerBindingType::Filtering)),
@@ -618,17 +628,20 @@ fn init_pipelines(
                     layout: &BindGroupLayoutDescriptor,
                     entry: &'static str|
      -> RenderPipelineDescriptor {
+        let mut shader_defs: Vec<bevy::shader::ShaderDefVal> = Vec::new();
+        if entry.starts_with("fs_downsample_water") {
+            shader_defs.push("WATER_GLOW".into());
+        }
+        if entry.ends_with("_hdr") {
+            shader_defs.push("MODERN_LOOK".into());
+        }
         RenderPipelineDescriptor {
             label: Some(label.into()),
             layout: vec![layout.clone()],
             vertex: fullscreen_shader.to_vertex_state(),
             fragment: Some(FragmentState {
                 shader: shader.clone(),
-                shader_defs: if entry == "fs_downsample_water" {
-                    vec!["WATER_GLOW".into()]
-                } else {
-                    vec![]
-                },
+                shader_defs,
                 entry_point: Some(entry.into()),
                 targets: vec![Some(ColorTargetState {
                     format: ViewTarget::TEXTURE_FORMAT_HDR,
@@ -654,6 +667,20 @@ fn init_pipelines(
     } else {
         downsample
     };
+    let downsample_hdr = pipeline_cache.queue_render_pipeline(pipeline(
+        "ffx_glow_downsample_hdr",
+        &layout_filter,
+        "fs_downsample_hdr",
+    ));
+    let downsample_water_hdr = if benilla_assets::preview::on(benilla_assets::preview::GLOW) {
+        pipeline_cache.queue_render_pipeline(pipeline(
+            "ffx_glow_downsample_water_hdr",
+            &layout_filter_water,
+            "fs_downsample_water_hdr",
+        ))
+    } else {
+        downsample_hdr
+    };
     let gauss_h =
         pipeline_cache.queue_render_pipeline(pipeline("ffx_glow_h", &layout_filter, "fs_gauss_h"));
     let gauss_v =
@@ -674,6 +701,8 @@ fn init_pipelines(
         wave_sampler,
         downsample,
         downsample_water,
+        downsample_hdr,
+        downsample_water_hdr,
         gauss_h,
         gauss_v,
         combine,
@@ -686,8 +715,9 @@ fn init_pipelines(
 struct FfxGlowTextures {
     quarter_a: CachedTexture,
     quarter_b: CachedTexture,
-    /// The combine's 32-byte uniform, `(gain, death, haze, dither)` then the wave phases,
-    /// rewritten each frame by a queue write, which lands before the graph's submit.
+    /// The combine's 64-byte uniform, `(gain, death, haze, dither)`, the wave phases, then the
+    /// Modern look's two lanes ([`with_look`]), rewritten each frame by a queue write, which lands
+    /// before the graph's submit.
     gain_buf: Buffer,
     /// Cached: the Gauss passes bind only the ¼-res pair. The downsample and combine bind the main
     /// texture, which `post_process_write` flips per call on a `Write` view, so bind per frame.
@@ -700,9 +730,34 @@ struct FfxGlowTextures {
     uw_buf: Buffer,
 }
 
-/// One view's dry and underwater combine pipelines, and the key they were specialised on.
+/// One view's dry and underwater combine pipelines, Classic and Modern, and the key they were
+/// specialised on.
 #[derive(Clone, Copy)]
 struct FfxCombinePair {
+    classic: FfxCombineSet,
+    /// benilla-gamepad fork: the same entries under `MODERN_LOOK`.
+    modern: FfxCombineSet,
+    format: TextureFormat,
+    /// 1 for the combine's own pass, the view's count for a backdrop draw inside a 2D main pass.
+    samples: u32,
+}
+
+impl FfxCombinePair {
+    /// The pipeline the pass-list swap selects ([`FfxCombineSet::armed`]), Modern or Classic.
+    fn armed(
+        &self,
+        wave: bool,
+        improved: bool,
+        water: bool,
+        modern: bool,
+    ) -> CachedRenderPipelineId {
+        if modern { &self.modern } else { &self.classic }.armed(wave, improved, water)
+    }
+}
+
+/// One look's combine entries.
+#[derive(Clone, Copy)]
+struct FfxCombineSet {
     dry: CachedRenderPipelineId,
     wave: CachedRenderPipelineId,
     /// The improved underwater entry; `wave` itself while the preview's `tint` is off.
@@ -715,12 +770,9 @@ struct FfxCombinePair {
     /// preview's `mist` and `falls` are off.
     dry_veil: CachedRenderPipelineId,
     dry_veil_water: CachedRenderPipelineId,
-    format: TextureFormat,
-    /// 1 for the combine's own pass, the view's count for a backdrop draw inside a 2D main pass.
-    samples: u32,
 }
 
-impl FfxCombinePair {
+impl FfxCombineSet {
     /// The pipeline the pass-list swap selects: the underwater entry while the wave is armed, the
     /// improved one where that is armed too.
     fn armed(&self, wave: bool, improved: bool, water: bool) -> CachedRenderPipelineId {
@@ -733,6 +785,19 @@ impl FfxCombinePair {
             (false, false, false) => self.dry,
             (false, false, true) => self.dry_water,
         }
+    }
+
+    /// Every entry, for the readiness check of [`FfxModernReady`].
+    fn ids(&self) -> [CachedRenderPipelineId; 7] {
+        [
+            self.dry,
+            self.wave,
+            self.wave_uw,
+            self.dry_water,
+            self.wave_water,
+            self.dry_veil,
+            self.dry_veil_water,
+        ]
     }
 }
 
@@ -761,7 +826,7 @@ impl CombineSpecializer<'_> {
         gamma_out: bool,
         inside_2d: Option<u32>,
     ) -> FfxCombinePair {
-        let mut key = |wave, improved, water| {
+        let mut key = |wave, improved, water, modern| {
             self.cache.specialize(
                 &self.pipeline_cache,
                 &self.pipelines.combine,
@@ -772,6 +837,7 @@ impl CombineSpecializer<'_> {
                     inside_2d,
                     improved,
                     water,
+                    modern,
                 },
             )
         };
@@ -780,14 +846,19 @@ impl CombineSpecializer<'_> {
         let water = benilla_assets::preview::on(benilla_assets::preview::GLOW);
         let veil = benilla_assets::preview::on(benilla_assets::preview::MIST)
             || benilla_assets::preview::on(benilla_assets::preview::FALLS);
+        // Both looks, so a switch finds its pipelines compiled.
+        let mut set = |modern| FfxCombineSet {
+            dry: key(false, false, false, modern),
+            wave: key(true, false, false, modern),
+            wave_uw: key(true, improved, false, modern),
+            dry_water: key(false, false, water, modern),
+            wave_water: key(true, false, water, modern),
+            dry_veil: key(false, veil, false, modern),
+            dry_veil_water: key(false, veil, water, modern),
+        };
         FfxCombinePair {
-            dry: key(false, false, false),
-            wave: key(true, false, false),
-            wave_uw: key(true, improved, false),
-            dry_water: key(false, false, water),
-            wave_water: key(true, false, water),
-            dry_veil: key(false, veil, false),
-            dry_veil_water: key(false, veil, water),
+            classic: set(false),
+            modern: set(true),
             format,
             samples: inside_2d.unwrap_or(1),
         }
@@ -865,7 +936,7 @@ fn prepare_textures(
         );
         let gain_buf = render_device.create_buffer(&BufferDescriptor {
             label: Some("ffx_glow_gain"),
-            size: 32,
+            size: 64,
             usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -1006,11 +1077,14 @@ impl ViewNode for FfxGlowNode {
         );
         let improved = uw_depth.is_some();
         let water = water_glow.is_some();
+        let look = modern_lanes(world, glow);
+        let modern = look.is_some();
         let (Some(downsample), Some(gauss_h), Some(gauss_v)) = (
-            pipeline_cache.get_render_pipeline(if water {
-                pipelines.downsample_water
-            } else {
-                pipelines.downsample
+            pipeline_cache.get_render_pipeline(match (water, modern) {
+                (true, false) => pipelines.downsample_water,
+                (false, false) => pipelines.downsample,
+                (true, true) => pipelines.downsample_water_hdr,
+                (false, true) => pipelines.downsample_hdr,
             }),
             pipeline_cache.get_render_pipeline(pipelines.gauss_h),
             pipeline_cache.get_render_pipeline(pipelines.gauss_v),
@@ -1024,7 +1098,7 @@ impl ViewNode for FfxGlowNode {
             Some(pair) => {
                 // The pass-list swap (`0x6cc630`): the two lists differ only in the combine.
                 let Some(combine) =
-                    pipeline_cache.get_render_pipeline(pair.armed(wave, improved, water))
+                    pipeline_cache.get_render_pipeline(pair.armed(wave, improved, water, modern))
                 else {
                     return Ok(());
                 };
@@ -1038,8 +1112,8 @@ impl ViewNode for FfxGlowNode {
         let diagnostics = render_context.diagnostic_recorder();
 
         // With both zero the filter passes are skipped, and the stale, finite ¼-res target is
-        // multiplied by zero.
-        if blur_read(&uniform) {
+        // multiplied by zero. The Modern look always reads it, for its bloom.
+        if blur_read(&uniform) || modern {
             let layout_filter = pipeline_cache.get_bind_group_layout(&pipelines.layout_filter);
             // Per frame: a `Write` view flips its main texture per call ([`FfxGlowTextures`]).
             let down_bind = match &water_glow {
@@ -1112,7 +1186,7 @@ impl ViewNode for FfxGlowNode {
         world.resource::<RenderQueue>().write_buffer(
             &textures.gain_buf,
             0,
-            bytemuck::cast_slice(&uniform),
+            bytemuck::cast_slice(&with_look(uniform, look)),
         );
         // The combine into the view's output, bound per frame as the downsample is.
         let bind = match (uw, uw_depth.as_ref()) {
@@ -1254,6 +1328,49 @@ fn live_combine(world: &World, glow: &FfxGlow) -> ([f32; 8], bool) {
     (uniform, wave_armed(glow.state, wave, player))
 }
 
+/// benilla-gamepad fork: the Modern look's lanes a view's combine reads this frame: the world
+/// view's pass pair only ([`FfxState::Player`]), and only once every Modern pipeline has compiled
+/// ([`FfxModernReady`]), so a frame is Modern or Classic whole, its filter passes and combine alike.
+fn modern_lanes(world: &World, glow: &FfxGlow) -> Option<[f32; 8]> {
+    if glow.state != FfxState::Player || !world.resource::<FfxModernReady>().0 {
+        return None;
+    }
+    world.get_resource::<LookLanes>().and_then(|l| l.0)
+}
+
+/// The combine's whole uniform: the reference's two lanes, then the Modern look's two (`ffx.look`,
+/// `ffx.grade`), zero in a Classic frame, whose shader does not declare them.
+fn with_look(uniform: [f32; 8], look: Option<[f32; 8]>) -> [f32; 16] {
+    let mut out = [0.0; 16];
+    out[..8].copy_from_slice(&uniform);
+    if let Some(look) = look {
+        out[8..].copy_from_slice(&look);
+    }
+    out
+}
+
+/// benilla-gamepad fork: whether the Modern look's decoded downsamples and every combine pair's
+/// Modern entries have compiled. Until they have, a Modern frame draws Classic.
+#[derive(Resource, Default)]
+struct FfxModernReady(bool);
+
+fn prepare_modern_ready(
+    mut ready: ResMut<FfxModernReady>,
+    pipeline_cache: Res<PipelineCache>,
+    pipelines: Res<FfxGlowPipelines>,
+    own: Query<&FfxGlowTextures>,
+    backdrops: Query<&FfxBackdropView>,
+) {
+    let compiled = |id: CachedRenderPipelineId| pipeline_cache.get_render_pipeline(id).is_some();
+    ready.0 = compiled(pipelines.downsample_hdr)
+        && compiled(pipelines.downsample_water_hdr)
+        && own
+            .iter()
+            .filter_map(|t| t.combine.as_ref())
+            .chain(backdrops.iter().map(|b| &b.pair))
+            .all(|pair| pair.modern.ids().into_iter().all(compiled));
+}
+
 /// The render-world views an [`FfxBackdrop`] claims this frame; a claimed view has no combine.
 #[derive(Resource, Default)]
 struct FfxBackdropClaims(Vec<Entity>);
@@ -1360,11 +1477,20 @@ impl ViewNode for FfxTransparent2dNode {
                 let (uniform, preview) = preview_combine(world, glow, wave, uniform);
                 let improved = preview.uw_depth.is_some();
                 let water = preview.water_glow.is_some();
+                let look = modern_lanes(world, glow);
                 // Still compiling: this frame has no world in it.
-                let combine =
-                    pipeline_cache.get_render_pipeline(view.pair.armed(wave, improved, water))?;
+                let combine = pipeline_cache.get_render_pipeline(view.pair.armed(
+                    wave,
+                    improved,
+                    water,
+                    look.is_some(),
+                ))?;
                 let queue = world.resource::<RenderQueue>();
-                queue.write_buffer(&textures.gain_buf, 0, bytemuck::cast_slice(&uniform));
+                queue.write_buffer(
+                    &textures.gain_buf,
+                    0,
+                    bytemuck::cast_slice(&with_look(uniform, look)),
+                );
                 // The world view's finished main texture and this frame's ¼-res blur, per frame.
                 let bind = match (preview.uw, preview.uw_depth.as_ref()) {
                     (Some(uw), Some(depth)) => {
@@ -1486,11 +1612,12 @@ impl Plugin for FfxGlowPlugin {
         render_app
             .init_resource::<SpecializedRenderPipelines<FfxCombinePipeline>>()
             .init_resource::<FfxBackdropClaims>()
+            .init_resource::<FfxModernReady>()
             .add_systems(RenderStartup, init_pipelines)
             .add_systems(
                 Render,
                 // The claims first: a claimed world view builds no combine pair of its own.
-                (prepare_backdrops, prepare_textures)
+                (prepare_backdrops, prepare_textures, prepare_modern_ready)
                     .chain()
                     .in_set(RenderSystems::PrepareResources),
             )

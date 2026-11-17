@@ -951,6 +951,10 @@ fn session_values(world: &World) -> Vec<(&'static str, Option<String>)> {
         let v = world.get_resource::<benilla_world::liquid::WaterQuality>();
         out.push(("waterQuality", v.map(|q| q.cvar().to_string())));
     }
+    if set("WOW_LOOK_MODEL") {
+        let v = world.get_resource::<benilla_world::modern::LookModel>();
+        out.push(("lookModel", v.map(|m| m.cvar().to_string())));
+    }
     // `$WOW_HOST` is the session's realmlist, which a test run must never write into the file.
     if set("WOW_HOST") {
         let v = world.get_resource::<crate::realmlist::Realmlist>();
@@ -1631,6 +1635,19 @@ mod tests {
             benilla_world::liquid::WaterQuality::from_cvar(d["waterQuality"]),
             benilla_world::liquid::WaterQuality::Medium
         );
+        // benilla-gamepad fork: the Modern look by default (`WOW_LOOK_MODEL=0` is the reference's).
+        assert_eq!(
+            benilla_world::modern::LookModel::from_cvar(d["lookModel"]),
+            benilla_world::modern::LookModel::Modern
+        );
+        assert_eq!(
+            benilla_world::modern::LookQuality::from_cvar(d["lookQuality"]),
+            benilla_world::modern::LookQuality::default()
+        );
+        assert_eq!(
+            d["autoExposure"] != 0.0,
+            benilla_world::modern::look::AutoExposure::default().0
+        );
     }
 
     /// The FFX pass's three switches reach it one by one (`ffx`, `ffxGlow`, `ffxDeath`).
@@ -1849,6 +1866,24 @@ mod tests {
                 apply(&mut app, "waterquality", value);
                 assert_eq!(*res::<WaterQuality>(&app), want);
                 assert_eq!(res::<WaterQuality>(&app).cvar(), value);
+            }
+            use benilla_world::modern::{look::AutoExposure, LookModel, LookQuality};
+            for (value, want) in [("0", LookModel::Classic), ("1", LookModel::Modern)] {
+                apply(&mut app, "lookModel", value);
+                assert_eq!(*res::<LookModel>(&app), want);
+                assert_eq!(res::<LookModel>(&app).cvar(), value);
+            }
+            for (value, want) in [
+                ("0", LookQuality::Low),
+                ("2", LookQuality::High),
+                ("1", LookQuality::Medium),
+            ] {
+                apply(&mut app, "lookQuality", value);
+                assert_eq!(*res::<LookQuality>(&app), want);
+            }
+            for (value, want) in [("0", false), ("1", true)] {
+                apply(&mut app, "autoExposure", value);
+                assert_eq!(res::<AutoExposure>(&app).0, want);
             }
         }
         apply(&mut app, "fpsjournal", "0");
@@ -2907,6 +2942,10 @@ mod tests {
             .insert_resource(benilla_world::liquid::WaterStyle::Stylised)
             // Literal: `WaterQuality::default()` reads `$WOW_WATER_QUALITY`.
             .insert_resource(benilla_world::liquid::WaterQuality::Medium)
+            // Literal: `LookModel::default()` reads `$WOW_LOOK_MODEL`.
+            .insert_resource(benilla_world::modern::LookModel::Modern)
+            .init_resource::<benilla_world::modern::LookQuality>()
+            .init_resource::<benilla_world::modern::look::AutoExposure>()
             .init_resource::<benilla_world::particles::ParticleTuning>()
             .init_resource::<crate::video::SpellEffectLevel>()
             .init_resource::<crate::video::Widescreen>()

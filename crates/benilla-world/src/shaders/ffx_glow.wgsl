@@ -17,6 +17,13 @@ struct FfxCombine {
     lane: vec4<f32>,
     // xy = the GlowWave phases `(t mod 3174)/3174` and `(t mod 2805)/2805`, t in ms; zw unused.
     wave: vec4<f32>,
+#ifdef MODERN_LOOK
+    // benilla-gamepad fork, the Modern look (`modern::look`): x = exposure, y = bloom strength,
+    // z = bloom threshold (linear), w spare.
+    look: vec4<f32>,
+    // x = contrast, y = saturation, z = vignette, w = toe (a gamma > 1 deepens the shadows).
+    grade: vec4<f32>,
+#endif
 }
 @group(0) @binding(3) var<uniform> ffx: FfxCombine;
 // The 128×128 wave LUT and its repeat sampler: bound on every combine, sampled only underwater.
@@ -50,6 +57,20 @@ fn fs_downsample_water(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     }
     return vec4<f32>(rgb.rgb, e);
 }
+
+#ifdef MODERN_LOOK
+// `fs_downsample_water`'s alpha: the mean excess over the quarter texel at `frag`.
+fn fs_downsample_water_excess(frag: vec2<f32>) -> f32 {
+    let q = max(vec2<u32>(textureDimensions(in_tex)) / 4u, vec2<u32>(8u));
+    let p = min(vec2<u32>(frag), q - 1u);
+    let i = p.y * q.x + p.x;
+    var e = 0.0;
+    if (i < arrayLength(&water_glow_acc)) {
+        e = f32(water_glow_acc[i]) / (16.0 * WATER_GLOW_FIXED);
+    }
+    return e;
+}
+#endif
 
 // Round 2: the excess spread wider than FFXGlow's own kernel, so it reads as a halo round the
 // glints rather than a fill between them: the blurred quarter texel at `uv` and a ring of eight at
@@ -92,6 +113,33 @@ fn fs_downsample(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
         + min(textureSample(in_tex, in_samp, in.uv + vec2<f32>(-1.5, 0.5) * texel), one))
         * 0.25;
 }
+
+#ifdef MODERN_LOOK
+// benilla-gamepad fork: the Modern look's Box4, the taps unclamped (capped only against inf).
+fn box4_hdr(uv: vec2<f32>) -> vec3<f32> {
+    let texel = 1.0 / vec2<f32>(textureDimensions(in_tex));
+    let cap = vec4<f32>(64.0);
+    return ((min(textureSample(in_tex, in_samp, uv + vec2<f32>(-1.5, -1.5) * texel), cap)
+        + min(textureSample(in_tex, in_samp, uv + vec2<f32>(0.5, -1.5) * texel), cap)
+        + min(textureSample(in_tex, in_samp, uv + vec2<f32>(0.5, 0.5) * texel), cap)
+        + min(textureSample(in_tex, in_samp, uv + vec2<f32>(-1.5, 0.5) * texel), cap))
+        * 0.25).rgb;
+}
+
+@fragment
+fn fs_downsample_hdr(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
+    return vec4<f32>(min(box4_hdr(in.uv), vec3<f32>(1.0)), 1.0);
+}
+
+#ifdef WATER_GLOW
+// [`fs_downsample_hdr`] with the water's excess in alpha, as `fs_downsample_water` carries it.
+@fragment
+fn fs_downsample_water_hdr(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
+    let e = fs_downsample_water_excess(in.position.xy);
+    return vec4<f32>(min(box4_hdr(in.uv), vec3<f32>(1.0)), e);
+}
+#endif
+#endif
 
 // Gauss4: taps at ±0.5 and ±2.5 source texels (0x6cad10), weights from FFXGauss4.bls.
 fn gauss4(uv: vec2<f32>, axis: vec2<f32>) -> vec4<f32> {

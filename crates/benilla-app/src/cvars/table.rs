@@ -885,6 +885,30 @@ pub(crate) const REGISTERED: &[Registered] = &[
         "1",
         "benilla's own — the reference has one water and no quality dial for it",
     ),
+    // benilla-gamepad fork: which look the world's frame is presented with, `0` the reference's
+    // (Classic), `1` the fork's (Modern: exposure, bloom, tonemap and grade in the FFXGlow combine).
+    // The knob is [`benilla_world::modern::LookModel`]. `$WOW_LOOK_MODEL` overrides it for the
+    // session.
+    ours(
+        "lookModel",
+        "1",
+        "the fork's own — the reference presents one picture and has no dial for its look",
+    ),
+    // benilla-gamepad fork: how much the Modern look spends, `0` Low, `1` Medium, `2` High. The
+    // knob is [`benilla_world::modern::LookQuality`]; the Classic look never reads it.
+    ours(
+        "lookQuality",
+        "1",
+        "the fork's own — the reference has one picture and no quality dial for its look",
+    ),
+    // benilla-gamepad fork: the Modern look's exposure follows the light, lifting a dark night or
+    // a gloomy zone toward visible; `0` holds it at 1. The knob is
+    // [`benilla_world::modern::look::AutoExposure`]; a Classic frame has no exposure.
+    ours(
+        "autoExposure",
+        "1",
+        "the fork's own — the reference's exposure never moves",
+    ),
     // benilla's own: `/console fpsJournal 1` appends a per-second row of position, frame cost and
     // per-pass GPU time to `benilla-config/Diagnostics/fps-journal.csv`. The knob is
     // [`crate::perf::FpsJournalSetting`].

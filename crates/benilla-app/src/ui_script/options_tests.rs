@@ -2360,8 +2360,9 @@ fn every_row_tooltip_key_resolves_in_the_real_global_strings() {
             untipped.push(row.to_string());
             continue;
         }
-        // Five rows with no fitting 1.12 string carry a `BENILLA_` one, each held to its row:
-        // Render Scale, Enable Sound in Background and Water Style have no 1.12 setting, Display
+        // Seven rows with no fitting 1.12 string carry a `BENILLA_` one, each held to its row:
+        // Render Scale, Enable Sound in Background, Water Style, Modern Look and Auto Exposure
+        // have no 1.12 setting, Display
         // Mode's string describes a checkbox, and `OPTION_TOOLTIP_GAMMA` cites art this page lacks.
         const BENILLA_OWNED: &[(&str, &str)] = &[
             ("BENILLA_TOOLTIP_RENDER_SCALE", "GraphicsRowRenderScale"),
@@ -2372,6 +2373,9 @@ fn every_row_tooltip_key_resolves_in_the_real_global_strings() {
             ),
             ("BENILLA_TOOLTIP_BRIGHTNESS", "GraphicsRowBrightness"),
             ("BENILLA_TOOLTIP_WATER_STYLE", "GraphicsRowWaterStyle"),
+            // benilla-gamepad fork: the Modern look's two rows.
+            ("BENILLA_TOOLTIP_LOOK_MODEL", "GraphicsRowLookModel"),
+            ("BENILLA_TOOLTIP_AUTO_EXPOSURE", "GraphicsRowAutoExposure"),
         ];
         if let Some((_, want_row)) = BENILLA_OWNED.iter().find(|(k, _)| *k == key) {
             assert_eq!(row, *want_row, "{row}: not this row's string");
@@ -2395,9 +2399,10 @@ fn every_row_tooltip_key_resolves_in_the_real_global_strings() {
         );
         checked += 1;
     }
-    // 85 rows less the three untipped below; five of the 82 carry a `BENILLA_` key, and a dropdown
-    // row is checked on the key it wears at rest.
-    assert_eq!(checked, 82, "every tipped row carries a live key");
+    // 87 rows less the three untipped below; seven of the 84 carry a `BENILLA_` key (two of them
+    // the benilla-gamepad fork's Modern look rows), and a dropdown row is checked on the key it
+    // wears at rest.
+    assert_eq!(checked, 84, "every tipped row carries a live key");
     assert_eq!(
         untipped,
         vec![
@@ -2493,8 +2498,8 @@ fn every_flavor_of_row_raises_its_plate_from_the_page_it_lives_on() {
             s.errors()
         );
     }
-    // Every tipped row: the same 82 the key census counts.
-    assert_eq!(raised, 82, "every row but Auto Loot raises a description");
+    // Every tipped row: the same 84 the key census counts.
+    assert_eq!(raised, 84, "every row but Auto Loot raises a description");
 }
 
 /// 1.12's AdvancedOptionsCombatText box as saved-global rows: a click writes the global, never a

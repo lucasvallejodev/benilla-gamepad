@@ -108,6 +108,8 @@ impl PluginGroup for WorldPlugins {
             // Water foam decals (`CWater0Ripple`): wake, ring and step-in splash.
             .add(crate::water_fx::WaterFxPlugin)
             .add(crate::ffx_glow::FfxGlowPlugin)
+            // benilla-gamepad fork: the Modern look's settings and the combine lanes they make.
+            .add(crate::modern::plugin)
             .add(crate::ribbons::RibbonPlugin)
             // Stuck-modifier reconciliation: macOS system shortcuts (⇧⌘5) swallow modifier
             // releases without a focus loss, wedging every bare-key binding.

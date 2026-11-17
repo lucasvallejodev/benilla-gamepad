@@ -1105,7 +1105,8 @@ fn accept_agreements(ctx: Res<CaptureCtx>, stock: crate::ui_script::glue::StockG
 /// sun's and moon's elevations and bearings off that heading, so a shot that needs a body above the
 /// horizon and ahead of the view is checked from its log. Headings are WoW's, counter-clockwise
 /// from north (+X), so a positive bearing off the view is to its left. The water's look and its
-/// quality tier follow on their own line, so a shot's log says which tier drew it.
+/// quality tier follow on their own line, so a shot's log says which tier drew it, and the
+/// benilla-gamepad fork's look its lanes.
 fn log_sky(
     ctx: Res<CaptureCtx>,
     lighting: Option<Res<benilla_world::lighting::WowLighting>>,
@@ -1114,6 +1115,7 @@ fn log_sky(
         Option<Res<benilla_world::liquid::WaterStyle>>,
         Option<Res<benilla_world::liquid::WaterQuality>>,
     ),
+    look: Option<Res<benilla_world::modern::LookLanes>>,
     mut logged: Local<bool>,
 ) {
     if *logged || matches!(ctx.phase, Phase::Building(_)) {
@@ -1132,6 +1134,12 @@ fn log_sky(
             quality.cvar(),
             *quality,
         );
+    }
+    if let Some(look) = look {
+        match look.0 {
+            Some(lanes) => info!("capture: {} look: Modern, lanes {lanes:?}", ctx.name),
+            None => info!("capture: {} look: Classic", ctx.name),
+        }
     }
     let (Some(scenario), Some(light), Some(cam)) = (ctx.scenario, lighting, cam.iter().next())
     else {
