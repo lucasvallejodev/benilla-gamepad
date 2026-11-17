@@ -871,9 +871,10 @@ pub(crate) const REGISTERED: &[Registered] = &[
     ),
     // benilla's own: which water look draws, `0` the reference's. The knob is
     // [`benilla_world::liquid::WaterStyle`]. `$WOW_WATER_STYLE` overrides it for the session.
+    // benilla-gamepad fork: Improved Water is on by default (the modern look is the fork's aim).
     ours(
         "waterStyle",
-        "0",
+        "1",
         "benilla's own — the reference has one water and no dial for it",
     ),
     // benilla's own: how much Improved Water spends, `0` Low, `1` Medium, `2` High. The knob is

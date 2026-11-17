@@ -9,8 +9,11 @@ description = "Gamepad play on top of benilla: the pad in Rust, the gamepad bar 
 workspace = true
 
 [features]
-default = ["dev"]
+default = ["dev", "improved-water"]
 dev = ["benilla-app/dev"]
+# The Improved Water plugin (crates/benilla-water); the player build keeps it:
+# `cargo build -p benilla-pad --profile ship --no-default-features --features improved-water`.
+improved-water = ["benilla-app/improved-water"]
 
 [dependencies]
 benilla-app = { path = "../benilla-app", default-features = false }

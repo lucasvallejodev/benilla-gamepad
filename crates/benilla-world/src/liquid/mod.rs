@@ -79,11 +79,14 @@ pub enum WaterStyle {
 /// `$WOW_WATER_STYLE=1` boots into Improved Water — the lever for the world viewer, which has no
 /// CVar host, and for captures. Session-only: `cvars` marks the row env-overridden so a run cannot
 /// pin itself into `config.toml`.
+///
+/// benilla-gamepad fork: Improved Water unless `$WOW_WATER_STYLE=0`, matching the fork's
+/// `waterStyle` default of 1 (the CVar applies only on a change, so the two must agree at boot).
 impl Default for WaterStyle {
     fn default() -> Self {
         match std::env::var("WOW_WATER_STYLE").as_deref() {
-            Ok("0") | Err(_) => Self::Reference,
-            Ok(_) => Self::Stylised,
+            Ok("0") => Self::Reference,
+            _ => Self::Stylised,
         }
     }
 }

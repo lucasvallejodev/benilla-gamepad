@@ -1446,6 +1446,10 @@ mod tests {
                 "gxColorBits",
                 "gxDepthBits",
                 "gxResolution",
+                "readContest",
+                "readEULA",
+                "readScanning",
+                "readTOS",
                 "realmList",
                 "weatherDensity",
             ],
@@ -1617,10 +1621,10 @@ mod tests {
         assert_eq!(d["boothHalfRate"] != 0.0, PaneRate::default().half);
         // Every visual golden assumes a 1:1 backdrop.
         assert_eq!(d["renderScale"], 1.0);
-        // The reference's water.
+        // benilla-gamepad fork: Improved Water by default (`WOW_WATER_STYLE=0` is the reference's).
         assert_eq!(
             benilla_world::liquid::WaterStyle::from_cvar(d["waterStyle"]),
-            benilla_world::liquid::WaterStyle::Reference
+            benilla_world::liquid::WaterStyle::Stylised
         );
         // Improved Water's default tier.
         assert_eq!(
@@ -2900,7 +2904,7 @@ mod tests {
             .init_resource::<crate::ui_chat::combat::LogPeriodicSpells>()
             .init_resource::<benilla_world::weather::WeatherState>()
             // Literal: `WaterStyle::default()` reads `$WOW_WATER_STYLE`.
-            .insert_resource(benilla_world::liquid::WaterStyle::Reference)
+            .insert_resource(benilla_world::liquid::WaterStyle::Stylised)
             // Literal: `WaterQuality::default()` reads `$WOW_WATER_QUALITY`.
             .insert_resource(benilla_world::liquid::WaterQuality::Medium)
             .init_resource::<benilla_world::particles::ParticleTuning>()
