@@ -115,8 +115,8 @@ fn fs_downsample(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
 }
 
 #ifdef MODERN_LOOK
-// benilla-gamepad fork: the Modern look's Box4 — each tap decoded to linear and left unclamped
-// (capped only against inf), so the energy above white survives into the blur as bloom.
+// benilla-gamepad fork: the Modern look's Box4 — each tap decoded to linear ([`modern_decode`],
+// a quarter past white), so the light above white survives into the blur as bloom.
 fn box4_hdr(uv: vec2<f32>) -> vec3<f32> {
     let texel = 1.0 / vec2<f32>(textureDimensions(in_tex));
     return (modern_decode(textureSample(in_tex, in_samp, uv + vec2<f32>(-1.5, -1.5) * texel).rgb)
@@ -199,14 +199,17 @@ fn combine_out(outg: vec3<f32>, alpha: f32, frag_coord: vec2<f32>) -> vec4<f32> 
 // [0, 1] and encodes again, so the reference's glow, haze and death math runs unchanged on a
 // tonemapped picture.
 
-/// The scene's linear value, capped only against inf.
-const MODERN_SCENE_CAP: f32 = 64.0;
+/// The gamma value the decode stops at. The additive lanes (flames, glows, the sun) sum far past
+/// white in the float target, and the reference clamps each channel at 1, which keeps a flame
+/// yellow-white; decoded uncapped, its red channel alone would bloom, a red blob round a candle.
+/// A quarter over white leaves them light to bloom and the shoulder to roll.
+const MODERN_SCENE_CAP: f32 = 1.25;
 /// The tonemap's knee (linear): identity below it, so a midtone keeps its reference value.
 const MODERN_KNEE: f32 = 0.8;
 
 /// A gamma value (possibly above 1, the float target does not saturate) to linear, capped.
 fn modern_decode(g: vec3<f32>) -> vec3<f32> {
-    return min(srgb_to_linear(max(g, vec3<f32>(0.0))), vec3<f32>(MODERN_SCENE_CAP));
+    return srgb_to_linear(clamp(g, vec3<f32>(0.0), vec3<f32>(MODERN_SCENE_CAP)));
 }
 
 /// Linear to gamma, the exact piecewise sRGB curve.
@@ -225,6 +228,21 @@ fn modern_tonemap(x: vec3<f32>) -> vec3<f32> {
     return select(x, rolled, x > vec3<f32>(k));
 }
 
+/// The grade on the encoded, tonemapped picture (`ffx.grade`): saturation about the luma, contrast
+/// as an S-curve, a toe that deepens the shadows, and a soft vignette. The contrast is a curve
+/// fixing 0 and 1, not a scale about mid grey, which would push a night (every pixel near 0.08)
+/// to black.
+fn modern_grade(g: vec3<f32>, uv: vec2<f32>) -> vec3<f32> {
+    let luma = dot(g, vec3<f32>(0.2126, 0.7152, 0.0722));
+    // Floored: a saturation above 1 can drive a channel negative, and the toe's `pow` makes NaN.
+    var c = max(mix(vec3<f32>(luma), g, ffx.grade.y), vec3<f32>(0.0));
+    let s = clamp(c * c * (vec3<f32>(3.0) - 2.0 * c), vec3<f32>(0.0), vec3<f32>(1.0));
+    c = mix(c, s, clamp((ffx.grade.x - 1.0) * 2.0, 0.0, 1.0));
+    c = pow(c, vec3<f32>(max(ffx.grade.w, 0.01)));
+    let edge = length((uv - vec2<f32>(0.5)) * vec2<f32>(1.25, 1.0)) * 1.3;
+    return c * (1.0 - ffx.grade.z * smoothstep(0.35, 1.0, edge));
+}
+
 /// The combine's two inputs after the Modern look, both gamma in [0, 1].
 struct ModernInputs {
     sg: vec3<f32>,
@@ -240,7 +258,11 @@ fn modern_inputs(uv: vec2<f32>, scene_g: vec3<f32>, blur_lin: vec3<f32>, extra: 
     // The death pass reads a byte framebuffer (`0x6cdf20`): a ghost's blur stops at white.
     let blur_hdr = select(blur_x, min(blur_x, vec3<f32>(1.0)), ffx.lane.y > 0.0);
     let bloom = max(blur_hdr - vec3<f32>(ffx.look.z), vec3<f32>(0.0)) * ffx.look.y + extra;
-    let sg = modern_encode(modern_tonemap(scene_x + bloom));
+    var sg = modern_encode(modern_tonemap(scene_x + bloom));
+    // All zero: no grade.
+    if (ffx.grade.x > 0.0) {
+        sg = modern_grade(sg, uv);
+    }
     return ModernInputs(sg, modern_encode(modern_tonemap(blur_hdr)));
 }
 

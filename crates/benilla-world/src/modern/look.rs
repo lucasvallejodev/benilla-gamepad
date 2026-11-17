@@ -26,16 +26,34 @@ pub struct Look {
     /// Linear. The reference frame's white is 1, so a threshold under it blooms the brightest lit
     /// surfaces as well as the additive light above white.
     pub bloom_threshold: f32,
+    /// The grade on the tonemapped picture. Above 1, an S-curve's share of the midtones,
+    /// `(contrast - 1) * 2`; 0 turns the whole grade off.
+    pub contrast: f32,
+    /// About the luma: 1 keeps the colour, under 1 mutes it.
+    pub saturation: f32,
+    /// How much the corners darken.
+    pub vignette: f32,
+    /// A gamma on the graded picture; above 1 deepens the shadows.
+    pub toe: f32,
 }
 
 impl Look {
     /// The one look every zone gets.
     pub const NEUTRAL: Self = Self {
-        exposure: 1.0,
+        // The grade's S-curve pivots on mid grey, under which most of the reference frame sits:
+        // a fifth more exposure keeps a noon frame's mean level where the reference's is.
+        exposure: 1.2,
         // The reference frame is dim (on a noon capture under 3% of pixels pass gamma 0.73): a
         // threshold at linear 0.3 lets lit stone, sky and lamps bloom, faintly.
         bloom: 0.4,
         bloom_threshold: 0.3,
+        // Tuned by capture from benilla-bourbon's neutral zone look (1.12, 0.86, 0.3, 1.03),
+        // whose muted colour suits its linear lighting; the reference's gamma lighting wants its
+        // colour kept, a little more of it.
+        contrast: 1.15,
+        saturation: 1.08,
+        vignette: 0.2,
+        toe: 1.0,
     };
 
     /// The combine's two lanes.
@@ -45,10 +63,10 @@ impl Look {
             self.bloom,
             self.bloom_threshold,
             0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
+            self.contrast,
+            self.saturation,
+            self.vignette,
+            self.toe,
         ]
     }
 }
@@ -58,7 +76,7 @@ impl Look {
 pub struct ActiveLook(pub Look);
 
 /// `$WOW_LOOK_TUNE="bloom=0.5,threshold=0.6"` overrides the look's constants for the session (keys
-/// `exposure`, `bloom`, `threshold`), the lever for tuning them by capture.
+/// `exposure`, `bloom`, `threshold`, `contrast`, `saturation`, `vignette`, `toe`), the lever for tuning them by capture.
 impl Default for ActiveLook {
     fn default() -> Self {
         let mut look = Look::NEUTRAL;
@@ -72,6 +90,10 @@ impl Default for ActiveLook {
                 "exposure" => look.exposure = v,
                 "bloom" => look.bloom = v,
                 "threshold" => look.bloom_threshold = v,
+                "contrast" => look.contrast = v,
+                "saturation" => look.saturation = v,
+                "vignette" => look.vignette = v,
+                "toe" => look.toe = v,
                 other => warn!("WOW_LOOK_TUNE: no constant named {other}"),
             }
         }
