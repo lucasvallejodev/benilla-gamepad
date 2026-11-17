@@ -46,7 +46,9 @@ P.DEFAULTS = {
     -- A/B/X/Y with no trigger: their game actions, or their own action slots like the D-pad.
     faceSpells = false,
     scale = 1.0,
-    offsetY = 170,
+    -- Bottom of the screen, above the experience bar, the console layout's place (an older build
+    -- centred it round the character at 170).
+    offsetY = 18,
     -- "auto" follows the pad's vendor; else "xbox" or "playstation".
     symbols = "auto",
     alwaysShow = false,

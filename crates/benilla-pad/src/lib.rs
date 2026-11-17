@@ -175,7 +175,13 @@ struct PadState {
     /// An Interact on a target the object mirror had not streamed yet, retried until this
     /// `Time::elapsed_secs`.
     interact_retry: Option<f32>,
+    /// The soft Interact's verb the addon's prompt shows, and when it is next recomputed.
+    soft_verb: Option<&'static str>,
+    soft_next: f32,
 }
+
+/// How often the soft Interact prompt is recomputed, in seconds.
+const SOFT_PROMPT_EVERY: f32 = 0.2;
 
 /// How long an Interact waits for its target to be streamed, in seconds.
 const INTERACT_RETRY_SECS: f32 = 0.3;
@@ -419,6 +425,24 @@ fn drive(
     if let Some(until) = state.interact_retry {
         if interacting.with_target() || now > until {
             state.interact_retry = None;
+        }
+    }
+
+    // ── The soft Interact prompt ── what X would do with no target, a few times a second.
+    if now >= state.soft_next {
+        state.soft_next = now + SOFT_PROMPT_EVERY;
+        let verb = if world && !cursor && interacting.target().is_none() {
+            interacting.soft_verb(state.last_target)
+        } else {
+            None
+        };
+        if verb != state.soft_verb {
+            state.soft_verb = verb;
+            fire(
+                script,
+                "BENILLAPAD_SOFT",
+                vec![verb.map_or(ScriptValue::Nil, |v| ScriptValue::Str(v.to_string()))],
+            );
         }
     }
 

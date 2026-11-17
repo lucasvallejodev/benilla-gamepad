@@ -341,12 +341,28 @@ local function guardOnShow(f, name)
     end)
 end
 
+-- The new-player tutorial alerts sit above the stock bar (TutorialFrameParent, BOTTOM +55), where
+-- the pad bar's stick buttons now are: they move to the bar's left while it shows.
+local function placeTutorials(onBar)
+    local parent = TutorialFrameParent
+    if not parent then
+        return
+    end
+    parent:ClearAllPoints()
+    if onBar then
+        parent:SetPoint("BOTTOMRIGHT", frame, "BOTTOMLEFT", -8, 24)
+    else
+        parent:SetPoint("BOTTOM", UIParent, "BOTTOM", 0, 55)
+    end
+end
+
 function Bar.StockBar()
     local hide = (P.Setting("hideStockBars") and frame:IsShown()) and true or false
     if hide == stockHidden then
         return
     end
     stockHidden = hide
+    placeTutorials(hide)
     for i = 1, table.getn(STOCK) do
         local name = STOCK[i]
         local f = getglobal(name)
@@ -429,6 +445,11 @@ end)
 -- Range, power and countdowns move without events: ten times a second.
 local elapsedSince = 0
 frame:SetScript("OnUpdate", function()
+    -- A wheel is drawn over the screen's centre: the bar steps out of its way while one is open.
+    local alpha = (P.mode == "wheel") and 0 or 1
+    if frame:GetAlpha() ~= alpha then
+        frame:SetAlpha(alpha)
+    end
     elapsedSince = elapsedSince + arg1
     if elapsedSince < 0.1 then
         return

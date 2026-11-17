@@ -14,5 +14,6 @@ Keybinds.lua
 Menu.lua
 Wheel.lua
 Cursor.lua
+Prompt.lua
 Bots.lua
 Chat.lua

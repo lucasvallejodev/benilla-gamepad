@@ -68,6 +68,26 @@ pub fn kind_of(fields: &ObjectFields) -> Option<Kind> {
     }
 }
 
+/// The verb a soft Interact on `fields` performs, for the on-screen prompt.
+pub fn verb_of(fields: &ObjectFields) -> &'static str {
+    match fields.object_type() {
+        Some(ObjectType::Unit | ObjectType::Player) if fields.unit_is_dead() => {
+            if fields.unit_lootable() {
+                "Loot"
+            } else {
+                "Skin"
+            }
+        }
+        Some(ObjectType::GameObject) => match fields.gameobject_type_id() {
+            3 => "Open",
+            9 => "Read",
+            19 => "Mail",
+            _ => "Use",
+        },
+        _ => "Talk",
+    }
+}
+
 /// The soft target among `candidates`: a corpse within [`CORPSE_RANGE`] (`last`, the last target,
 /// first, else the nearest), else the service within [`RANGE`] that is nearest and most ahead of
 /// the camera (`ahead`, flat and unit, or zero for no preference); nothing behind the camera.
@@ -136,12 +156,23 @@ impl Interacting<'_, '_> {
 
     /// Interact with the soft target, if there is one.
     pub fn with_soft_target(&mut self, last: Option<u64>) -> bool {
-        let Some(me) = self.objects.player() else {
+        let Some(entity) = self.soft(last).and_then(|g| self.objects.entity(g)) else {
             return false;
         };
-        let Ok(origin) = self.transforms.get(me).map(|t| t.translation) else {
-            return false;
-        };
+        self.out.write(Interact(entity));
+        true
+    }
+
+    /// What a soft Interact would do now: the soft target's verb, for the prompt.
+    pub fn soft_verb(&mut self, last: Option<u64>) -> Option<&'static str> {
+        let guid = self.soft(last)?;
+        self.objects.object(guid).map(verb_of)
+    }
+
+    /// The soft target's guid, if there is one.
+    fn soft(&mut self, last: Option<u64>) -> Option<u64> {
+        let me = self.objects.player()?;
+        let origin = self.transforms.get(me).map(|t| t.translation).ok()?;
         let ahead = self
             .camera
             .single()
@@ -163,13 +194,7 @@ impl Interacting<'_, '_> {
                 offset: Vec2::new(at.x - origin.x, at.z - origin.z),
             })
         });
-        let Some(entity) =
-            soft_target(candidates, ahead, last).and_then(|g| self.objects.entity(g))
-        else {
-            return false;
-        };
-        self.out.write(Interact(entity));
-        true
+        soft_target(candidates, ahead, last)
     }
 }
 
