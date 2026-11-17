@@ -1956,10 +1956,19 @@ mod tests {
             (false, true, true),
             "accepted agreements go straight to the login boxes"
         );
+        // benilla-gamepad fork: the agreements default to accepted (cvars/table.rs), so a first
+        // launch goes straight to the login boxes; an explicit "0" still asks.
         assert_eq!(
             screens(crate::cvars::Cvars::default()),
+            (false, true, true),
+            "a first launch goes straight to the login boxes"
+        );
+        let mut unread = crate::cvars::Cvars::with_value("readEULA", "0");
+        unread.set("readTOS", "0");
+        assert_eq!(
+            screens(unread),
             (true, false, false),
-            "a first launch is asked for the EULA"
+            "unaccepted agreements are still asked for"
         );
     }
 
