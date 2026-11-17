@@ -52,7 +52,7 @@ end
 
 function Prompt.Refresh()
     local kind, value = P.Binding("X", "bare")
-    local on = P.connected and P.mode == "world" and kind == "action" and value == "interact"
+    local on = P.connected and P.Setting("prompt") and P.mode == "world" and kind == "action" and value == "interact"
         and not (P.Cursor and P.Cursor.Wanted())
     local verb = on and (targetVerb() or (not UnitExists("target") and soft)) or nil
     if not verb then

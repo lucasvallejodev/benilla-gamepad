@@ -15,5 +15,6 @@ Menu.lua
 Wheel.lua
 Cursor.lua
 Prompt.lua
+Legend.lua
 Bots.lua
 Chat.lua

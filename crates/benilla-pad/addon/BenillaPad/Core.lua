@@ -63,6 +63,9 @@ P.DEFAULTS = {
     xpText = true,
     -- A row above the bar with the cooldowns of the layers not held.
     layerCooldowns = true,
+    -- The top-left legend of what the buttons do now, and the Interact prompt above the bar.
+    legend = true,
+    prompt = true,
 }
 
 local FACES = { A = true, B = true, X = true, Y = true }
