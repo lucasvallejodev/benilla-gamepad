@@ -415,6 +415,10 @@ end
 
 -- The binding command a press runs, or nil for nothing.
 function BenillaPad_Resolve(btn, layer)
+    -- LB held is the friendly targeting mode: the D-pad's up and down walk the party.
+    if layer == "bare" and P.held.LB and (btn == "DUP" or btn == "DDOWN") then
+        return btn == "DUP" and "BENILLAPAD_PARTYPREV" or "BENILLAPAD_PARTYNEXT"
+    end
     local kind, value = P.Binding(btn, layer)
     if kind == "form" then
         -- The button's own slot command; its body casts the override.
@@ -555,6 +559,8 @@ BINDING_NAME_BENILLAPAD_CONSUMABLES = "Consumables wheel"
 BINDING_NAME_BENILLAPAD_QUESTITEM = "Use quest item"
 BINDING_NAME_BENILLAPAD_BOTWHEEL = "Bot wheel"
 BINDING_NAME_BENILLAPAD_CHAT = "Quick Chat"
+BINDING_NAME_BENILLAPAD_PARTYNEXT = "Next party member"
+BINDING_NAME_BENILLAPAD_PARTYPREV = "Previous party member"
 
 SLASH_BENILLAPAD1 = "/pad"
 SlashCmdList["BENILLAPAD"] = function(msg)

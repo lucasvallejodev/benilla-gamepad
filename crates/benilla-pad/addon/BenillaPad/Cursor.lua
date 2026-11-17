@@ -81,14 +81,40 @@ function Cursor.Targets()
     return list
 end
 
+-- Popups whose first button can't be undone (StaticPopup.lua's `which`): the cursor lands on
+-- Cancel instead, so a stray A press never deletes, abandons, binds or wipes anything.
+local DESTRUCTIVE = {
+    DELETE_ITEM = true, DELETE_GOOD_ITEM = true, ABANDON_QUEST = true,
+    ABANDON_QUEST_WITH_ITEMS = true, ABANDON_PET = true, CONFIRM_TALENT_WIPE = true,
+    CONFIRM_BINDER = true, UNLEARN_SKILL = true, DELETE_MAIL = true, CONFIRM_GUILD_DISBAND = true,
+    CONFIRM_GUILD_LEAVE = true, CONFIRM_RESET_INSTANCES = true, CONFIRM_LOOT_DISTRIBUTION = true,
+    CONFIRM_BUY_BANK_SLOT = true, CONFIRM_BUY_STABLE_SLOT = true, EQUIP_BIND = true,
+    AUTOEQUIP_BIND = true, LOOT_BIND = true, USE_BIND = true, QUIT = true, CAMP = true,
+    CONFIRM_TEAM_DISBAND = true, CONFIRM_REMOVE_FRIEND = true,
+}
+Cursor.DESTRUCTIVE = DESTRUCTIVE
+
+-- The button "enter" snaps an open popup to: its second (Cancel) on a destructive popup.
+function Cursor.PopupButton(i)
+    local popup = getglobal("StaticPopup" .. i)
+    if not (popup and popup:IsVisible()) then
+        return nil
+    end
+    local index = 1
+    local second = getglobal("StaticPopup" .. i .. "Button2")
+    if popup.which and DESTRUCTIVE[popup.which] and second and second:IsVisible() then
+        index = 2
+    end
+    return getglobal("StaticPopup" .. i .. "Button" .. index)
+end
+
 -- The button to jump to from (x, y) toward `dir` (DUP / DDOWN / DLEFT / DRIGHT), or, for "enter",
--- an open popup's first button. Answers absolute units, or nothing.
+-- an open popup's first button (Cancel on a destructive one). Answers absolute units, or nothing.
 function BenillaPad_Snap(dir, x, y)
     if dir == "enter" then
         for i = 1, 4 do
-            local popup = getglobal("StaticPopup" .. i)
-            local button = getglobal("StaticPopup" .. i .. "Button1")
-            if popup and popup:IsVisible() and button and button:IsVisible() then
+            local button = Cursor.PopupButton(i)
+            if button and button:IsVisible() then
                 local s = button:GetEffectiveScale()
                 return (button:GetLeft() + button:GetWidth() / 2) * s,
                     (button:GetBottom() + button:GetHeight() / 2) * s

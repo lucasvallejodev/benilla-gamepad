@@ -61,3 +61,37 @@ end
 function BenillaPad_Menu()
     P.Menu.Toggle()
 end
+
+-- LB held + D-pad up / down: walk the friendly target through you, then your party or raid, in
+-- frame order (the friendly targeting of a console UI). Wraps at both ends.
+function BenillaPad_PartyStep(step)
+    local units = { "player" }
+    local raid = GetNumRaidMembers() or 0
+    if raid > 0 then
+        for i = 1, raid do
+            table.insert(units, "raid" .. i)
+        end
+    else
+        for i = 1, GetNumPartyMembers() or 0 do
+            table.insert(units, "party" .. i)
+        end
+    end
+    local n = table.getn(units)
+    local at = 0
+    for i = 1, n do
+        if UnitIsUnit("target", units[i]) then
+            at = i
+            break
+        end
+    end
+    local i = at + step
+    if at == 0 and step < 0 then
+        i = n
+    end
+    if i < 1 then
+        i = n
+    elseif i > n then
+        i = 1
+    end
+    TargetUnit(units[i])
+end

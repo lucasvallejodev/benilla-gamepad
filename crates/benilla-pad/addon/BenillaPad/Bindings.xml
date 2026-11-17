@@ -58,5 +58,7 @@
 	<Binding name="BENILLAPAD_CONSUMABLES">BenillaPad.Wheel.Toggle("consumables")</Binding>
 	<Binding name="BENILLAPAD_QUESTITEM">BenillaPad.Quest.Use()</Binding>
 	<Binding name="BENILLAPAD_BOTWHEEL">BenillaPad.Wheel.Toggle("bots")</Binding>
+	<Binding name="BENILLAPAD_PARTYNEXT">BenillaPad_PartyStep(1)</Binding>
+	<Binding name="BENILLAPAD_PARTYPREV">BenillaPad_PartyStep(-1)</Binding>
 	<Binding name="BENILLAPAD_CHAT">BenillaPad.Chat.Toggle()</Binding>
 </Bindings>
