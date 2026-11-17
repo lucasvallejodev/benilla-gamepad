@@ -874,14 +874,17 @@ pub(crate) fn step_up(
         contact: None,
         verdict,
     };
-    // A steep, non-overhanging face opposing the motion within `look`. The reference has no
-    // incidence gate; a graze nets zero in the settle.
+    // A steep face opposing the motion within `look`. The reference has no incidence gate; a
+    // graze nets zero in the settle.
     let Some(ahead) = cast(center, dir_h * look) else {
         return none(StepVerdict::NoFace);
     };
     // The face's own normal: `0x6334a0` classifies the hit's record (`0x6334e6`), not a contact.
+    // With `0x4000000` clear it sends every non-walkable record to the step probe (`0x636b6e`), a
+    // face leaning out over its foot included (`n.z < 0`, `0x63352b`), save one facing down by
+    // more than 50° at the box's top (`0x63353c`-`0x633595`), where a level sweep meets one.
     let n = ahead.face_normal;
-    if n.y >= GROUND_COS || n.y < OVERHANG_EPS || n.dot(dir_h) >= 0.0 {
+    if n.y >= GROUND_COS || n.y < -GROUND_COS || n.dot(dir_h) >= 0.0 {
         return none(StepVerdict::NoFace);
     }
     let at = |verdict| StepAttempt {
@@ -1156,6 +1159,101 @@ mod tests {
             .unwrap()
     }
 
+    /// The terrain of the `map` tiles holding the WoW columns `at`, one trimesh per tile as the
+    /// streamer welds them, and those tiles' chunks for heights; `None` without an install.
+    fn world_from_terrain(
+        map: &str,
+        at: &[[f32; 2]],
+    ) -> Option<(App, Vec<Vec<benilla_formats::ChunkMesh>>)> {
+        use benilla_assets::coords::wow_to_bevy;
+        let data = benilla_formats::wow_data_or_skip!(None);
+        let mut chain = benilla_formats::open_chain(&data).expect("open chain");
+        let tiles = benilla_formats::MapTiles::load(&mut chain, map).expect("map tiles");
+        let mut ids: Vec<(u32, u32)> = at.iter().map(|&[x, y]| tiles.tile_at(x, y)).collect();
+        ids.dedup();
+        let mut app = App::new();
+        app.init_resource::<benilla_world::collision::MoverTraceExclusions>();
+        app.add_plugins((
+            MinimalPlugins,
+            bevy::transform::TransformPlugin,
+            bevy::asset::AssetPlugin::default(),
+            bevy::scene::ScenePlugin,
+            PhysicsPlugins::new(bevy::app::PostUpdate),
+        ));
+        app.init_asset::<Mesh>();
+        let mut chunks = Vec::new();
+        for (tx, ty) in ids {
+            let tile = benilla_formats::load_tile_mesh(&mut chain, map, tx, ty).expect("tile");
+            let (mut verts, mut tris) = (Vec::new(), Vec::new());
+            for chunk in &tile.chunks {
+                let base = verts.len() as u32;
+                verts.extend(chunk.positions.iter().map(|p| wow_to_bevy(*p)));
+                tris.extend(
+                    chunk
+                        .indices
+                        .as_chunks::<3>()
+                        .0
+                        .iter()
+                        .map(|c| [base + c[0], base + c[1], base + c[2]]),
+                );
+            }
+            app.world_mut().spawn((
+                RigidBody::Static,
+                Collider::trimesh(verts, tris),
+                Transform::default(),
+            ));
+            chunks.push(tile.chunks);
+        }
+        app.update();
+        Some((app, chunks))
+    }
+
+    /// Map 1's Valley of Trials ramp, rising +y over the tile seam at y = −4266.67: a body the
+    /// server places flush on it at y = −4268 walks on over the seam. The far tile's floor rises
+    /// a few centimetres above the feet there, and it is ahead of the volume's bevels, so the
+    /// settle keeps it (`0x632830`) instead of the body falling through it.
+    #[test]
+    fn a_body_placed_flush_on_the_valley_ramp_walks_over_the_tile_seam() {
+        use benilla_assets::coords::{bevy_to_wow, wow_to_bevy};
+        const AT: [f32; 2] = [-601.29, -4268.0];
+        let Some((mut world, chunks)) = world_from_terrain("Kalimdor", &[AT, [AT[0], AT[1] + 3.0]])
+        else {
+            return;
+        };
+        let height = move |w: [f32; 3]| {
+            chunks
+                .iter()
+                .find_map(|c| benilla_formats::terrain_height_at(c, w))
+                .expect("terrain under the walk")
+        };
+        let lowest = world
+            .world_mut()
+            .run_system_once(move |world: benilla_world::collision::WorldCollision| {
+                let capsule = player_capsule();
+                let half = Vec3::Y * (CAPSULE_HEIGHT * 0.5);
+                let feet = [AT[0], AT[1], height([AT[0], AT[1], 0.0])];
+                let mut center = wow_to_bevy(feet) + half;
+                let dir = wow_to_bevy([0.0, 1.0, 0.0]);
+                let dt = std::time::Duration::from_secs_f32(TRAVEL_60FPS / 7.0);
+                let mut support = Support::default();
+                let mut lowest = f32::MAX;
+                // 40 frames at a run: 4.7 yd, the seam at 1.3.
+                for _ in 0..40 {
+                    let g = grounded_step(&world, &capsule, center, dir * 7.0, dt, support);
+                    center = g.center - Vec3::Y * g.unsupported.unwrap_or(0.0);
+                    support.steep = g.steep_support;
+                    let w = bevy_to_wow(center - half);
+                    lowest = lowest.min(w[2] - height(w));
+                }
+                lowest
+            })
+            .unwrap();
+        assert!(
+            lowest > -0.05,
+            "the body sank {lowest} yd under the terrain crossing the seam"
+        );
+    }
+
     #[test]
     fn the_stormwind_auction_house_stairs_are_climbed_head_on_and_at_an_angle() {
         // The Trade District auction house's street door, WoW `(-8807.8, 650.5, 94.6)`: a stone
@@ -1176,6 +1274,27 @@ mod tests {
                  kerb; feet {feet:?}"
             );
         }
+    }
+
+    #[test]
+    fn the_thelsamar_inn_door_sill_is_walked_over() {
+        // The Thelsamar inn's door, WoW `(-5367, -2963.9, 326.5)`: a 0.28 yd sill whose riser
+        // leans out over its foot, face normal `z` −0.063. The step probe takes any record that
+        // is not walkable (`0x636b6e`), so the body steps onto the 326.8 yd floor inside.
+        let Some(world) = world_from_wmo("Azeroth", "wet_inn.wmo", -5367.0, -2964.0, 12.0) else {
+            return;
+        };
+        let feet = walk_wow(
+            world,
+            [-5367.0, -2961.0, 327.0],
+            -std::f32::consts::FRAC_PI_2,
+            60,
+        );
+        let top = feet.iter().copied().fold(f32::MIN, f32::max);
+        assert!(
+            top > 326.7,
+            "the body must step over the sill, not stall at it; feet {feet:?}"
+        );
     }
 
     #[test]

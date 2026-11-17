@@ -122,10 +122,18 @@ enum Created {
 /// their place.
 #[derive(Resource, Default)]
 pub(crate) struct Released {
-    objects: HashMap<u64, Kept>,
+    /// Each released object with the stamp of the release that put it here.
+    objects: HashMap<u64, (u64, Kept)>,
     /// Each type's released guids, oldest first: the reuse lists from the manager's `+0x50`,
-    /// which a release appends to (`0x464a83`-`0x464ac4`).
-    reuse: HashMap<u8, VecDeque<u64>>,
+    /// which a release appends to (`0x464a83`-`0x464ac4`). An entry whose stamp no longer
+    /// matches its object's was taken out of the table: [`Self::take`] leaves it here rather than
+    /// walking the list, and [`Self::free_oldest`] skips it, so the order of the live entries is
+    /// the list's and a take costs no walk however many objects are released.
+    reuse: HashMap<u8, VecDeque<(u64, u64)>>,
+    /// The last stamp handed out.
+    stamp: u64,
+    /// Entries left behind by takes and not yet skipped; past the live count, the lists compact.
+    stale: usize,
 }
 
 /// A released object as it left.
@@ -173,34 +181,56 @@ impl Kept {
 
 impl Released {
     fn insert(&mut self, guid: u64, kept: Kept) {
+        self.stamp += 1;
+        let stamp = self.stamp;
         self.reuse
             .entry(kept.type_id())
             .or_default()
-            .push_back(guid);
-        self.objects.insert(guid, kept);
+            .push_back((guid, stamp));
+        if self.objects.insert(guid, (stamp, kept)).is_some() {
+            self.stale += 1;
+        }
     }
 
-    /// Takes `guid` out of the table and its type's reuse list (`0x464635`, `0x46464c`).
+    /// Takes `guid` out of the table and its type's reuse list (`0x464635`, `0x46464c`). Its
+    /// list entry stays behind, stale, for [`Self::free_oldest`] to skip.
     fn take(&mut self, guid: u64) -> Option<Kept> {
-        let kept = self.objects.remove(&guid)?;
-        if let Some(list) = self.reuse.get_mut(&kept.type_id()) {
-            list.retain(|&g| g != guid);
+        let (_, kept) = self.objects.remove(&guid)?;
+        self.stale += 1;
+        if self.stale > self.objects.len() + 64 {
+            self.compact();
         }
         Some(kept)
     }
 
     /// A new object of type `type_id` frees the oldest released one of that type (`0x466e55`,
-    /// the head of the list).
-    fn free_oldest(&mut self, type_id: u8) {
-        if let Some(guid) = self.reuse.get_mut(&type_id).and_then(VecDeque::pop_front) {
-            self.objects.remove(&guid);
+    /// the head of the list); the guid it freed.
+    fn free_oldest(&mut self, type_id: u8) -> Option<u64> {
+        let list = self.reuse.get_mut(&type_id)?;
+        while let Some((guid, stamp)) = list.pop_front() {
+            if self.objects.get(&guid).is_some_and(|(s, _)| *s == stamp) {
+                self.objects.remove(&guid);
+                return Some(guid);
+            }
+            self.stale = self.stale.saturating_sub(1);
         }
+        None
+    }
+
+    /// Drops the stale entries from every list, keeping the live ones in order.
+    fn compact(&mut self) {
+        let objects = &self.objects;
+        for list in self.reuse.values_mut() {
+            list.retain(|(g, s)| objects.get(g).is_some_and(|(live, _)| live == s));
+        }
+        self.stale = 0;
     }
 
     /// Frees every released object, as leaving the world does (`0x467700`).
     pub(crate) fn clear(&mut self) {
         self.objects.clear();
         self.reuse.clear();
+        self.stale = 0;
     }
 }
 
@@ -376,7 +406,19 @@ fn on_object_create(In(ev): In<SessionEvent>, mut sc: Scene) {
 /// allocated apart and frees nothing (`0x466e0c`).
 fn allocate(sc: &mut Scene, guid: u64, ty: ObjectType) {
     if sc.self_guid.0 != Some(guid) {
-        sc.released.free_oldest(type_id(ty));
+        if let Some(freed) = sc.released.free_oldest(type_id(ty)) {
+            free_item(sc, freed);
+        }
+    }
+}
+
+/// An object freed here: an item's lock goes with it, at this place among the packet's runs
+/// ([`crate::item_watch::Freed`]).
+fn free_item(sc: &mut Scene, object: u64) {
+    if guid::is_item(object) {
+        sc.item_lane.push(crate::item_watch::Run::freeing(
+            crate::item_watch::Freed::Items(vec![object]),
+        ));
     }
 }
 
@@ -410,6 +452,7 @@ fn on_item_create(In(ev): In<SessionEvent>, mut sc: Scene) {
         ) => {
             let moved = write_fields(&mut store, fields);
             sc.view_log.replaced(guid, None);
+            sc.view_log.countdowns(guid, None);
             let e =
                 crate::items::spawn_item(&mut sc.commands, &mut sc.index, guid, store, container);
             if let Body::Item { countdowns, .. } = body {
@@ -421,6 +464,7 @@ fn on_item_create(In(ev): In<SessionEvent>, mut sc: Scene) {
         (None, None) => {
             allocate(&mut sc, guid, item_type(container));
             sc.view_log.replaced(guid, None);
+            sc.view_log.countdowns(guid, None);
             crate::items::spawn_item(&mut sc.commands, &mut sc.index, guid, fields, container);
             sc.pass.unshown.insert(guid);
             Vec::new()
@@ -458,7 +502,7 @@ fn write_logged(
 /// A held object leaving the live table: the store it takes, logged for any unit, as one a token
 /// names now or named earlier in the frame (the target's target before it changed) reads it in
 /// the frame's earlier listeners, and for any item, as a weapon the active player wore earlier in
-/// the frame reads to the stat getters there.
+/// the frame reads to the stat getters there, with the item's countdown cells.
 fn log_destroy(sc: &mut Scene, guid: u64) {
     let Some(&e) = sc.index.0.get(&guid) else {
         return;
@@ -466,6 +510,9 @@ fn log_destroy(sc: &mut Scene, guid: u64) {
     let before = sc.stores.get(e).ok().cloned();
     if before.is_some() {
         sc.view_log.replaced(guid, before);
+    }
+    if let Ok(cells) = sc.countdowns.get(e) {
+        sc.view_log.countdowns(guid, Some(cells.clone()));
     }
 }
 
@@ -567,6 +614,7 @@ fn on_object_move(In(ev): In<SessionEvent>, mut sc: Scene) {
         &sc.index,
         &mut sc.transforms,
         &sc.movers,
+        &mut sc.remote,
     );
 }
 
@@ -612,6 +660,7 @@ fn respawn(sc: &mut Scene, guid: u64, body: Body, store: ObjectFields, pose: Opt
             let e =
                 crate::items::spawn_item(&mut sc.commands, &mut sc.index, guid, store, container);
             sc.commands.entity(e).insert(countdowns);
+            sc.view_log.countdowns(guid, None);
         }
         Body::World {
             kind,
@@ -769,15 +818,18 @@ fn on_object_destroyed(In(ev): In<SessionEvent>, mut sc: Scene, script: Option<N
         return;
     };
     crate::death::net::forget_corpse(guid, &mut sc.death_net);
-    // A released object ran its deactivate as it left.
+    // A released object ran its deactivate as it left, and is freed now.
     if sc.released.take(guid).is_some() {
+        free_item(&mut sc, guid);
         return;
     }
-    if let Some(&e) = sc.index.0.get(&guid) {
-        if held_by_play(&sc, e) {
-            sc.commands.entity(e).insert(ReleasePending);
-            return;
-        }
+    // A guid neither live nor released has nothing to release (`0x464931`, `0x46493a`).
+    let Some(&e) = sc.index.0.get(&guid) else {
+        return;
+    };
+    if held_by_play(&sc, e) {
+        sc.commands.entity(e).insert(ReleasePending);
+        return;
     }
     deactivate(&mut sc, guid, script.as_deref());
     log_destroy(&mut sc, guid);
@@ -789,18 +841,26 @@ fn on_object_destroyed(In(ev): In<SessionEvent>, mut sc: Scene, script: Option<N
     if let Some(mover) = sc.mover.as_deref_mut() {
         mover.forget(guid);
     }
-    // An item has no model to fade, so it goes now with its countdown cells.
+    // An item has no model to fade, so it goes now with its countdown cells, its lock behind its
+    // deactivate's run.
     if benilla_protocol::guid::is_item(guid) {
         sc.commands.entity(e).despawn();
+        free_item(&mut sc, guid);
         return;
     }
-    sc.commands.entity(e).queue(super::tear_down);
+    let at = crate::lanes::stamp();
+    sc.commands
+        .entity(e)
+        .queue(move |ent: EntityWorldMut| super::tear_down(ent, at, true));
 }
 
 /// The deactivate a release runs (vtable slot 1, `0x46496f`), reading the descriptor about to go:
-/// the item's (`0x5d8660`) and the party member's, which snapshots its record and sends
-/// `CMSG_REQUEST_PARTY_MEMBER_STATS`.
+/// the item's (`0x5d8660`), its head ([`super::item_deactivate::head`]) then its interface tail,
+/// and the party member's, which snapshots its record and sends `CMSG_REQUEST_PARTY_MEMBER_STATS`.
 fn deactivate(sc: &mut Scene, guid: u64, script: Option<&UiScript>) {
+    if benilla_protocol::guid::is_item(guid) {
+        super::item_deactivate::head(sc, guid);
+    }
     let gone = item_watch(&sc.index, &sc.stores, &sc.self_guid, &sc.items).destroyed_run(guid);
     sc.item_lane.push(gone.unwrap_or_default());
     let held = |g: u64| sc.index.0.get(&g).and_then(|e| sc.stores.get(*e).ok());
@@ -827,10 +887,20 @@ fn deactivate(sc: &mut Scene, guid: u64, script: Option<&UiScript>) {
     if sc.self_guid.0 == Some(guid) {
         crate::ui_mirror::stop_all(&mut sc.field_notices);
     }
-    // `CGUnit_C::Release` (`0x5fbb60`, after the player's roster legs, `0x5e9b61`): the
-    // selection's teardown (`0x5fbbe5`), unless a group row holds the guid (`0x5fbbcd`). Its run
-    // waits for the packet's end, so in one out-of-range list its sends follow a later member's
-    // `0x27f`.
+    // `CGUnit_C::Release` (`0x5fbb60`, after the player's roster legs, `0x5e9b61`): its plate
+    // freed (`0x5fbba9`), then the selection's teardown (`0x5fbbe5`), unless a group row holds the
+    // guid (`0x5fbbcd`). Its run waits for the packet's end, so in one out-of-range list its sends
+    // follow a later member's `0x27f`.
+    if held(guid).is_some_and(|s| s.is_unit()) {
+        sc.field_notices
+            .write(crate::field_watch::FieldNotice::Plate {
+                guid,
+                call: crate::vplates::PlateCall::Gone,
+            });
+    }
+    if let Some(guilds) = sc.guilds.as_deref() {
+        guilds.cancel_name_text(guid);
+    }
     {
         let held = |g: u64| held(g).map(|s| &s.0);
         let me = sc.self_guid.0;
@@ -1014,7 +1084,10 @@ fn release(sc: &mut Scene, guid: u64) {
     if sc.item_objects.contains(e) {
         sc.commands.entity(e).despawn();
     } else {
-        sc.commands.entity(e).queue(super::tear_down);
+        let at = crate::lanes::stamp();
+        sc.commands
+            .entity(e)
+            .queue(move |ent: EntityWorldMut| super::tear_down(ent, at, false));
     }
 }
 
@@ -1050,7 +1123,7 @@ fn on_update_end(
             // Deviation: a first-pass values block the clear header byte left unwritten re-fires,
             // for a live object, its last write's edges against the watch copy (`0x465570`,
             // `0x466686`); benilla compares against this packet's copies, which hold none for it,
-            // so a stale edge never fires twice.
+            // because that way a stale edge never fires twice.
             Notify::Values { guid, sent } => {
                 let moved = copies.get(&guid).unwrap_or(&none);
                 let block = Notified::new(Sent::Fields(&sent), moved);
@@ -1063,7 +1136,8 @@ fn on_update_end(
             // `0x465d79`). For a first-pass create the clear header byte left unwritten, an
             // object not live crashes the reference, and a live one runs the all-fields watch
             // (`0x465d8e`) against its stale watch copy, re-firing its last write's edges as the
-            // values block above does; benilla's [`notify`] fires nothing for either.
+            // values block above does; benilla's [`notify`] fires nothing for either, because the
+            // faults the reference's passes have on malformed packets are recorded, not copied.
             Notify::Create { guid, kind } => {
                 if unshown.remove(&guid) {
                     create_hook(&mut sc, guid, kind, script.as_deref(), &mut arrival);
@@ -1096,17 +1170,22 @@ fn notify(sc: &mut Scene, guid: u64, block: Notified, bridged: bool) {
         return;
     };
     // The `UNIT_FIELD_DISPLAYID` watcher (`0x604990`) and the health watcher's return to life
-    // (`0x6046f0`: old health not above 0, new above, `0x6047ee`-`0x604835`) rebuild the display.
+    // (`0x6046f0`: old health not above 0, new above, `0x6047ee`-`0x604835`) rebuild the display;
+    // the rebuild is announced at the first of the two edges the walk below writes.
+    let rebuilds = |index: u16, old: u32, new: u32| {
+        index == benilla_protocol::field::FIELD_UNIT_DISPLAYID
+            || (index == benilla_protocol::field::FIELD_UNIT_HEALTH
+                && old as i32 <= 0
+                && new as i32 > 0)
+    };
+    let mut rebuild_owed = None;
     if matches!(kind, ObjectType::Unit | ObjectType::Player)
-        && block.edges().any(|(index, old, new)| {
-            index == benilla_protocol::field::FIELD_UNIT_DISPLAYID
-                || (index == benilla_protocol::field::FIELD_UNIT_HEALTH
-                    && old as i32 <= 0
-                    && new as i32 > 0)
-        })
+        && block
+            .edges()
+            .any(|(index, old, new)| rebuilds(index, old, new))
     {
         let fields = fields.clone();
-        display_changed(sc, e, guid, &fields);
+        rebuild_owed = display_changed(sc, e, guid, &fields);
     }
     let Some(fields) = sc.stores.get(e).ok().map(|s| &s.0) else {
         return;
@@ -1179,6 +1258,19 @@ fn notify(sc: &mut Scene, guid: u64, block: Notified, bridged: bool) {
     // (`0x5e266b`, `0x4918e0`): an old pet the object manager holds no unit of has its selection
     // torn down (`0x5e26f7`, `0x5e2719`).
     if me == Some(guid) || sc.group.party_or_raid_member(guid) {
+        // Each of the two fields' old guid, then its new one, held as a unit has its token flags
+        // read again (`0x5e2702`, `0x5e2743`).
+        for pet in crate::field_watch::pet_guids_moved(&block, kind, fields) {
+            let held = sc
+                .index
+                .0
+                .get(&pet)
+                .and_then(|&e| sc.stores.get(e).ok())
+                .is_some_and(|s| s.is_unit());
+            if held {
+                sc.field_notices.write(token_update(pet));
+            }
+        }
         for old in crate::field_watch::pets_moved_off(&block, kind, fields) {
             let held = sc
                 .index
@@ -1225,6 +1317,14 @@ fn notify(sc: &mut Scene, guid: u64, block: Notified, bridged: bool) {
                     old,
                     new,
                 });
+                if let Some(display_id) = rebuild_owed.filter(|_| rebuilds(index, old, new)) {
+                    sc.rebuilds.write(crate::entities::DisplayRebuilt {
+                        entity: e,
+                        at,
+                        display_id,
+                    });
+                    rebuild_owed = None;
+                }
                 // The watcher runs at its range's place, where its first edge is written.
                 if crate::net::in_aura_watch(index) {
                     if let Some((old, new, health)) = aura_call.take() {
@@ -1306,6 +1406,23 @@ fn notify(sc: &mut Scene, guid: u64, block: Notified, bridged: bool) {
                     }
                 }
             }
+            // The ghost bit's corpse query (`0x5eeac1` → `0x491f50`), at its place: the cache reset,
+            // the range latch's `CORPSE_OUT_OF_RANGE` on the lane behind `PLAYER_UNGHOST`, and a
+            // ghost's `MSG_CORPSE_QUERY` sent here, as the bit stands after this packet.
+            crate::field_watch::Step::Notice(crate::field_watch::FieldNotice::QueryCorpse) => {
+                let was_in = crate::death::reset_corpse(
+                    Some(&mut sc.death_net),
+                    sc.death_latches.as_deref_mut(),
+                );
+                if was_in {
+                    sc.field_notices
+                        .write(crate::field_watch::FieldNotice::Global {
+                            id: crate::field_watch::id::CORPSE_OUT_OF_RANGE,
+                        });
+                }
+                let ghost = sc.stores.get(e).is_ok_and(|s| s.0.player_is_ghost());
+                crate::death::ask_corpse(ghost, &sc.net);
+            }
             // The quest-slot watcher's accept line (`0x5dde4f`-`0x5dde7d`), at its place.
             crate::field_watch::Step::Notice(crate::field_watch::FieldNotice::QuestAccepted {
                 quest_id,
@@ -1329,6 +1446,15 @@ fn notify(sc: &mut Scene, guid: u64, block: Notified, bridged: bool) {
             crate::field_watch::Step::Notice(n) => sc.field_notices.write(n),
             crate::field_watch::Step::Item(run) => sc.item_lane.push(run),
         }
+    }
+    // A walk that wrote neither edge still owes its rebuild, after what it wrote.
+    if let Some(display_id) = rebuild_owed {
+        let at = crate::lanes::stamp();
+        sc.rebuilds.write(crate::entities::DisplayRebuilt {
+            entity: e,
+            at,
+            display_id,
+        });
     }
     // The active player's coinage watcher `OnMoneyChanged` (`0x5ddf30`), registered on its own
     // object (`0x5dd8a0`): the trade offer's trim (`0x5ddfda`), at the packet, behind the
@@ -1399,31 +1525,7 @@ fn create_hook(
         return;
     };
     match kind {
-        Created::Item => {
-            // The record, set up at once when cached, for our item in the world, and its signal
-            // for the owner of any item.
-            let run = item_watch(&sc.index, &sc.stores, &sc.self_guid, &sc.items).created_run(
-                guid,
-                &fields,
-                &sc.bag_cache,
-            );
-            // The set-up asks for the record of every item, whoever's, with the callback
-            // `0x5d8390` (`0x5d8300` into `0x55ba30`): the readers of a held item only read it.
-            if let Some(entry) = fields.object_entry() {
-                if sc
-                    .items
-                    .template(entry, guid, Ask::Event(&sc.net))
-                    .is_none()
-                {
-                    sc.items
-                        .wait(entry, crate::items::RecordCallback::SetUp(guid));
-                }
-            }
-            if let Some(crate::item_watch::ItemNotice::Record { guid, .. }) = run.notice {
-                super::replay_enchant_times(&mut sc.items, &mut sc.countdowns, &sc.index, guid);
-            }
-            sc.item_lane.push(run);
-        }
+        Created::Item => request_item_record(sc, guid, &fields),
         Created::World(EntityKind::Player) => {
             // Our own create runs the world-enter cascade (`0x5deb60` → `0x4908c0`), whose bag
             // watcher set-up zeroes and rescans the bag cache (`0x49098d` → `0x4f8cc0`).
@@ -1442,9 +1544,16 @@ fn create_hook(
             // The unit's `PostInit` (`0x5dec09` → `0x5fb880`): its far-sight arrival, ahead of
             // its tail (`0x60c520`, `0x606fe0`, `0x607710`, `0x5ff130`, `0x612a30`).
             far_sight_arrives(sc, guid);
+            sc.field_notices.write(token_update(guid));
             sc.names.lookup_fields(guid, &fields, &sc.net);
             sc.field_notices
                 .write_batch(crate::field_watch::guild_tag(guid));
+            // Then the recruitment cascade (`0x5dec1e`), for our create alone (the deviation in
+            // `crate::ui_chat`'s recruitment).
+            if sc.self_guid.0 == Some(guid) {
+                sc.field_notices
+                    .write(crate::field_watch::FieldNotice::RecruitmentCascade);
+            }
             // `0x5dec35` → `0x4e85d0` mode 1: a party slot's `PARTY_MEMBER_ENABLE`.
             sc.group.member_object(guid, true);
             if sc.self_guid.0 != Some(guid) {
@@ -1456,7 +1565,9 @@ fn create_hook(
         Created::World(EntityKind::Unit) => {
             resolve_display_records(sc, guid, &fields);
             sc.names.lookup_fields(guid, &fields, &sc.net);
+            // `PostInit` (`0x5fb880`): the far-sight arrival, then the token flags (`0x60c520`).
             far_sight_arrives(sc, guid);
+            sc.field_notices.write(token_update(guid));
         }
         // `OnCreate` (`0x5d5420`): a far-sight focus (the bytes' low byte 2, `0x5d54a7`) that
         // the active player cast (`0x5d54b6`) is the far-sight arrival's.
@@ -1477,10 +1588,13 @@ fn create_hook(
 }
 
 /// Vtable slot 3 of an object the packet brought back: a unit's (`0x5fbe00`) rebuilds its display
-/// when its records changed while it was away (`0x5fbe28` → `0x60abe0`); a player's `PostUpdate`
+/// when its records changed while it was away (`0x5fbe28` → `0x60abe0`) and reads its token flags
+/// again, which its release dropped (`0x5fbe36`, `0x5fbc44`); a player's `PostUpdate`
 /// (`0x5dec90`) runs the unit's, then compares its party record (`0x5decb7`), with no
 /// active-player gate, as the active player is never released; a game object's (`0x5f7ed0`) asks
-/// its template when it holds none (`+0x214`, `0x558560` at `0x5f7f31`).
+/// its template when it holds none (`+0x214`, `0x558560` at `0x5f7f31`); an item's and a bag's
+/// (`0x5d8430` → `0x5d8300`) request their record as their create did, set up at once when
+/// cached ([`request_item_record`]).
 fn reactivated_end(sc: &mut Scene, guid: u64, script: Option<&UiScript>) {
     let Some(e) = sc.index.0.get(&guid).copied() else {
         return;
@@ -1489,16 +1603,54 @@ fn reactivated_end(sc: &mut Scene, guid: u64, script: Option<&UiScript>) {
         return;
     };
     match fields.created_as() {
-        Some(ObjectType::Unit) => display_changed(sc, e, guid, &fields),
+        Some(ObjectType::Unit) => {
+            reactivated_rebuild(sc, e, guid, &fields);
+            sc.field_notices.write(token_update(guid));
+        }
         Some(ObjectType::Player) => {
-            display_changed(sc, e, guid, &fields);
+            reactivated_rebuild(sc, e, guid, &fields);
+            sc.field_notices.write(token_update(guid));
             // `0x5deca1` → `0x4e85d0` mode 1.
             sc.group.member_object(guid, true);
             compare_party_record(sc, guid, &fields, script);
         }
         Some(ObjectType::GameObject) => sc.go_templates.request_at_create(guid, &fields, &sc.net),
+        Some(ObjectType::Item | ObjectType::Container) => request_item_record(sc, guid, &fields),
         _ => {}
     }
+}
+
+/// `CGItem_C::RequestRecord` (`0x5d8300`), an item's create hook (`0x5d8400`) and its slot 3
+/// (`EndReactivation 0x5d8430`): the record, set up at once when cached (`0x5d834a` →
+/// `0x5d8440`), for our item in the world, and its signal for the owner of any item; a miss asks
+/// for it with the callback `0x5d8390` (`0x5d833f` → `0x55ba30`), whoever's the item. The readers
+/// of a held item only read it.
+fn request_item_record(sc: &mut Scene, guid: u64, fields: &ObjectFields) {
+    let run = item_watch(&sc.index, &sc.stores, &sc.self_guid, &sc.items).created_run(
+        guid,
+        fields,
+        &sc.bag_cache,
+    );
+    if let Some(entry) = fields.object_entry() {
+        if sc
+            .items
+            .template(entry, guid, Ask::Event(&sc.net))
+            .is_none()
+        {
+            sc.items
+                .wait(entry, crate::items::RecordCallback::SetUp(guid));
+        }
+    }
+    if let Some(crate::item_watch::ItemNotice::Record { guid, .. }) = run.notice {
+        super::replay_enchant_times(
+            &mut sc.items,
+            &mut sc.countdowns,
+            &sc.index,
+            &mut sc.view_log,
+            guid,
+        );
+    }
+    sc.item_lane.push(run);
 }
 
 /// `CGUnit_C::ResolveDisplayRecords` from the unit's `PostInit` (`0x5fb88b` → `0x60afb0`): the
@@ -1519,30 +1671,39 @@ fn resolve_display_records(sc: &mut Scene, guid: u64, fields: &ObjectFields) {
     }
 }
 
+/// Slot 3's rebuild (`0x5fbe28`), after the packet's walk: announced with a stamp of its own.
+fn reactivated_rebuild(sc: &mut Scene, e: Entity, guid: u64, fields: &ObjectFields) {
+    if let Some(display_id) = display_changed(sc, e, guid, fields) {
+        let at = crate::lanes::stamp();
+        sc.rebuilds.write(crate::entities::DisplayRebuilt {
+            entity: e,
+            at,
+            display_id,
+        });
+    }
+}
+
 /// `CGUnit_C::OnDisplayChanged` (`0x60abe0`), from the `UNIT_FIELD_DISPLAYID` watcher
 /// (`0x6049b5`), the health watcher's return to life (`0x604835`) and slot 3 (`0x5fbe28`): when
 /// `0x60ae10` sees a new record set the unit resolves its records again (`0x60ac21`), and a
-/// creature asks its record (`0x60b15b`).
-fn display_changed(sc: &mut Scene, e: Entity, guid: u64, fields: &ObjectFields) {
-    let Some(creatures) = sc.creatures.as_deref() else {
-        return;
-    };
-    let Ok(mut held) = sc.held_displays.get_mut(e) else {
-        return;
-    };
+/// creature asks its record (`0x60b15b`). The row it rebuilt from, which the caller announces
+/// ([`crate::entities::DisplayRebuilt`]) at the watcher's place; `None` for no rebuild.
+fn display_changed(sc: &mut Scene, e: Entity, guid: u64, fields: &ObjectFields) -> Option<u32> {
+    let creatures = sc.creatures.as_deref()?;
+    let mut held = sc.held_displays.get_mut(e).ok()?;
     let display = unit_display(fields);
-    let Some(was) = held.0 else {
-        return;
-    };
+    let was = held.0?;
     if !creatures.display_records_differ(display, was) {
-        return;
+        return None;
     }
-    held.0 = creatures.records_row(display);
+    let row = creatures.records_row(display);
+    held.0 = row;
     // The body rebuilt (`0x60abe0`) dresses both pieces by the flag (`0x5ed802`, `0x5ed81a`).
     if let Ok(mut pins) = sc.worn_pins.get_mut(e) {
         pins.rebuilt();
     }
     sc.names.ask_creature_record(guid, fields, &sc.net);
+    row
 }
 
 /// `UNIT_FIELD_DISPLAYID` as the resolve reads it, absent as 0 (vmangos omits zero fields).
@@ -1582,4 +1743,73 @@ fn compare_party_record(
     );
     let notices = crate::ui_party::record_notices(guid, &old, &live);
     sc.field_notices.write_batch(notices);
+}
+
+/// `UpdateUnitTokenFlags` (`0x60c520`) on `guid` at the notice's place.
+fn token_update(guid: u64) -> crate::field_watch::FieldNotice {
+    crate::field_watch::FieldNotice::TokenFlags {
+        guid,
+        change: benilla_ui::script::TokenChange::Update,
+    }
+}
+
+#[cfg(test)]
+mod released_tests {
+    use super::{Body, Kept, Released};
+
+    fn item(container: bool) -> Kept {
+        Kept {
+            fields: Default::default(),
+            body: Body::Item {
+                container,
+                countdowns: Default::default(),
+            },
+        }
+    }
+
+    /// A take out of the middle leaves the rest freed oldest first, the taken guid never freed,
+    /// and a guid released again joins at the tail, not at its old place.
+    #[test]
+    fn takes_keep_the_reuse_order() {
+        let mut r = Released::default();
+        for g in 1..=5 {
+            r.insert(g, item(false));
+        }
+        assert!(r.take(3).is_some());
+        assert!(r.take(3).is_none(), "a taken guid is gone");
+        assert!(r.take(1).is_some());
+        r.insert(1, item(false));
+        let freed: Vec<u64> = std::iter::from_fn(|| r.free_oldest(1)).collect();
+        assert_eq!(freed, [2, 4, 5, 1]);
+        assert!(r.objects.is_empty());
+    }
+
+    /// Each type keeps its own list: a container's release is not freed by a new item.
+    #[test]
+    fn the_lists_are_per_type() {
+        let mut r = Released::default();
+        r.insert(10, item(true));
+        r.insert(11, item(false));
+        assert_eq!(r.free_oldest(1), Some(11));
+        assert_eq!(r.free_oldest(1), None);
+        assert_eq!(r.free_oldest(2), Some(10));
+    }
+
+    /// Many takes with no frees compact the lists, so stale entries do not pile up, and the live
+    /// order survives the compaction.
+    #[test]
+    fn stale_entries_compact() {
+        let mut r = Released::default();
+        for g in 1..=1000 {
+            r.insert(g, item(false));
+        }
+        for g in (1..=1000).filter(|g| g % 10 != 0) {
+            r.take(g);
+        }
+        // Stale entries never pass the live count by more than 64 before a compaction.
+        assert!(r.reuse[&1].len() <= 2 * r.objects.len() + 65);
+        assert!(r.reuse[&1].len() < 1000, "the takes compacted the list");
+        let freed: Vec<u64> = std::iter::from_fn(|| r.free_oldest(1)).collect();
+        assert_eq!(freed, (1..=100).map(|g| g * 10).collect::<Vec<_>>());
+    }
 }
