@@ -144,3 +144,57 @@ function BenillaPad_Snap(dir, x, y)
     end
     return nil
 end
+
+-- ── The focus glow ──
+-- A gold outline round the button under the pad cursor (a console UI's frame focus), so the
+-- pointer is never lost: the OS cursor is small, the outline follows whatever it is over, snapped
+-- by the D-pad or moved by the stick. Drawn in the DIALOG strata over the windows it outlines.
+
+local glow = CreateFrame("Frame", "BenillaPadFocusGlow", UIParent)
+glow:SetFrameStrata("TOOLTIP")
+glow:Hide()
+local function edge()
+    local t = glow:CreateTexture(nil, "OVERLAY")
+    t:SetTexture(1, 0.82, 0.2, 0.95)
+    return t
+end
+local TH = 2
+local top, bottom, left, right = edge(), edge(), edge(), edge()
+top:SetPoint("TOPLEFT", glow, "TOPLEFT", 0, 0)
+top:SetPoint("TOPRIGHT", glow, "TOPRIGHT", 0, 0)
+top:SetHeight(TH)
+bottom:SetPoint("BOTTOMLEFT", glow, "BOTTOMLEFT", 0, 0)
+bottom:SetPoint("BOTTOMRIGHT", glow, "BOTTOMRIGHT", 0, 0)
+bottom:SetHeight(TH)
+left:SetPoint("TOPLEFT", glow, "TOPLEFT", 0, 0)
+left:SetPoint("BOTTOMLEFT", glow, "BOTTOMLEFT", 0, 0)
+left:SetWidth(TH)
+right:SetPoint("TOPRIGHT", glow, "TOPRIGHT", 0, 0)
+right:SetPoint("BOTTOMRIGHT", glow, "BOTTOMRIGHT", 0, 0)
+right:SetWidth(TH)
+local fill = glow:CreateTexture(nil, "ARTWORK")
+fill:SetAllPoints(glow)
+fill:SetTexture(1, 0.82, 0.2, 0.12)
+
+local glowElapsed = 0
+local poll = CreateFrame("Frame", nil, UIParent)
+poll:SetScript("OnUpdate", function()
+    glowElapsed = glowElapsed + arg1
+    if glowElapsed < 0.05 then
+        return
+    end
+    glowElapsed = 0
+    local f = P.connected and P.mode == "world" and Cursor.Wanted() and GetMouseFocus()
+    local kind = f and f.GetObjectType and f:GetObjectType()
+    if not (f and (kind == "Button" or kind == "CheckButton") and f:IsVisible() and f:GetLeft()) then
+        glow:Hide()
+        return
+    end
+    -- In UIParent's units: the button's absolute rectangle over UIParent's scale.
+    local s = f:GetEffectiveScale() / UIParent:GetEffectiveScale()
+    glow:ClearAllPoints()
+    glow:SetPoint("BOTTOMLEFT", UIParent, "BOTTOMLEFT", f:GetLeft() * s - 3, f:GetBottom() * s - 3)
+    glow:SetWidth(f:GetWidth() * s + 6)
+    glow:SetHeight(f:GetHeight() * s + 6)
+    glow:Show()
+end)
