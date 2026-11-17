@@ -284,6 +284,7 @@ fn drive_pad(
     scroll: ResMut<AccumulatedMouseScroll>,
     input: SynthInput,
     glue: Local<Vec<(GamepadButton, GlueInput)>>,
+    glue_kb: Local<GlueKeyboard>,
 ) {
     vm.run(|script| {
         drive(
@@ -298,6 +299,7 @@ fn drive_pad(
             scroll,
             input,
             glue,
+            glue_kb,
         );
     });
 }
@@ -316,6 +318,7 @@ fn drive(
     mut scroll: ResMut<AccumulatedMouseScroll>,
     mut input: SynthInput,
     mut glue: Local<Vec<(GamepadButton, GlueInput)>>,
+    mut glue_kb: Local<GlueKeyboard>,
 ) {
     // Before the world (login, realm list, character select) the VM is the boot one, with no
     // stock UI loaded (`UIParent` is FrameXML's): nothing of the world's survives, and the pad
@@ -331,10 +334,14 @@ fn drive(
             .ok()
         })
         .unwrap_or((false, None, None));
-    let Some(script) = script.filter(|_| in_world) else {
+    if !in_world {
         *state = PadState::default();
+        let pad = pads.iter().next().map(|(_, g)| g);
+        if let Some(script) = script.as_deref() {
+            glue_kb.sync(script, pad.is_some());
+        }
         drive_glue(
-            pads.iter().next().map(|(_, g)| g),
+            pad,
             &settings,
             &time,
             windows
@@ -344,7 +351,11 @@ fn drive(
                 .as_mut(),
             &mut input,
             &mut glue,
+            script.as_deref().filter(|_| glue_kb.edit.is_some()),
         );
+        return;
+    }
+    let Some(script) = script else {
         return;
     };
     // Entering the world with a glue key still held: let go of it.
@@ -634,13 +645,15 @@ enum GlueInput {
     Mouse(MouseButton),
 }
 
-/// The pad before the world: A is Enter (log in, enter the world, a dialog's Okay), B is Escape
-/// (back, Cancel), the D-pad is the arrow keys (the character and realm lists), Y is Tab (the
-/// next box), X clicks, and the right stick moves the cursor. These are the keys the screens
+/// The pad before the world: A and Start are Enter (log in, enter the world, a dialog's Okay), B
+/// is Escape (back, Cancel), the D-pad is the arrow keys (the character and realm lists), Y is Tab
+/// (the next box), X clicks, and the right stick moves the cursor. These are the keys the screens
 /// read (`login`, `realm_select`, `char_select`).
 fn glue_input(button: GamepadButton) -> Option<GlueInput> {
     Some(match button {
         GamepadButton::South => GlueInput::Key(KeyCode::Enter),
+        // Enter too: while the on-screen keyboard is up, A types and Start logs in.
+        GamepadButton::Start => GlueInput::Key(KeyCode::Enter),
         GamepadButton::East => GlueInput::Key(KeyCode::Escape),
         GamepadButton::DPadUp => GlueInput::Key(KeyCode::ArrowUp),
         GamepadButton::DPadDown => GlueInput::Key(KeyCode::ArrowDown),
@@ -782,6 +795,46 @@ fn release_glue(held: GlueInput, input: &mut SynthInput) {
     }
 }
 
+/// The login screens' on-screen keyboard (`glue/GlueKeyboard.lua`), run in the glue VM: the
+/// BenillaPad addon loads only in the world.
+#[derive(Default)]
+struct GlueKeyboard {
+    /// The glue VM session the keyboard's chunk was run in.
+    session: Option<u64>,
+    /// The EditBox the keyboard types into, by name, while one has the focus and a pad is in.
+    edit: Option<String>,
+}
+
+const GLUE_KEYBOARD_LUA: &str = include_str!("../glue/GlueKeyboard.lua");
+
+impl GlueKeyboard {
+    /// Run the chunk once per glue VM, and show the keyboard under the focused EditBox.
+    fn sync(&mut self, script: &UiScript, pad: bool) {
+        let session = script.session();
+        if self.session != Some(session) {
+            self.session = Some(session);
+            self.edit = None;
+            if let Err(e) = script.run(GLUE_KEYBOARD_LUA) {
+                warn!("pad: the glue keyboard failed to load: {e}");
+            }
+        }
+        let edit = if pad && script.has_keyboard_focus() {
+            script.focused_editbox_name()
+        } else {
+            None
+        };
+        if edit != self.edit {
+            let arg = edit.as_deref().map_or("nil".to_string(), map::lua_str);
+            if let Err(e) = script.run(&format!(
+                "if BenillaPadGlue_Sync then BenillaPadGlue_Sync({arg}) end"
+            )) {
+                warn!("pad: the glue keyboard's sync failed: {e}");
+            }
+            self.edit = edit;
+        }
+    }
+}
+
 /// The pad on the screens before the world ([`glue_input`]).
 fn drive_glue(
     pad: Option<&Gamepad>,
@@ -790,6 +843,7 @@ fn drive_glue(
     window: Option<&mut CursorWindow>,
     synth: &mut SynthInput,
     held: &mut Vec<(GamepadButton, GlueInput)>,
+    keyboard: Option<&UiScript>,
 ) {
     let mut i = 0;
     while i < held.len() {
@@ -807,6 +861,20 @@ fn drive_glue(
     for (button, _) in map::BUTTONS {
         if !pad.just_pressed(button) {
             continue;
+        }
+        // With an EditBox focused the on-screen keyboard takes the keys it uses.
+        if let Some(script) = keyboard {
+            let name = map::BUTTONS
+                .iter()
+                .find(|(b, _)| *b == button)
+                .map_or("", |(_, n)| *n);
+            let chunk = format!(
+                "if BenillaPadGlue_Press then return BenillaPadGlue_Press({}) end return false",
+                map::lua_str(name)
+            );
+            if script.eval::<bool>(&chunk).unwrap_or(false) {
+                continue;
+            }
         }
         if let Some(input) = glue_input(button) {
             match input {
