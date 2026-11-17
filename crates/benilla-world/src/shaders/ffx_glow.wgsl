@@ -115,20 +115,20 @@ fn fs_downsample(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
 }
 
 #ifdef MODERN_LOOK
-// benilla-gamepad fork: the Modern look's Box4, the taps unclamped (capped only against inf).
+// benilla-gamepad fork: the Modern look's Box4 — each tap decoded to linear and left unclamped
+// (capped only against inf), so the energy above white survives into the blur as bloom.
 fn box4_hdr(uv: vec2<f32>) -> vec3<f32> {
     let texel = 1.0 / vec2<f32>(textureDimensions(in_tex));
-    let cap = vec4<f32>(64.0);
-    return ((min(textureSample(in_tex, in_samp, uv + vec2<f32>(-1.5, -1.5) * texel), cap)
-        + min(textureSample(in_tex, in_samp, uv + vec2<f32>(0.5, -1.5) * texel), cap)
-        + min(textureSample(in_tex, in_samp, uv + vec2<f32>(0.5, 0.5) * texel), cap)
-        + min(textureSample(in_tex, in_samp, uv + vec2<f32>(-1.5, 0.5) * texel), cap))
-        * 0.25).rgb;
+    return (modern_decode(textureSample(in_tex, in_samp, uv + vec2<f32>(-1.5, -1.5) * texel).rgb)
+        + modern_decode(textureSample(in_tex, in_samp, uv + vec2<f32>(0.5, -1.5) * texel).rgb)
+        + modern_decode(textureSample(in_tex, in_samp, uv + vec2<f32>(0.5, 0.5) * texel).rgb)
+        + modern_decode(textureSample(in_tex, in_samp, uv + vec2<f32>(-1.5, 0.5) * texel).rgb))
+        * 0.25;
 }
 
 @fragment
 fn fs_downsample_hdr(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
-    return vec4<f32>(min(box4_hdr(in.uv), vec3<f32>(1.0)), 1.0);
+    return vec4<f32>(box4_hdr(in.uv), 1.0);
 }
 
 #ifdef WATER_GLOW
@@ -136,7 +136,7 @@ fn fs_downsample_hdr(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
 @fragment
 fn fs_downsample_water_hdr(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     let e = fs_downsample_water_excess(in.position.xy);
-    return vec4<f32>(min(box4_hdr(in.uv), vec3<f32>(1.0)), e);
+    return vec4<f32>(box4_hdr(in.uv), e);
 }
 #endif
 #endif
@@ -191,6 +191,97 @@ fn combine_out(outg: vec3<f32>, alpha: f32, frag_coord: vec2<f32>) -> vec4<f32> 
 #endif
 }
 
+#ifdef MODERN_LOOK
+// ---- benilla-gamepad fork: the Modern look (`modern::look`) ------------------------------------
+//
+// The world draws the reference's gamma frame; the combine decodes it once, exposes it
+// (`look.x`), adds the blur's energy above `look.z` as bloom (`look.y`), rolls a shoulder into
+// [0, 1] and encodes again, so the reference's glow, haze and death math runs unchanged on a
+// tonemapped picture.
+
+/// The scene's linear value, capped only against inf.
+const MODERN_SCENE_CAP: f32 = 64.0;
+/// The tonemap's knee (linear): identity below it, so a midtone keeps its reference value.
+const MODERN_KNEE: f32 = 0.8;
+
+/// A gamma value (possibly above 1, the float target does not saturate) to linear, capped.
+fn modern_decode(g: vec3<f32>) -> vec3<f32> {
+    return min(srgb_to_linear(max(g, vec3<f32>(0.0))), vec3<f32>(MODERN_SCENE_CAP));
+}
+
+/// Linear to gamma, the exact piecewise sRGB curve.
+fn modern_encode(c: vec3<f32>) -> vec3<f32> {
+    let x = max(c, vec3<f32>(0.0));
+    let lo = x * 12.92;
+    let hi = 1.055 * pow(x, vec3<f32>(1.0 / 2.4)) - vec3<f32>(0.055);
+    return select(hi, lo, x <= vec3<f32>(0.0031308));
+}
+
+/// Identity below the knee, an exponential shoulder above it that approaches white unclipped.
+fn modern_tonemap(x: vec3<f32>) -> vec3<f32> {
+    let k = MODERN_KNEE;
+    let over = max(x - vec3<f32>(k), vec3<f32>(0.0));
+    let rolled = vec3<f32>(k) + (1.0 - k) * (vec3<f32>(1.0) - exp(-over / (1.0 - k)));
+    return select(x, rolled, x > vec3<f32>(k));
+}
+
+/// The combine's two inputs after the Modern look, both gamma in [0, 1].
+struct ModernInputs {
+    sg: vec3<f32>,
+    bg: vec3<f32>,
+}
+
+/// The Modern look on the scene `scene_g` (gamma), the decoded blur `blur_lin` (`box4_hdr`'s,
+/// Gauss-blurred) and `extra`, linear light added to the bloom (the water glow).
+fn modern_inputs(uv: vec2<f32>, scene_g: vec3<f32>, blur_lin: vec3<f32>, extra: vec3<f32>) -> ModernInputs {
+    let exposure = ffx.look.x;
+    let scene_x = modern_decode(scene_g) * exposure;
+    let blur_x = max(blur_lin, vec3<f32>(0.0)) * exposure;
+    // The death pass reads a byte framebuffer (`0x6cdf20`): a ghost's blur stops at white.
+    let blur_hdr = select(blur_x, min(blur_x, vec3<f32>(1.0)), ffx.lane.y > 0.0);
+    let bloom = max(blur_hdr - vec3<f32>(ffx.look.z), vec3<f32>(0.0)) * ffx.look.y + extra;
+    let sg = modern_encode(modern_tonemap(scene_x + bloom));
+    return ModernInputs(sg, modern_encode(modern_tonemap(blur_hdr)));
+}
+
+/// The reference's tail on the Modern look's inputs: the death combine, or the haze and the glow.
+fn modern_tail(sg: vec3<f32>, bg: vec3<f32>, scene_a: f32, frag_coord: vec2<f32>) -> vec4<f32> {
+    if ffx.lane.y > 0.0 {
+        let glowed = sg + ffx.lane.x * bg * bg;
+        let luma = clamp(dot(glowed, vec3<f32>(0.299, 0.587, 0.144)), 0.0, 1.0);
+        let p = clamp(4.0 * luma * (1.0 - luma), 0.0, 1.0);
+        let ghost_tint = vec3<f32>(83.0, 147.0, 168.0) / 255.0; // 0x5393A8
+        let outg = min(vec3<f32>(luma) + ghost_tint * p, vec3<f32>(1.0));
+        return combine_out(outg, scene_a, frag_coord);
+    }
+    let hazed = mix(sg, bg, ffx.lane.z);
+    let outg = min(hazed + ffx.lane.x * bg * bg, vec3<f32>(1.0));
+    return combine_out(outg, scene_a, frag_coord);
+}
+
+// Both combines, at the plain or the warped UV: the scene unclamped, its light above white is
+// the bloom's.
+fn combine_body(uv: vec2<f32>, frag_coord: vec2<f32>) -> vec4<f32> {
+    let scene = textureSample(in_tex, in_samp, uv);
+    return combine_body_on(uv, frag_coord, max(scene.rgb, vec3<f32>(0.0)), scene.a);
+}
+
+// [`combine_body`] on the scene colour `scene_g` (gamma) and alpha `scene_a`. The water glow
+// joins the bloom as linear light, in the hue of its neighbourhood, instead of
+// `water_glow_over`'s square-law add on the output.
+fn combine_body_on(uv: vec2<f32>, frag_coord: vec2<f32>, scene_g: vec3<f32>, scene_a: f32) -> vec4<f32> {
+#ifdef WATER_GLOW
+    let blur4 = water_glow_wide(uv);
+    let e = min(max(blur4.a, 0.0), ffx.wave.w) * ffx.wave.z;
+    let m = max(blur4.r, max(blur4.g, blur4.b));
+    let hue = select(vec3<f32>(1.0), blur4.rgb / m, m > 1e-3);
+    let look = modern_inputs(uv, scene_g, blur4.rgb, e * hue);
+#else
+    let look = modern_inputs(uv, scene_g, textureSample(blur_tex, in_samp, uv).rgb, vec3<f32>(0.0));
+#endif
+    return modern_tail(look.sg, look.bg, scene_a, frag_coord);
+}
+#else
 // Both combines, at the plain or the warped UV; `frag_coord` stays unwarped for the dither.
 fn combine_body(uv: vec2<f32>, frag_coord: vec2<f32>) -> vec4<f32> {
     let scene = textureSample(in_tex, in_samp, uv);
@@ -228,6 +319,7 @@ fn combine_body_on(uv: vec2<f32>, frag_coord: vec2<f32>, sg: vec3<f32>, scene_a:
 #endif
     return combine_out(outg, scene.a, frag_coord);
 }
+#endif
 
 @fragment
 fn fs_combine(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
@@ -1209,8 +1301,20 @@ fn fs_combine_wave_improved(in: FullscreenVertexOutput) -> @location(0) vec4<f32
     let n_recv = normalize(cross(dpdx(p), dpdy(p)) + vec3<f32>(0.0, 1e-7, 0.0));
     let scene = textureSample(in_tex, in_samp, uv);
     let lit = uw_sun_lit(p, uw.shadow);
+#ifdef MODERN_LOOK
+    // benilla-gamepad fork: the Modern look on the water's transport and the decoded blur.
+    let look = modern_inputs(
+        uv,
+        wu_post(clamp(scene.rgb, vec3<f32>(0.0), vec3<f32>(1.0)), rd, z, n_recv, lit, uw),
+        textureSample(blur_tex, in_samp, uv).rgb,
+        vec3<f32>(0.0),
+    );
+    let sg = look.sg;
+    let bg = look.bg;
+#else
     let sg = wu_post(clamp(scene.rgb, vec3<f32>(0.0), vec3<f32>(1.0)), rd, z, n_recv, lit, uw);
     let bg = max(textureSample(blur_tex, in_samp, uv).rgb, vec3<f32>(0.0));
+#endif
     let hazed = mix(sg, min(bg, vec3<f32>(1.0)), ffx.lane.z * UW_HAZE_KEEP);
     let outg = min(hazed + ffx.lane.x * bg * bg, vec3<f32>(1.0));
     return combine_out(outg, scene.a, in.position.xy);
