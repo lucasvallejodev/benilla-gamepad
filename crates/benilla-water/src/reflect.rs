@@ -1,0 +1,2131 @@
+//! The stylised water's **planar reflection** — a second camera, mirrored through the water plane,
+//! rendering the world into an off-screen image the water samples by screen UV.
+//!
+//! **This belongs to the stylised look and to nothing else.** The 1.12 client has no reflection of
+//! any kind on this path (its water is a depth swatch, an animated sheet and a specular sheen), so
+//! everything here is off, and costs nothing, while `waterStyle` is Reference. What it reproduces is
+//! the shape the *reference's own Ultra water* has — a real mirrored-camera capture, which is the
+//! only mechanical difference between High and Ultra in the 4.3.4 renderer this project's sibling
+//! sandbox reverse-engineered.
+//!
+//! ## The three things that are load-bearing
+//!
+//! - **The mirror is not a rotation.** A true planar reflection is `view · R` with `R` the mirror
+//!   through the plane, and that matrix has a negative determinant — no `Transform` can hold it.
+//!   `looking_to(R·forward, R·up)` differs from it in exactly one respect: its right vector is
+//!   negated, which flips the image horizontally. The shader samples at `1 − u` to undo that. It is
+//!   the exact correction, not a fudge, and it holds at any camera roll.
+//! - **Alpha is coverage.** The camera clears to fully transparent, so a texel's alpha says whether
+//!   the mirrored view drew anything there. Where it did not, the water keeps the Fresnel sky mix it
+//!   would have had — which is why the sky needs no special case and a reflection that fails to
+//!   render degrades to the look without one rather than to a hole.
+//! - **The water itself must not be in it.** The mirrored camera sits below the plane looking up
+//!   through it, so the water surface is between it and everything it is there to capture — and
+//!   liquid draws blended with depth-write off, so it would not occlude the reflection, it would
+//!   wash it teal. Liquid surfaces therefore ride [`WATER_RENDER_LAYER`], which the world camera
+//!   renders and this one does not.
+//!
+//! ## What it costs, and what that buys back
+//!
+//! A second pass over the world's draws. Two things hold it down: the target is **half the main
+//! view's resolution** (it is sampled through a rippling normal — the detail is not recoverable and
+//! not missed), and the pass is **inactive** whenever the look is off, no water is near the eye, or
+//! the eye is under the surface. The oblique clip below pays for part of the rest: the mirror draws
+//! nothing under the waterline.
+//!
+//! It renders **every frame**. Alternating was the third saving and it is gone: it judders (see
+//! [`drive_reflection`]) and, measured, it bought 1.7 %.
+
+use bevy::asset::RenderAssetUsages;
+use bevy::camera::{ClearColorConfig, PerspectiveProjection, RenderTarget};
+use bevy::math::Mat3;
+use bevy::prelude::*;
+use bevy::render::extract_resource::{ExtractResource, ExtractResourcePlugin};
+use bevy::render::render_resource::{
+    Buffer, BufferDescriptor, BufferUsages, Extent3d, TextureDimension, TextureFormat,
+    TextureUsages,
+};
+use bevy::render::renderer::{RenderDevice, RenderQueue};
+use bevy::render::{Render, RenderApp, RenderSystems};
+
+use super::floor_share::FloorOnScreen;
+use super::WaterChunkInfo;
+use super::WaterStyle;
+use crate::view::WorldCamera;
+use benilla_assets::coords::{bevy_to_wow, wow_to_bevy};
+use benilla_world::liquid::{
+    mirror_view_shape, ReflectionCamera, CLOCK_LANES, DOME_LANES, LOOK_LANES, LOOK_QUALITY,
+    LOOK_WATER_RECT, MARCH_LANES, MIRROR2_LANES, PREVIEW_LANES, PROBE_LANES, REFLECT_FLOATS,
+};
+
+/// How far from the eye a water surface may be and still be the **fallback** plane — the "water
+/// beside me" answer used when the view ray hits nothing, in yards. Finite, because the pass is a
+/// second world draw and a player crossing a continent should not pay for it.
+///
+/// This is deliberately NOT the reach of the look test; see [`look_reach`].
+const REFLECT_RADIUS: f32 = 120.0;
+
+/// How far the look test reaches — **the player's own view distance**, not a constant.
+///
+/// Split from [`REFLECT_RADIUS`] because the two answer different questions and sharing a number
+/// made the far case wrong. The surface you are *watching* is routinely past 120 yd — a lake seen
+/// from a ridge, the sea from a cliff path — and with one radius the ray test found nothing out
+/// there and fell through to "nearest", which is the stream at your feet. The capture was then
+/// built for the puddle's plane while the lake filled the screen: not a missing reflection, a wrong
+/// one, and the reported "at some distance the reflection is not correct".
+///
+/// **It is `farclip` because any other number is a second, invisible view distance.** This was
+/// briefly a flat 600, which is inside the 717 a player on the slider's upper half is running: the
+/// world drew water for another 117 yd that the reflection had already given up on, and the seam
+/// moved whenever they touched the slider. `farclip` is also the honest ceiling in the other
+/// direction — past it the liquid is not resident (`terrain_stream::window` sizes residency from
+/// the same number), so there is nothing to find and the WDL horizon is drawing instead.
+///
+/// The proximity fallback keeps [`REFLECT_RADIUS`], because a plane picked for a surface half a
+/// zone away is a worse answer for the water you are standing in than the water you are standing
+/// in is.
+fn look_reach(farclip: f32) -> f32 {
+    farclip.max(REFLECT_RADIUS)
+}
+
+/// The mirror's own far clip, in yards — **not** the world camera's.
+///
+/// The pass inherited the world lens whole (only its near plane was replaced), and the world lens
+/// reaches about 3000 yd: far beyond `farclip` on purpose, so the coarse WDL horizon can draw
+/// behind the wall (`view::within_farclip`). The mirror inherited that reach for an image that is
+/// downscaled, sampled through a rippling normal, and mixed in at the water's Fresnel share, at
+/// most the grazing limit — a second horizon's worth of culling and draws, for a picture that cannot show it.
+///
+/// **This is a frustum bound, not a clip plane.** Bevy's perspective matrix is
+/// `perspective_infinite_reverse_rh` and does not carry `far` at all; `far` builds the [`Frustum`]
+/// the per-view visibility pass tests against, so what this buys is entities never reaching the
+/// mirror's draw list. Nothing is clipped mid-mesh and there is no wall in the image — geometry
+/// simply stops being submitted.
+///
+/// Five hundred rather than the two or three hundred the near field would justify, because the
+/// reflection is at its *strongest* where it shows the most distant things: Fresnel runs to the
+/// grazing limit at grazing angles, which is exactly the long view down a lake or out to sea. Cut
+/// too close and the reflected far shore goes missing from the one shot that shows it off. Sweep it
+/// with `$WOW_MIRROR_FAR` against `$WOW_GPU_MS` before moving the default.
+const MIRROR_FAR_YARDS: f32 = 500.0;
+
+/// How much smaller than the main view the mirror's target is, per side.
+///
+/// Left at the 2 this pass shipped with, because raising it is a *look* change and belongs to
+/// whoever is looking at the water — but named and levered, because it is the cheapest knob here:
+/// the image is sampled through a distorting normal, so 3 or 4 may well be indistinguishable at a
+/// third or a quarter of the mirror's fragments.
+const REFLECT_DOWNSCALE: u32 = 2;
+
+/// The mirror cameras' far plane, in yards.
+fn mirror_far() -> f32 {
+    MIRROR_FAR_YARDS
+}
+
+/// The mirror target's size divisor against the main view.
+fn reflect_downscale() -> u32 {
+    REFLECT_DOWNSCALE
+}
+
+/// How far from the capture plane a surface is still served at **full** reflection strength, in
+/// yards — the shader fades it out over a wider band past this rather than cutting it off
+/// (`liquid.wgsl`'s `plane_trust`).
+///
+/// **This is not a "which surface may reflect" threshold, and it must not become one again.** A
+/// frame regularly holds more than one water body — a roadside pool and the sea, a river and the
+/// pond above it — and they all have to reflect at the same time. One capture can do that because
+/// the shader reprojects each fragment by its own distance from the capture plane; what this number
+/// bounds is where that correction is exact enough to trust at full weight.
+///
+/// It replaced a hard 3.0 that was a cutoff, and the cutoff was wrong twice over. A liquid grid is
+/// a heightfield — Felwood's river drops about two yards across a single MCNK and Elwynn's stream
+/// has 3.04 in one chunk — so three yards could not even cover one surface; and across two bodies
+/// it meant exactly one of them reflected while the other went flat, with the choice flipping as
+/// the camera moved.
+///
+/// ## What is still only approximate across bodies
+///
+/// The mirror clips its own waterline at the capture plane ([`WATERLINE_CLIP_BIAS`]), so a body
+/// *below* that plane is missing whatever geometry stands between the two heights, and one above it
+/// keeps a little it should have cut. The clip follows the plane the prominence walk picked — the
+/// water covering most of the screen — so the error lands on the bodies occupying least of it.
+pub(crate) const PLANE_TOLERANCE: f32 = 10.0;
+
+/// How far below the capture plane the mirror's clip may be dropped to spare a lower water body,
+/// in yards.
+///
+/// The two artefacts this sits between are both real and both have been seen. Too small and a
+/// lower surface loses its reflection outright (the Savage Coast seam). Too large and the capture
+/// keeps the submerged world — hulls, pilings, the sea bed — which the capture plane's own body
+/// then paints as hard-edged slabs standing in the water (Booty Bay, the reason the oblique clip
+/// exists at all).
+///
+/// Twelve yards covers the spread a view actually holds — a river mouth against the sea is about
+/// ten, terraced pools less — while staying well inside the depth at which the reference world's
+/// large submerged geometry sits.
+/// **Zero, and it stays zero until the clip plane's `w` convention is settled.** Dropping the clip
+/// was meant to spare a lower water body's reflection; measured, it does the opposite — it removes
+/// the geometry NEAREST the waterline from the capture, which is the bank and the base of every
+/// tree trunk. At a Stranglethorn river camera a 12 yd drop emptied the top of the mirror image and
+/// the water went flat; `WOW_CLIP_DROP=0` brought the trunk reflections straight back.
+///
+/// That means `pos.y - (clip_at - WATERLINE_CLIP_BIAS)` does not move the plane the way lowering
+/// `clip_at` implies — Bevy's contract wants the **negative** signed distance from the camera to
+/// the plane, and this passes the positive one, so the effective plane is mirrored about the
+/// camera and a lower `clip_at` raises it. The existing value worked because `clip_at == plane`
+/// was the only case ever exercised. Correcting the sign is a separate change that has to be
+/// re-validated against Booty Bay, which is what the oblique clip exists for.
+const MAX_CLIP_DROP: f32 = 0.0;
+
+/// The share of the most prominent body's score a surface needs before it may lower the clip.
+const CLIP_SHARE: f32 = 0.10;
+
+/// How far below the water the mirror's clip plane sits, in yards. See the plane's use: clipping
+/// exactly on the surface leaves a hairline gap where a hull meets its own reflection.
+const WATERLINE_CLIP_BIAS: f32 = 0.25;
+
+/// How far the surface normal displaces the reflection's UV — the wobble that makes it read as a
+/// reflection in *water* rather than as a mirror. Small: past a few hundredths the image tears off
+/// the geometry that casts it.
+///
+/// Raised from 0.035 along with the roughness pass in `liquid.wgsl`: the complaint that the water
+/// looked "too perfect" is answered half by reflecting less and half by reflecting less *cleanly*,
+/// and this is the second half.
+const REFLECT_DISTORT: f32 = 0.055;
+
+/// The reflection target and the buffer the water samples it through.
+#[derive(Resource)]
+pub(crate) struct WaterReflect {
+    /// The off-screen colour target. Rebuilt (a new asset, as the world backdrop does it) when the
+    /// main view's size changes; [`restamp_reflection_target`] re-points the materials.
+    pub(crate) image: Handle<Image>,
+    /// The second mirror's target — see [`SECOND_SHARE_MIN`]. Same size as `image`.
+    pub(crate) image2: Handle<Image>,
+    /// The two captures' roughness chains for the preview's rough reflections
+    /// (`super::mirror_chain`), rebuilt with them.
+    pub(crate) chain: Handle<Image>,
+    pub(crate) chain2: Handle<Image>,
+    /// The image's current size in physical pixels.
+    size: UVec2,
+}
+
+/// The per-frame parameters the water shader reads — **two `vec4`s**, and only the first is about
+/// the reflection:
+///
+/// - `0..4` — the mirror: `x` = the plane's world Y, `y` = the reflection's strength (0 disables it
+///   — no plane, no water near, an eye under the surface, or the reference look), `z` = the UV
+///   distortion, `w` = the plane tolerance.
+/// - `4..8` — **the sun the player can actually see**: `xyz` = the to-sun direction
+///   ([`crate::lighting::WowLighting::celestial_dir`]) and `w` = [`crate::sun::SunVisibility`].
+/// - `8..12` / `12..16` — **the sky the underside reflects**: the zenith and horizon stops of the
+///   dome's own gradient (`WowLighting::sky` rows 0 and 4 — the same colours the dome is drawn
+///   with). The water seen from below reads them at the reflected view ray's elevation; from above
+///   it reflects the sky floor (`super::sky_lut`).
+/// - `20..24` — **the moon**, the same pair as the sun: `xyz` = the to-moon direction and `w` =
+///   [`crate::sun::MoonVisibility`]. A separate body rather than a switch on the sun's, because on
+///   the nights both are up they are up together and in different parts of the sky.
+/// - `16..20` — **the wave simulation's window** (`super::ripple_sim`): `xy` = its lower corner in
+///   Bevy XZ yards, `z` = one over its side length, `w` = strength (0 on the reference lane, where
+///   the client's own painted splash decals are the wake instead).
+///
+/// The sun lanes live here rather than in the shared light buffer because that buffer's layout is
+/// mirrored by three shaders and read by every draw in the frame, and this is one consumer's
+/// per-frame scalar. They are written unconditionally — the water's glitter needs them on exactly
+/// the frames the reflection is off.
+#[derive(Resource, Clone, Copy, ExtractResource)]
+/// The reflection row block: 48 floats of shared lanes, then four `vec4`s per probe slot
+/// (capture point + validity, blend share in `w`, a spare row, the fixed spot) for
+/// [`probe::PROBE_SLOT_MAX`] slots, then the sky dome's seven rows ([`DOME_LANES`]), the march's
+/// and the second mirror's rows, the surface's clock ([`CLOCK_LANES`]) and the look's rows
+/// ([`LOOK_LANES`], `super::look`). The slot block
+/// is sized to the CEILING rather than to `probe_slots()`, because the shader's array length is
+/// fixed at compile time and the unused tail simply carries a zero validity flag.
+pub(crate) struct WaterReflectData(pub(crate) [f32; REFLECT_FLOATS]);
+
+/// The ripple's slide of the point a reflection is read for, in yards per unit of the normal's
+/// horizontal tilt (`water_reflect.march.y`): the planar mirror, the probes and the march read the
+/// reflection at `world_pos + n.xz · this`, the ray's direction unchanged, so neighbouring pixels
+/// stay coherent and every sample reflects a real point. The floor occlusion reads its plane result
+/// and its occluder's colour there too, but its off-plane verdict marches from the unrippled point,
+/// so a still camera gets a still verdict (`liquid.wgsl`'s `floor_occlusion`).
+fn ripple_origin() -> f32 {
+    3.0
+}
+
+/// The probe's softening radius, in taps.
+fn probe_soft() -> f32 {
+    2.0
+}
+
+/// Whether the march's rays may pass behind a tile past its thickness slab.
+fn pass_behind() -> bool {
+    true
+}
+
+/// Whether the march's sky hits read the colour buffer rather than the dome law; they do not.
+fn sky_read_snapshot() -> bool {
+    false
+}
+
+/// Hand-written because `Default` for arrays stops at 32 elements, and this row count passed that
+/// when the probe's two lanes landed. Zero is the right empty state for every lane here: strength
+/// zero is "this tier is not contributing", which is exactly what a frame before anything has been
+/// computed should say.
+impl Default for WaterReflectData {
+    fn default() -> Self {
+        Self([0.0; REFLECT_FLOATS])
+    }
+}
+
+/// The buffer every liquid material binds (`#[storage(107, …)]`), written once a frame in the render
+/// world — the same shape as the shared light buffer, and for the same reason: a per-frame material
+/// mutation would mark every liquid material Modified and rebuild its bind group, which this project
+/// has already measured and retired once.
+#[derive(Resource, Clone, ExtractResource)]
+pub(crate) struct WaterReflectBuffer(pub(crate) Buffer);
+
+/// The mirrored camera as [`drive_reflection`] writes it: its pose, its gate, its lens and its
+/// target, all four of which move together when the plane or the main view does.
+type MirrorCamera<'w, 's> = Query<
+    'w,
+    's,
+    (
+        &'static mut Transform,
+        &'static mut Camera,
+        &'static mut Projection,
+        &'static mut RenderTarget,
+        &'static ReflectionCamera,
+    ),
+    Without<WorldCamera>,
+>;
+
+pub(super) fn register(app: &mut App) {
+    app.init_resource::<WaterReflectData>()
+        .add_plugins(ExtractResourcePlugin::<WaterReflectData>::default())
+        .add_plugins(ExtractResourcePlugin::<WaterReflectBuffer>::default())
+        // Before the liquid materials are built: they bind the buffer and the image, and a
+        // material built before either exists would have to be rebuilt to get them.
+        .add_systems(
+            Startup,
+            setup_reflection
+                .after(benilla_assets::AssetSet::Open)
+                .before(super::WaterPassSet),
+        )
+        .add_systems(
+            PostUpdate,
+            (
+                // After the camera has been moved for the frame and before transforms propagate,
+                // so the mirrored pose reaches the render world in the same frame as the pose it
+                // mirrors. A frame-late mirror swims against the camera on every turn.
+                drive_reflection
+                    .before(bevy::transform::TransformSystems::Propagate)
+                    .before(bevy::camera::CameraUpdateSystems),
+                restamp_reflection_target,
+                trace_mirrors,
+            )
+                .chain(),
+        );
+    app.add_systems(
+        PostUpdate,
+        idle_mirrors_off_screen.after(super::world_view::water_screen_rect),
+    );
+    let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
+        return;
+    };
+    render_app.add_systems(
+        Render,
+        upload_reflect.in_set(RenderSystems::PrepareResources),
+    );
+}
+
+/// Whether the mirrors render this frame: water is on the world view's screen, or was within
+/// [`MIRROR_HOLD_S`]. `idle` counts the seconds since the last frame with water and is advanced by
+/// `dt` here.
+fn mirrors_wanted(visible: bool, idle: &mut f32, dt: f32) -> bool {
+    if visible {
+        *idle = 0.0;
+    } else {
+        *idle += dt;
+    }
+    *idle < MIRROR_HOLD_S
+}
+
+/// **The mirrors render only for water on the screen.** [`drive_reflection`] elects a plane from
+/// the liquid near the eye and in its view, before visibility has run, so it keeps a camera on
+/// for water that no pixel shows: behind the eye within [`REFLECT_RADIUS`], or culled (a canal
+/// behind Stormwind's walls). Once the water's rectangle is known, a frame with none on screen,
+/// held past [`MIRROR_HOLD_S`], switches both cameras off before they are extracted; their lanes
+/// stay as written, and no water reads them. `drive_reflection` switches them on again the next
+/// frame it elects a plane, and this leaves them on whenever water is on screen.
+#[allow(clippy::type_complexity)]
+fn idle_mirrors_off_screen(
+    rect: Res<super::world_view::WaterScreenRect>,
+    time: Res<Time>,
+    mut idle: Local<f32>,
+    mut mirrors: Query<
+        &mut Camera,
+        (
+            With<ReflectionCamera>,
+            Without<WorldCamera>,
+            Without<benilla_world::liquid::ProbeFace>,
+        ),
+    >,
+) {
+    if mirrors_wanted(rect.visible, &mut idle, time.delta_secs()) {
+        return;
+    }
+    for mut camera in &mut mirrors {
+        if camera.is_active {
+            camera.is_active = false;
+        }
+    }
+}
+
+fn setup_reflection(
+    mut commands: Commands,
+    device: Res<RenderDevice>,
+    mut images: ResMut<Assets<Image>>,
+) {
+    let size = UVec2::new(640, 360);
+    let image = images.add(reflection_image(size));
+    let camera = commands
+        .spawn((
+            Name::new("water reflection camera"),
+            mirror_view_shape(),
+            // Never `WorldCamera`: that marker means *the* viewer, and every "where is the eye"
+            // consumer in the client filters on it.
+            ReflectionCamera(0),
+            RenderTarget::Image(image.clone().into()),
+            Camera {
+                // Ahead of the world camera (order 0), so the water samples this frame's image rather
+                // than last frame's on the frames it does render.
+                order: -1,
+                // Transparent, because alpha is coverage — see the module doc.
+                clear_color: ClearColorConfig::Custom(Color::NONE),
+                is_active: false,
+                ..default()
+            },
+            Transform::default(),
+        ))
+        .id();
+    if reflect_debug() {
+        // Straight to the window, over the world (the world camera is order 0), so the mirrored
+        // image is what you see. The water still samples its own target, which nothing writes —
+        // this mode is for looking at the capture, not at the water.
+        commands.entity(camera).insert(RenderTarget::default());
+        commands.entity(camera).insert(Camera {
+            order: 1,
+            clear_color: ClearColorConfig::Custom(Color::BLACK),
+            is_active: false,
+            ..default()
+        });
+    }
+    // The second mirror, for a second water height in view — see [`SECOND_SHARE_MIN`]. The same
+    // view shape, so it shares every pipeline the first one has.
+    let image2 = images.add(reflection_image(size));
+    commands.spawn((
+        Name::new("water reflection camera 2"),
+        mirror_view_shape(),
+        ReflectionCamera(1),
+        RenderTarget::Image(image2.clone().into()),
+        Camera {
+            order: -2,
+            clear_color: ClearColorConfig::Custom(Color::NONE),
+            is_active: false,
+            ..default()
+        },
+        Transform::default(),
+    ));
+    commands.insert_resource(WaterReflect {
+        image,
+        image2,
+        chain: images.add(super::mirror_chain::chain_image(size)),
+        chain2: images.add(super::mirror_chain::chain_image(size)),
+        size,
+    });
+    commands.insert_resource(WaterReflectBuffer(device.create_buffer(
+        &BufferDescriptor {
+            label: Some("water_reflect_params"),
+            size: std::mem::size_of::<WaterReflectData>() as u64,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        },
+    )));
+}
+
+/// `$WOW_NO_REFLECT=1` — the reflection pass's kill switch, in the mould of `$WOW_NO_LIQUID` and
+/// `$WOW_NO_PARTICLES`: the stylised look keeps its ripples, glitter, sky mix and foam, and only the
+/// mirrored pass goes. It is the A/B this feature is priced with (a second world draw is the one
+/// thing here that can cost a frame rate) and the answer for a machine that cannot afford it.
+///
+/// Read once — an env var cannot change mid-session, and this is asked every frame.
+fn no_reflect() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("WOW_NO_REFLECT").is_some())
+}
+
+/// How far the mirror capture is blurred before the water reads it, in **capture texels**.
+///
+/// The reference pipeline blurs: Cataclysm's Ultra water renders the mirror into a downscaled
+/// target and then runs a 4-tap box blur into a second target before the water samples it. This
+/// pass took the downscale and skipped the blur, so it sampled a sharp image through a displacing
+/// ripple offset — which delivers every artefact in the capture at full contrast with a crisp edge.
+/// See `sample_mirror` in `liquid.wgsl` for the kernel and why its average is premultiplied.
+///
+/// One texel by default, which at [`REFLECT_DOWNSCALE`] is two of the main view's. It is a *look*
+/// number and belongs to whoever is looking at the water.
+const REFLECT_BLUR_TEXELS: f32 = 1.0;
+
+/// The mirror capture's blur radius, in capture texels.
+fn reflect_blur() -> f32 {
+    REFLECT_BLUR_TEXELS
+}
+
+/// Whether the mirror image is shown unmixed (a debug view); off.
+fn reflect_debug() -> bool {
+    false
+}
+
+/// `$WOW_REFLECT_PLANE=<height>` — serve this capture plane instead of the one
+/// [`plane_near`] elected, in raw WoW `z`.
+///
+/// The instrument for the only question that matters about a handover: **not how often the plane
+/// changes, but what changes when it does.** Everything else here measures the choice — this
+/// measures the cost, by capturing one viewpoint twice with the two planes it is choosing between
+/// and diffing them. A handover the trust falloff and the screen-space tier fully cover is one the
+/// player cannot see, and that is the bar; counting handovers only ever showed how often the bar
+/// was being tested.
+///
+/// It defeats the election entirely, so it is a measuring tool and not a setting — a pinned plane
+/// is wrong for every body that is not at that height.
+fn pinned_plane() -> Option<f32> {
+    static PIN: std::sync::OnceLock<Option<f32>> = std::sync::OnceLock::new();
+    *PIN.get_or_init(|| {
+        std::env::var("WOW_REFLECT_PLANE")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+    })
+}
+
+/// Whether the plane election logs each surface it weighs; off.
+fn trace_surfaces() -> bool {
+    false
+}
+
+/// An HDR colour target with an alpha channel — the same `Rgba16Float` the world camera renders,
+/// so the reflected colours arrive on the same scale the water is mixing them into.
+fn reflection_image(size: UVec2) -> Image {
+    let mut image = Image::new_fill(
+        Extent3d {
+            width: size.x.max(1),
+            height: size.y.max(1),
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        &[0; 8],
+        TextureFormat::Rgba16Float,
+        RenderAssetUsages::default(),
+    );
+    image.texture_descriptor.usage =
+        TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST | TextureUsages::RENDER_ATTACHMENT;
+    image
+}
+
+/// A wet height on this surface near `(x, y)`, and how far away that sample is — the surface's own
+/// answer to "how high is the water over there".
+///
+/// The clamped box point is only the first guess, and taking its `None` for an answer was a bug
+/// with a very visible face. [`WaterChunkInfo::surface_z_at`] answers *wet or dry at this point*,
+/// which is the right question for a swimmer and the wrong one for a plane: a WMO pool's footprint
+/// is a box around a whole district, and a camera standing on a bridge inside that box is over a
+/// DRY cell of it. Read as "this surface is not here", that left Stormwind's canals reflecting from
+/// some positions and not from others a few yards away — the reported symptom, and reproducible in
+/// the world viewer at one pose out of four.
+///
+/// So when the near point is dry, a short lattice over the footprint answers instead: any wet cell
+/// will do, and the nearest one is the best reading of "the water beside me".
+///
+/// It is rarer than it looks, and worth knowing why before pricing it: `xy_bounds` is the box of
+/// the **wet** cells, so clamping into it already lands on water for any convex surface, and only a
+/// wet region shaped like an L — a canal bend — leaves the clamped corner dry. That is what the
+/// lattice is for. It runs only when the cheap point missed, and only for the surfaces near enough
+/// to be the fallback plane (`lattice`); see [`look_reach`] for why the walk now visits
+/// many more surfaces than it can afford to probe.
+fn wet_height_near(chunk: &WaterChunkInfo, x: f32, y: f32, lattice: bool) -> Option<(f32, f32)> {
+    let [[min_x, min_y], [max_x, max_y]] = chunk.xy_bounds()?;
+    let (cx, cy) = (x.clamp(min_x, max_x), y.clamp(min_y, max_y));
+    let d2 = |px: f32, py: f32| (px - x) * (px - x) + (py - y) * (py - y);
+    if let Some(z) = chunk.planar_z_at(cx, cy) {
+        return Some((z, d2(cx, cy)));
+    }
+    // Only for the surfaces near enough to be the fallback plane. The lattice is 25 grid probes and
+    // the walk now reaches out to [`look_reach`], which is several times the surfaces —
+    // paying it on every one of them, once a frame, to rescue the rare distant WMO pool whose
+    // near corner happens to be dry is the wrong trade. A far surface that misses simply is not a
+    // candidate, which is the behaviour this walk had at every distance before.
+    // A surface only partly planar is searched too: its nearest point may sit on its fall.
+    if !lattice && !chunk.votes_partly() {
+        return None;
+    }
+    const N: i32 = 4;
+    let mut best: Option<(f32, f32)> = None;
+    for i in 0..=N {
+        for j in 0..=N {
+            let px = min_x + (max_x - min_x) * i as f32 / N as f32;
+            let py = min_y + (max_y - min_y) * j as f32 / N as f32;
+            let Some(z) = chunk.planar_z_at(px, py) else {
+                continue;
+            };
+            let d = d2(px, py);
+            if best.is_none_or(|(bd, _)| d < bd) {
+                best = Some((d, z));
+            }
+        }
+    }
+    best.map(|(d, z)| (z, d))
+}
+
+/// The water plane to mirror through: **the surface the camera is looking at**, out to
+/// [`look_reach`], and only failing that the nearest one ahead within [`REFLECT_RADIUS`].
+///
+/// Nearest-to-the-eye alone was the first rule and it is the wrong question. A capture is right for
+/// one plane, so the plane has to be the one the player is *watching*: standing on a bank between a
+/// stream and a lake, "nearest" picks the stream, the lake falls outside the tolerance and reflects
+/// nothing — and because zooming the camera in or out moves the eye tens of yards, which of the two
+/// is nearest flips as the camera moves.
+///
+/// The look test is a ray-plane hit, evaluated per surface: take a wet sample near the eye for the
+/// surface's height, intersect the view ray with that height, and keep the hit only if the point it
+/// lands on is wet too. One iteration is enough — a liquid grid is a heightfield, but a gentle one.
+/// The nearest hit along the ray wins, which is what "looking at" means when two surfaces overlap.
+///
+/// **A full walk, not the `WaterIndex`**, which is the shape that index's own module doc prescribes
+/// for a once-a-frame consumer ("fine for the consumers that ask once or twice a frame … and it
+/// detonates the moment a consumer asks per *draw*"). It is also the reading that works: at a
+/// Stormwind camera the index answered `over()` empty for a cell whose surface the walk finds
+/// containing the point — 22 of 673 loaded surfaces were unreachable through it while 651 were — so
+/// an index query here would have left the canals with no reflection and no error.
+fn plane_near(
+    eye: Vec3,
+    forward: Vec3,
+    up: Vec3,
+    fov_y: f32,
+    aspect: f32,
+    reach: f32,
+    held: Option<f32>,
+    held2: Option<f32>,
+    chunks: &Query<&WaterChunkInfo>,
+) -> Option<(f32, f32, Option<f32>)> {
+    let [x, y, _] = bevy_to_wow(eye);
+    let frame = Frame::new(forward, up, fov_y, aspect);
+    // The second mirror is elected from a WIDER view than the screen, so a body about to turn into
+    // view already has its mirror rendering when it arrives — see [`SECOND_FOV_SCALE`].
+    let wide = Frame::new(forward, up, (fov_y * SECOND_FOV_SCALE).min(3.0), aspect);
+    let mut seen_wide = Prominence::default();
+    let mut seen = Prominence::default();
+    let trace_on = trace_surfaces();
+    let mut nearest: Option<(f32, f32)> = None; // (distance² to a wet sample, plane)
+    for chunk in chunks {
+        // The cheap reject first, on the footprint alone: everything below samples the grid.
+        let Some([[min_x, min_y], [max_x, max_y]]) = chunk.xy_bounds() else {
+            continue;
+        };
+        let (bx, by) = (x.clamp(min_x, max_x), y.clamp(min_y, max_y));
+        let foot_d2 = (bx - x) * (bx - x) + (by - y) * (by - y);
+        if foot_d2 > reach * reach {
+            continue;
+        }
+        // Near enough to be the *fallback* plane, which is a shorter reach than the look test's.
+        // Only planar water votes: falls, descending rivers and small pools are the probe's.
+        if !chunk.votes_any() {
+            continue;
+        }
+        let near = foot_d2 <= REFLECT_RADIUS * REFLECT_RADIUS;
+        let Some((z, d2)) = wet_height_near(chunk, x, y, near) else {
+            continue; // a footprint with no wet cell in reach
+        };
+        if near && nearest.is_none_or(|(bd2, _)| d2 < bd2) {
+            nearest = Some((d2, z));
+        }
+        // **How much of the screen does this surface cover?** — see [`Prominence`]. Not "is the
+        // centre ray on it" (which the sea fails from up the beach) and not "is it the nearest one
+        // in frame" (which hands a roadside pool the capture while the sea fills the window).
+        if eye.y <= z {
+            if trace_on {
+                info!("  DROP z {z:.2} eye {:.2} below surface", eye.y);
+            }
+            continue;
+        }
+        // The footprint, measured rather than sampled — see [`Frame::footprint_share`]. `at` is
+        // still the right sample for the surface's HEIGHT; it was never the right one for how much
+        // of the screen the surface covers.
+        let corners = [
+            wow_to_bevy([min_x, min_y, z]),
+            wow_to_bevy([max_x, min_y, z]),
+            wow_to_bevy([max_x, max_y, z]),
+            wow_to_bevy([min_x, max_y, z]),
+        ];
+        if let Some((wide_depth, wide_share)) = wide.footprint_share(eye, corners) {
+            if wide_depth <= reach {
+                seen_wide.add(z, wide_share);
+            }
+        }
+        let Some((depth, share)) = frame.footprint_share(eye, corners) else {
+            if trace_on {
+                info!("  DROP z {z:.2} footprint off screen");
+            }
+            continue;
+        };
+        if depth > reach {
+            if trace_on {
+                info!("  DROP z {z:.2} depth {depth:.0} past reach");
+            }
+            continue;
+        }
+        if trace_on {
+            let area = (max_x - min_x) * (max_y - min_y);
+            info!("  surf z {z:.2} area {area:.0} depth {depth:.1} share {share:.4}");
+        }
+        seen.add(z, share);
+    }
+    let plane = seen.best_sticky(held).or(nearest.map(|(_, z)| z))?;
+    // The lowest surface actually on screen, which is what the mirror's clip has to spare — see
+    // `drive_reflection`. Falls back to the chosen plane when nothing else was in frame.
+    // **Only bodies with a real share of the screen may pull the clip down.** A surface scoring
+    // 0.013 against the river's 3.9 — a puddle at the edge of the frame — was setting `lowest` and
+    // moving the clip a full twelve yards, which is a large change to the capture driven by
+    // something invisible in it.
+    let top = seen.slots[..seen.used]
+        .iter()
+        .map(|(_, s)| *s)
+        .fold(0.0_f32, f32::max);
+    let lowest = seen.slots[..seen.used]
+        .iter()
+        .filter(|(_, s)| *s >= top * CLIP_SHARE)
+        .map(|(z, _)| *z)
+        .fold(plane, f32::min);
+    Some((plane, lowest, seen_wide.second(plane, held2)))
+}
+
+/// How much screen each distinct water height covers, accumulated over the surfaces in frame.
+///
+/// **The third rule this function has had, and the reasons the first two failed are the argument
+/// for this one.** "What the centre ray lands on" cannot see a sea that fills the top half of the
+/// window while the middle of the screen is beach. "The nearest surface in frame" can see it, but
+/// ranks a pool at the roadside above it — measured on the Savage Coast as plane 10.07 at every
+/// distance from 100 to 700 yd, with the ocean right there at 0.00.
+///
+/// What actually decides which plane a capture should serve is **which water the player is mostly
+/// looking at**, and that is a question about screen area. [`Frame::footprint_share`] gives each
+/// chunk its measured fraction of the window, so one chunk of pool close by and a hundred chunks of ocean far away
+/// can be compared on the same scale — and the ocean, being made of many chunks, accumulates.
+///
+/// The accumulated number is therefore **a share of the frame**: around 1.0 for a body filling the
+/// window, a few hundredths for one at the edge of notice. That scale is what lets
+/// [`HANDOVER_MARGIN`] be written as an absolute, which is the half of the switching fix that a
+/// ratio could not express.
+///
+/// Heights are bucketed because a water body is many surfaces at one height: the ocean is hundreds
+/// of ADT chunks all at 0.0, and they have to add up rather than compete. [`BUCKET_YARDS`] is well
+/// under `PLANE_TOLERANCE`, so two heights that land in one bucket are two the capture could serve
+/// together anyway.
+#[derive(Default)]
+struct Prominence {
+    /// `(height, accumulated share of the frame)`, in no order.
+    slots: [(f32, f32); PROMINENCE_SLOTS],
+    used: usize,
+}
+
+/// How far apart two surface heights must be to be ranked separately, in yards.
+const BUCKET_YARDS: f32 = 0.5;
+
+/// The least share of the wider view ([`SECOND_FOV_SCALE`]) a second water height must cover for
+/// the second mirror to render for it. Small, because the point is to be rendering before the body
+/// is on screen; below it the first mirror's reprojection serves it.
+const SECOND_SHARE_MIN: f32 = 0.005;
+
+/// How long the second mirror keeps rendering after its body leaves the wider view, in seconds.
+const SECOND_HOLD_S: f32 = 1.0;
+
+/// How long both mirrors keep rendering after the last frame with water on the world view's
+/// screen, in seconds: a surface flickering at the frame's edge, or a glance away and back, leaves
+/// the cameras running, and a camera just switched on draws incompletely for its first frames.
+const MIRROR_HOLD_S: f32 = 1.0;
+
+/// How much wider than the screen, in field of view, the view the second mirror is elected from
+/// is — the lead that lets it render before its body turns into sight.
+const SECOND_FOV_SCALE: f32 = 1.5;
+
+/// How far from the first mirror's plane a second height must be, in yards, to earn its own
+/// mirror. Nearer, the first mirror's reprojection is close to exact for it.
+const SECOND_MIN_DZ: f32 = 3.0;
+
+/// How much better a challenger must score than the plane already in use before the capture is
+/// handed over.
+///
+/// **Continuity is worth more here than being right by a nose.** Switching plane changes every
+/// fragment's error, trust, reprojection and the mirror's clip in a single frame, so a handover is
+/// expensive to look at however well-judged it is; two bodies scoring within a few percent of each
+/// other would otherwise trade the capture back and forth every time the camera breathed. A
+/// challenger that is genuinely what the player is looking at clears this easily — at the Savage
+/// Coast a pool under the camera covers the frame against an ocean at a quarter of it — while a
+/// near-tie leaves the picture alone. It is necessary and not sufficient: see [`HANDOVER_MARGIN`].
+const HYSTERESIS: f32 = 1.5;
+
+/// How much more of the frame a challenger must cover, in absolute share, before it may take the
+/// capture — on top of clearing [`HYSTERESIS`].
+///
+/// **A ratio alone cannot tell a real lead from noise, because a ratio has no scale.** Two bodies
+/// covering 8% and 16% of the frame are 2.1x apart and the difference is nothing anyone is looking
+/// at; two covering 40% and 84% are the same 2.1x and the second one plainly IS the view. Only the
+/// first of those should be refused, and no ratio can separate them.
+///
+/// This is askable at all only because [`Frame::footprint_share`] returns a real fraction of the
+/// window. The score before it was `area / depth²` — unbounded, and in no unit an absolute
+/// threshold could be written in — so a ratio was the only test available.
+///
+/// **It is a guard, not the fix.** The reported flight up the Savage Coast is held by the
+/// measurement now: with footprints the stream's share is a smooth 0.6 the whole way in and the
+/// rule hands the capture over once, at the mouth, with or without this margin. What this still
+/// buys is the case the measurement cannot settle — two bodies both reduced to slivers, where a
+/// large ratio between two small numbers is noise and a handover costs more than it corrects.
+const HANDOVER_MARGIN: f32 = 0.10;
+
+/// How many distinct water heights can be ranked at once.
+///
+/// Twelve is far past what a view holds in the shipped world — a terraced spot like Stormwind's
+/// canals shows three or four — and the overflow path folds a thirteenth into its nearest
+/// neighbour rather than dropping it, so a pathological view degrades in accuracy, never into
+/// having no reflection.
+const PROMINENCE_SLOTS: usize = 12;
+
+impl Prominence {
+    fn add(&mut self, z: f32, score: f32) {
+        if !score.is_finite() || score <= 0.0 {
+            return;
+        }
+        let mut closest = usize::MAX;
+        let mut closest_gap = f32::MAX;
+        for (i, (bz, _)) in self.slots[..self.used].iter().enumerate() {
+            let gap = (bz - z).abs();
+            if gap < closest_gap {
+                (closest, closest_gap) = (i, gap);
+            }
+        }
+        if closest_gap <= BUCKET_YARDS {
+            self.slots[closest].1 += score;
+        } else if self.used < PROMINENCE_SLOTS {
+            self.slots[self.used] = (z, score);
+            self.used += 1;
+        } else {
+            // Full: fold into the nearest height rather than lose the surface entirely.
+            self.slots[closest].1 += score;
+        }
+    }
+
+    /// The height covering the most screen, **with the plane already in use given right of
+    /// first refusal** — see [`HYSTERESIS`].
+    fn best_sticky(&self, incumbent: Option<f32>) -> Option<f32> {
+        let challenger = self.best()?;
+        let Some(held) = incumbent else {
+            return Some(challenger);
+        };
+        // Is the plane we are already serving still on screen at all? Find its bucket.
+        let standing = self.slots[..self.used]
+            .iter()
+            .find(|(z, _)| (z - held).abs() <= BUCKET_YARDS)
+            .map(|(z, score)| (*z, *score));
+        let Some((held_z, held_score)) = standing else {
+            return Some(challenger); // gone from the frame; nothing to defend
+        };
+        let top = self.slots[..self.used]
+            .iter()
+            .map(|(_, s)| *s)
+            .fold(0.0_f32, f32::max);
+        // Both bars, and for different reasons: the ratio refuses a near-tie at any size, the
+        // margin refuses a large ratio between two bodies that are both slivers of the frame.
+        if top > held_score * HYSTERESIS && top - held_score > HANDOVER_MARGIN {
+            Some(challenger)
+        } else {
+            Some(held_z)
+        }
+    }
+
+    /// The height covering the most screen, or `None` when nothing was in frame.
+    /// The second mirror's plane: a height at least [`SECOND_MIN_DZ`] from the first mirror's,
+    /// covering at least [`SECOND_SHARE_MIN`] of the frame, the one covering most. The one already
+    /// served keeps it down to half that share, so a body at the threshold does not blink its
+    /// mirror on and off.
+    fn second(&self, first: f32, incumbent: Option<f32>) -> Option<f32> {
+        let apart = |z: f32| (z - first).abs() >= SECOND_MIN_DZ;
+        let slots = &self.slots[..self.used];
+        if let Some(held) = incumbent {
+            // Held down to half the share and half the height gap: leaving late is better than
+            // blinking.
+            if let Some((z, share)) = slots.iter().find(|(z, _)| (z - held).abs() <= BUCKET_YARDS) {
+                if (z - first).abs() >= SECOND_MIN_DZ * 0.5 && *share >= SECOND_SHARE_MIN * 0.5 {
+                    return Some(*z);
+                }
+            }
+        }
+        slots
+            .iter()
+            .filter(|(z, share)| apart(*z) && *share >= SECOND_SHARE_MIN)
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(z, _)| *z)
+    }
+
+    fn best(&self) -> Option<f32> {
+        self.slots[..self.used]
+            .iter()
+            .copied()
+            .fold(None, |best: Option<(f32, f32)>, (z, score)| match best {
+                Some((_, bs)) if bs >= score => best,
+                _ => Some((z, score)),
+            })
+            .map(|(z, _)| z)
+    }
+}
+
+/// The camera's frame, as the three numbers a "is that point on screen" test needs.
+///
+/// **This replaces a ray march, and the reason is worth keeping.** The look test used to intersect
+/// the camera's forward ray with each surface's height and ask whether the crossing point was wet.
+/// That answers for the middle of the screen and nothing else, so standing back from a shore and
+/// looking out to sea — where the middle of the screen is *beach* — it found no water at all, and
+/// the ocean filling the upper half of the frame got no reflection until the player walked close
+/// enough for the centre of the screen to land on it. Measured at the Savage Coast: strength 0 from
+/// 400 yd up the beach, with the sea plainly in view.
+///
+/// Fanning the ray over the vertical FOV was the first fix and it **did not work**, for a reason
+/// worth recording: ground distance runs as `height / tan(θ)`, so a fan spread evenly in *angle* is
+/// spread wildly unevenly in *distance*. At that same spot the ocean subtended about 0.4° of
+/// depression angle, and seven rays across a 46° frame stepped straight over the band — the sweep
+/// came back strength 0 at every distance it had before.
+///
+/// So the question is asked directly instead: take the surface's nearest wet point, and test
+/// whether it falls inside the view frustum's four sides. No marching, no sampling density to get
+/// wrong, and one grid lookup per surface rather than one per ray.
+struct Frame {
+    forward: Vec3,
+    /// The frame's up and right, squared against `forward` — a rolled or degenerate basis must not
+    /// tilt the test out of the camera's own plane.
+    up: Vec3,
+    right: Vec3,
+    /// Tangents of the half angles: vertical, then horizontal.
+    tan_v: f32,
+    tan_h: f32,
+}
+
+/// The nearest depth a footprint vertex may keep, in yards. Anything closer is trimmed away by
+/// [`clip_near`] so the perspective divide stays finite.
+const MIN_DEPTH: f32 = 0.05;
+
+/// The most vertices a clipped footprint can have: a quad, plus one per clipping plane.
+const POLY_MAX: usize = 12;
+
+/// A polygon under construction — a fixed buffer, because this runs per surface per frame and a
+/// heap allocation there buys nothing.
+struct Poly<const N: usize> {
+    v: [[f32; 3]; POLY_MAX],
+    n: usize,
+}
+
+impl<const N: usize> Poly<N> {
+    fn new() -> Self {
+        Self {
+            v: [[0.0; 3]; POLY_MAX],
+            n: 0,
+        }
+    }
+
+    fn push(&mut self, p: [f32; 3]) {
+        if self.n < POLY_MAX {
+            self.v[self.n] = p;
+            self.n += 1;
+        }
+    }
+
+    /// Sutherland–Hodgman against one half-space `keep(v) >= 0`, interpolating the crossings.
+    ///
+    /// Convex in, convex out, which is why one pass per plane is enough and why the area below can
+    /// be a plain shoelace.
+    fn clip(&self, keep: impl Fn(&[f32; 3]) -> f32) -> Self {
+        let mut out = Self::new();
+        for i in 0..self.n {
+            let (a, b) = (self.v[i], self.v[(i + 1) % self.n]);
+            let (fa, fb) = (keep(&a), keep(&b));
+            if fa >= 0.0 {
+                out.push(a);
+            }
+            if (fa >= 0.0) != (fb >= 0.0) {
+                let t = fa / (fa - fb);
+                out.push([
+                    a[0] + (b[0] - a[0]) * t,
+                    a[1] + (b[1] - a[1]) * t,
+                    a[2] + (b[2] - a[2]) * t,
+                ]);
+            }
+        }
+        out
+    }
+
+    /// Twice the signed area in the `[1]`/`[2]` components — the shoelace sum.
+    fn double_area(&self) -> f32 {
+        let mut acc = 0.0;
+        for i in 0..self.n {
+            let (a, b) = (self.v[i], self.v[(i + 1) % self.n]);
+            acc += a[1] * b[2] - b[1] * a[2];
+        }
+        acc
+    }
+}
+
+impl Frame {
+    fn new(forward: Vec3, up: Vec3, fov_y: f32, aspect: f32) -> Self {
+        let forward = forward.normalize_or_zero();
+        let up = (up - forward * forward.dot(up)).normalize_or_zero();
+        let tan_v = (fov_y * 0.5).tan();
+        Self {
+            forward,
+            up,
+            right: forward.cross(up).normalize_or_zero(),
+            tan_v,
+            tan_h: tan_v * aspect.max(0.1),
+        }
+    }
+
+    /// What fraction of the window a surface's footprint covers, and the nearest depth of the part
+    /// that is actually on screen — or `None` when none of it is.
+    ///
+    /// **This replaces scoring a surface at a single representative point, which has now produced
+    /// the same bug three times.** A point is cheap and it is not the shape: a footprint is a
+    /// 33-yard chunk and the frame is a window, so any one point of it answers for a place the body
+    /// mostly is not. Each time the fix was to make the point behave better and each time the
+    /// failure came back somewhere else — the point crossing the frame edge made the whole score
+    /// vanish (patched with a fade), the point's `area / depth²` ran away as it neared the eye
+    /// (patched with a proper share), and then the point chosen was the footprint's *nearest* one,
+    /// which for the water you are standing over is directly underfoot and below the bottom of the
+    /// screen. Measured on the reported flight: seventeen chunks of the stream dropped as "not
+    /// visible" including a full 1111 yd² chunk three yards in front of the camera, the body
+    /// filling the frame scored 0.043, and the ocean took the capture.
+    ///
+    /// So the footprint is measured instead of sampled. Its four corners go to view space, the part
+    /// behind the eye is trimmed rather than dropped, the rest is projected and clipped to the
+    /// window, and the area of what survives is the answer.
+    ///
+    /// Three properties come out of that for free, each of which was a patch before. It is
+    /// **bounded** — clipped to the window, a surface cannot claim more than the screen, so the
+    /// sum over the chunks of one body means something. It is **foreshortened** — a horizontal
+    /// sheet seen from a low eye projects to a thin band without a cosine term written anywhere.
+    /// And it is **continuous** — a body leaving the frame loses area smoothly, so no fade is
+    /// needed to stop the score stepping.
+    ///
+    /// The footprint is the surface's full rectangle, wet cells or not; an L-shaped canal bend is
+    /// therefore over-credited by the dry part of its box. That was true of the `area` term this
+    /// replaces and it is the right trade — the alternative is walking the wet grid per surface per
+    /// frame to score a body that is already known to be in view.
+    fn footprint_share(&self, eye: Vec3, corners: [Vec3; 4]) -> Option<(f32, f32)> {
+        // View space, as (depth along forward, right, up) — the basis the clip and the projection
+        // both want.
+        let mut poly = Poly::<POLY_MAX>::new();
+        for c in corners {
+            let v = c - eye;
+            poly.push([v.dot(self.forward), v.dot(self.right), v.dot(self.up)]);
+        }
+        // Behind the eye is trimmed, not dropped: the chunk underfoot reaches back past the camera
+        // and it is the part in FRONT that fills the screen.
+        let near = poly.clip(|p| p[0] - MIN_DEPTH);
+        if near.n < 3 {
+            return None;
+        }
+        let depth = near.v[..near.n]
+            .iter()
+            .map(|p| p[0])
+            .fold(f32::MAX, f32::min);
+        // Project: the window is [-1, 1] in both axes.
+        let mut screen = Poly::<POLY_MAX>::new();
+        for i in 0..near.n {
+            let [d, r, u] = near.v[i];
+            screen.push([d, r / (d * self.tan_h), u / (d * self.tan_v)]);
+        }
+        // Straight lines stay straight under projection, so clipping the window in 2D is exact.
+        let clipped = screen
+            .clip(|p| p[1] + 1.0)
+            .clip(|p| 1.0 - p[1])
+            .clip(|p| p[2] + 1.0)
+            .clip(|p| 1.0 - p[2]);
+        if clipped.n < 3 {
+            return None;
+        }
+        // The window itself is 2 by 2, so its area is 4 and the shoelace gives twice the polygon's.
+        let share = (clipped.double_area().abs() / 8.0).clamp(0.0, 1.0);
+        (share > 0.0).then_some((depth, share))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Aim a mirror at `plane`: the world camera's pose mirrored about it, its lens with the near
+/// plane replaced by an oblique clip at `clip_at` and its far plane by [`MIRROR_FAR_YARDS`].
+fn aim_mirror(
+    eye: &GlobalTransform,
+    projection: &Projection,
+    plane: f32,
+    clip_at: f32,
+) -> (Transform, Projection) {
+    // The mirror. `looking_to` of the mirrored basis is the reflection matrix up to a negated right
+    // vector; the shader's `1 − u` is that negation's exact undo (module doc).
+    let eye_pos = eye.translation();
+    let mirror_v = |v: Vec3| Vec3::new(v.x, -v.y, v.z);
+    let pos = Vec3::new(eye_pos.x, 2.0 * plane - eye_pos.y, eye_pos.z);
+    let mirror_tf = Transform::from_translation(pos)
+        .looking_to(mirror_v(eye.forward().into()), mirror_v(eye.up().into()));
+    // The same lens, so the reflection lines up with the view it is sampled by screen UV against —
+    // **with its near plane replaced by the water plane**.
+    //
+    // Without that replacement the mirrored camera, which sits under the surface looking up through
+    // it, draws everything BELOW the waterline too: a moored ship's submerged hull, a pier's
+    // pilings, the sea bed. Mirrored into the image and sampled by screen UV, that arrives as huge
+    // hard-edged slabs standing in the water — Booty Bay, where a galleon's hull filled half the
+    // bay, is its worst case, and it is why a lake looked fine while a harbour did not.
+    //
+    // `PerspectiveProjection::near_clip_plane` is Bevy's own oblique-clip (Lengyel 2005) in the
+    // reverse-Z convention, which is exactly this problem's textbook solution. Its contract: the
+    // normal is in VIEW space, unit length, pointing at the half-space to KEEP, and `w` is the
+    // negative signed distance from the camera to the plane. Ours is world up (+Y) rotated into
+    // view — a rotation, so it stays unit — and the camera's own height below the plane.
+    let mut lens = match projection {
+        Projection::Perspective(p) => p.clone(),
+        // The world camera is perspective in both binaries; a non-perspective one would be a new
+        // kind of view and this pass would need thinking about, not a silent fallback.
+        _ => PerspectiveProjection::default(),
+    };
+    let rot = Mat3::from_quat(mirror_tf.rotation);
+    let up_in_view = Vec3::new(rot.x_axis.y, rot.y_axis.y, rot.z_axis.y);
+    // Biased a little UNDER the surface: clipped dead on the waterline, a hull and its reflection
+    // meet across a hairline of missing pixels. A quarter of a yard is far below anything the
+    // artefact is made of and hides the seam.
+    // **The clip is dropped to the lowest water on screen, not held at the capture plane.**
+    //
+    // Clipping at the capture plane is right for the body that plane belongs to and ruinous for
+    // every body below it: everything under the waterline is cut from the capture, so a surface
+    // ten yards lower reflects its rays into parts of the image that were never drawn, reads
+    // `alpha = 0`, and falls back to the sky mix. That is not a soft error — it is the whole
+    // reflection missing, with a hard seam along the boundary between the two bodies. Measured at
+    // the Savage Coast river mouth, where the pool at 10.07 reflected and the ocean at 0.00 beside
+    // it went flat.
+    //
+    // Dropping the clip costs the opposite artefact — submerged geometry the capture plane's own
+    // body should not show, which is the hull that filled half of Booty Bay when this pass had no
+    // clip at all. So the drop is **bounded** by [`MAX_CLIP_DROP`]: enough for the water bodies a
+    // real view holds at once, never enough to reach a galleon's keel.
+    lens.near_clip_plane = up_in_view.extend(pos.y - (clip_at - WATERLINE_CLIP_BIAS));
+    // ...and its FAR plane replaced too, which the world lens does not get to decide. See
+    // [`MIRROR_FAR_YARDS`]: the mirror inherited the player's whole view distance and drew a second
+    // horizon into an image that is downscaled, wobbled and mixed in at a fraction of its strength.
+    // Never widened beyond what the world camera itself draws — a mirror that reaches further than
+    // the view it belongs to would reflect geometry that is not streamed in.
+    lens.far = lens.far.min(mirror_far());
+    (mirror_tf, Projection::Perspective(lens))
+}
+
+/// `$WOW_MIRROR_TRACE=1` — one log line whenever either mirror's plane or on/off state changes,
+/// with the frame number, so a blink seen live can be matched to what the mirrors did.
+fn trace_mirrors(
+    data: Res<WaterReflectData>,
+    mut frame: Local<u64>,
+    mut last: Local<Option<[f32; 4]>>,
+) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("WOW_MIRROR_TRACE").as_deref() == Ok("1")) {
+        return;
+    }
+    *frame += 1;
+    let now = [
+        data.0[0],
+        data.0[1],
+        data.0[MIRROR2_LANES.start],
+        data.0[MIRROR2_LANES.start + 1],
+    ];
+    if *last != Some(now) {
+        info!(
+            "mirrors frame {}: first {} second {}",
+            *frame,
+            if now[1] > 0.0 {
+                format!("on at {:.2}", now[0])
+            } else {
+                "off".into()
+            },
+            if now[3] > 0.0 {
+                format!("on at {:.2}", now[2])
+            } else {
+                "off".into()
+            },
+        );
+        *last = Some(now);
+    }
+}
+
+/// A mirror's strength lane: 1, or 2 under `$WOW_MIRROR_SHOW`, which rides the lane's headroom.
+fn strength_lane() -> f32 {
+    if std::env::var_os("WOW_MIRROR_SHOW").is_some() {
+        2.0
+    } else {
+        1.0
+    }
+}
+
+pub(super) fn drive_reflection(
+    (style, dev): (Res<WaterStyle>, Res<crate::dev_state::DebugState>),
+    light: Res<crate::lighting::WowLighting>,
+    sun_visible: Res<crate::sun::SunVisibility>,
+    moon_visible: Res<crate::sun::MoonVisibility>,
+    mut reflect: ResMut<WaterReflect>,
+    mut data: ResMut<WaterReflectData>,
+    mut images: ResMut<Assets<Image>>,
+    chunks: Query<&WaterChunkInfo>,
+    view_distance: Res<crate::view::ViewDistance>,
+    mut held_plane: Local<Option<f32>>,
+    mut held_second: Local<Option<f32>>,
+    mut second_idle: Local<f32>,
+    (time, clock, mut look, preview): (
+        Res<Time>,
+        Res<super::clock::WaterClock>,
+        super::look::LookSources,
+        Res<super::preview::PreviewLanes>,
+    ),
+    world_cam: Query<(&GlobalTransform, &Camera, &Projection), With<WorldCamera>>,
+    mut mirror: MirrorCamera,
+    probe: Option<Res<super::probe::WaterProbe>>,
+) {
+    // The look rows and the sun lanes first and unconditionally: they are not the mirror's, and
+    // every path out of this system below is a frame on which the water still has to draw.
+    let mut dome = crate::sky::dome_uniforms(&light);
+    data.0[LOOK_LANES].copy_from_slice(&look.lanes(&light, &dome));
+    // The preview's rows, zero where it is off (`super::preview`).
+    data.0[PREVIEW_LANES].copy_from_slice(&preview.0);
+    let to_sun = light.celestial_dir.normalize_or_zero();
+    data.0[4..8].copy_from_slice(&[to_sun.x, to_sun.y, to_sun.z, sun_visible.0]);
+    let to_moon = light.moon_dir_white.normalize_or_zero();
+    data.0[20..24].copy_from_slice(&[to_moon.x, to_moon.y, to_moon.z, moon_visible.0]);
+    // The flag row: `x` the mirror capture's blur radius in capture texels, `y` the debug view
+    // (`WaterDebug::view`, read only by the `WATER_VIEW` variant), `z` and `w` spare (`z` was the
+    // screen-space march's strength, deleted: no screen-space reflection at all).
+    let view = f32::from(dev.water.view);
+    data.0[24..28].copy_from_slice(&[reflect_blur(), view, 0.0, 0.0]);
+    // The probe's own rows (`probe::probe_lanes`) — the reflection-only switch, then strength and
+    // its debug switch, then its look knobs. Written here rather than by the probe itself because
+    // this buffer has ONE writer; a second system reaching into it is how two tiers end up
+    // disagreeing about which frame they are on.
+    let (probe_at, probe_cfg, box_min, box_max) = super::probe::probe_lanes(probe.as_deref());
+    data.0[28..32].copy_from_slice(&probe_at);
+    data.0[32..36].copy_from_slice(&probe_cfg);
+    data.0[36..40].copy_from_slice(&box_min);
+    data.0[40..44].copy_from_slice(&box_max);
+    let eye_at = world_cam.single().map(|(eye, _, _)| eye.translation()).ok();
+    // x = how much ripple the CUBE lookup sees, which `liquid.wgsl` does not read.
+    data.0[44..48].copy_from_slice(&[
+        super::probe::probe_normal(),
+        // y = which slot the lat-long debug unwraps.
+        super::probe::probe_debug_slot(probe.as_deref(), eye_at),
+        // z = march the cube's stored distances (2) or run the fixed point (1); w = the fixed
+        // point's step count.
+        super::probe::probe_depth_proxy(),
+        super::probe::probe_march_steps(),
+    ]);
+    // One slot's three rows per probe, from 48 on — see [`WaterReflectData`].
+    data.0[PROBE_LANES].copy_from_slice(&super::probe::probe_slot_lanes(probe.as_deref()));
+    // The march's switches; the dome's rows below are for its sky hits.
+    data.0[MARCH_LANES].copy_from_slice(&[
+        f32::from(pass_behind()),
+        ripple_origin(),
+        probe_soft(),
+        // `w` spare.
+        0.0,
+    ]);
+    dome[6].z = f32::from(sky_read_snapshot());
+    for (row, v) in dome.iter().enumerate() {
+        data.0[DOME_LANES.start + 4 * row..DOME_LANES.start + 4 * row + 4]
+            .copy_from_slice(&v.to_array());
+    }
+    // The sky gradient the underside reflects; `w` lanes are debug views, off.
+    let (zenith, horizon) = (light.sky[0], light.sky[4]);
+    data.0[8..12].copy_from_slice(&[zenith[0], zenith[1], zenith[2], 0.0]);
+    data.0[12..16].copy_from_slice(&[horizon[0], horizon[1], horizon[2], 0.0]);
+    // The surface's phases, each reduced by its own period ([`super::clock`]).
+    data.0[CLOCK_LANES].copy_from_slice(&clock.lanes());
+    let mut first = None;
+    let mut second_cam = None;
+    for (tf, cam, proj, target, which) in mirror.iter_mut() {
+        if which.0 == 0 {
+            first = Some((tf, cam, proj, target));
+        } else {
+            second_cam = Some((tf, cam, proj, target));
+        }
+    }
+    let Some((mut mirror_tf, mut mirror_cam, mut mirror_proj, mut target)) = first else {
+        return;
+    };
+    // The second mirror is off, and its row zero, unless a second plane is chosen below.
+    if let Some((_, cam2, _, _)) = second_cam.as_mut() {
+        cam2.is_active = false;
+    }
+    data.0[MIRROR2_LANES].copy_from_slice(&[0.0; 4]);
+    let off = |cam: &mut Camera, data: &mut WaterReflectData| {
+        cam.is_active = false;
+        // The mirror's lanes only — see [`WaterReflectData`].
+        data.0[..4].copy_from_slice(&[0.0; 4]);
+    };
+    // The reference water leaves here: `off` zeroes the mirror's lanes (the shader's "no capture")
+    // and deactivates the camera, so the second view is never queued, culled or drawn.
+    if !style.wants_mirror() || no_reflect() {
+        off(&mut mirror_cam, &mut data);
+        return;
+    }
+    let Ok((eye, camera, projection)) = world_cam.single() else {
+        off(&mut mirror_cam, &mut data);
+        return;
+    };
+    let eye_pos = eye.translation();
+    let fov_y = match projection {
+        Projection::Perspective(p) => p.fov,
+        _ => PerspectiveProjection::default().fov,
+    };
+    let aspect = camera
+        .physical_target_size()
+        .map_or(16.0 / 9.0, |s| s.x as f32 / s.y.max(1) as f32);
+    let Some((plane, lowest_visible, second)) = plane_near(
+        eye_pos,
+        eye.forward().into(),
+        eye.up().into(),
+        fov_y,
+        aspect,
+        look_reach(view_distance.farclip),
+        *held_plane,
+        *held_second,
+        &chunks,
+    ) else {
+        *held_plane = None;
+        *held_second = None;
+        off(&mut mirror_cam, &mut data);
+        return;
+    };
+    // Pinned, for measuring what a handover costs — see [`pinned_plane`].
+    let plane = pinned_plane().unwrap_or(plane);
+    // A second plane the eye is under has nothing to reflect, as for the first below.
+    let second = second.filter(|z| eye_pos.y > *z && pinned_plane().is_none());
+    // Under the surface there is nothing to reflect: the sky is on the other side of it, and the
+    // mirrored camera would be above the water looking down at the bed.
+    if eye_pos.y <= plane {
+        // Release the incumbent too. Defending a plane the eye has sunk below would have this
+        // frame's rejection re-elect it next frame — a swimmer who dips under one surface would
+        // hold the pass off even where another body could have served it.
+        *held_plane = None;
+        *held_second = None;
+        off(&mut mirror_cam, &mut data);
+        return;
+    }
+
+    // Half the main view, and re-made when that moves (render scale moves it too). A new asset
+    // rather than a resize in place, which is how the world backdrop does the same job — the
+    // materials are re-pointed at it by `restamp_reflection_target`.
+    let want = camera.physical_target_size().map_or(reflect.size, |s| {
+        (s / reflect_downscale()).max(UVec2::splat(64))
+    });
+    if want != reflect.size {
+        reflect.image = images.add(reflection_image(want));
+        reflect.image2 = images.add(reflection_image(want));
+        reflect.chain = images.add(super::mirror_chain::chain_image(want));
+        reflect.chain2 = images.add(super::mirror_chain::chain_image(want));
+        reflect.size = want;
+        if let Some((_, _, _, target2)) = second_cam.as_mut() {
+            **target2 = RenderTarget::Image(reflect.image2.clone().into());
+        }
+        // Not while the debug view owns the target: it points this camera at the WINDOW, and a
+        // resize would quietly take it back to the image — which is how the lever looked broken
+        // the first time it was used.
+        if !reflect_debug() {
+            *target = RenderTarget::Image(reflect.image.clone().into());
+        }
+    }
+
+    // The clip: see [`aim_mirror`]. Dropped to the lowest water on screen so a lower body the
+    // first mirror serves through reprojection keeps its reflection — unless that body has the
+    // second mirror, which serves it exactly, in which case the first clips at its own plane.
+    let drop = MAX_CLIP_DROP;
+    let clip_at = if second.is_some_and(|z| z < plane) {
+        plane
+    } else {
+        lowest_visible.clamp(plane - drop, plane)
+    };
+    (*mirror_tf, *mirror_proj) = aim_mirror(eye, projection, plane, clip_at);
+    // **Switched off late.** Once its body leaves the wider view the second mirror keeps rendering
+    // for [`SECOND_HOLD_S`], unused (its lanes zero), so turning back does not find a camera that
+    // has lost its pipelines — a view inactive for a frame loses them, and draws incompletely
+    // for its first frames back.
+    if second.is_some() {
+        *second_idle = 0.0;
+    } else {
+        *second_idle += time.delta_secs();
+    }
+    if let (None, Some(z), Some((tf2, cam2, proj2, _))) =
+        (second, *held_second, second_cam.as_mut())
+    {
+        if *second_idle < SECOND_HOLD_S && eye_pos.y > z {
+            (**tf2, **proj2) = aim_mirror(eye, projection, z, z);
+            cam2.is_active = true;
+        }
+    }
+    if let (Some(z), Some((tf2, cam2, proj2, _))) = (second, second_cam.as_mut()) {
+        (**tf2, **proj2) = aim_mirror(eye, projection, z, z);
+        cam2.is_active = true;
+        data.0[MIRROR2_LANES].copy_from_slice(&[
+            z,
+            strength_lane(),
+            REFLECT_DISTORT,
+            PLANE_TOLERANCE,
+        ]);
+    }
+    if second.is_some() || *second_idle >= SECOND_HOLD_S {
+        *held_second = second;
+    }
+
+    // **Every frame.**
+    //
+    // This alternated once, on the reasoning that a second pass over the world is the one thing that
+    // can most afford to be a frame stale. It cannot, and the reason is the sampling: on a skipped
+    // frame the water reads an image built for the PREVIOUS pose while sampling it with THIS
+    // frame's screen UVs, so the reflected world slides by one frame of camera motion and back
+    // again — a judder at half the frame rate, reported as "sometimes behind and stuttering,
+    // sometimes in complete sync", which is the two parities.
+    //
+    // And it was not even paying: measured at the Stormwind quay (1920x1045, uncapped), the pass
+    // costs 168.6 → 152.6 fps every frame and 155.2 fps on alternate frames. Halving the rate buys
+    // 1.7 % and costs the judder, so there is no knob here — a choice that cheap is not a choice.
+    mirror_cam.is_active = true;
+    *held_plane = Some(plane);
+    // `$WOW_MIRROR_SHOW` rides the strength lane's spare headroom: strength is a 0..1 fraction, so
+    // anything past
+    // 1.5 is unambiguous. It paints the capture the water is about to sample — its colour where the
+    // mirror drew something, red where its alpha says it drew nothing — which is the only way to
+    // tell "the capture has no sky in it" apart from "the capture has sky and the composite is
+    // dropping it". Those need opposite fixes and the water itself cannot distinguish them.
+    data.0[..4].copy_from_slice(&[plane, strength_lane(), REFLECT_DISTORT, PLANE_TOLERANCE]);
+}
+
+/// Re-point every liquid material at the reflection image after a rebuild. Change-gated on the
+/// handle, so it is a no-op on every frame that is not a resize.
+fn restamp_reflection_target(
+    reflect: Res<WaterReflect>,
+    mut materials: ResMut<Assets<benilla_assets::materials::LiquidMaterial>>,
+    mut stamped: Local<Option<AssetId<Image>>>,
+) {
+    if *stamped == Some(reflect.image.id()) {
+        return;
+    }
+    *stamped = Some(reflect.image.id());
+    for (_, material) in materials.iter_mut() {
+        material.extension.reflection = reflect.image.clone();
+        material.extension.reflection2 = reflect.image2.clone();
+        material.extension.reflection_chain = reflect.chain.clone();
+        material.extension.reflection_chain2 = reflect.chain2.clone();
+    }
+}
+
+/// Render world: the whole block once a frame, before anything draws, then the water rectangle's
+/// row and the floor occlusion's lane over it.
+fn upload_reflect(
+    queue: Res<RenderQueue>,
+    buffer: Option<Res<WaterReflectBuffer>>,
+    data: Option<Res<WaterReflectData>>,
+    rect: Option<Res<super::world_view::WaterScreenRect>>,
+    floor: Option<Res<FloorOnScreen>>,
+) {
+    let (Some(buffer), Some(data)) = (buffer, data) else {
+        return;
+    };
+    queue.write_buffer(&buffer.0, 0, bytemuck::cast_slice(&data.0));
+    // The rect row's one writer: the rectangle is computed after visibility, which runs after
+    // `drive_reflection`, so it is current only here. The same queue's later write lands over the
+    // zeros the block carries in that row.
+    let r = rect.map_or([0.0; 4], |r| {
+        [
+            r.min.x as f32,
+            r.min.y as f32,
+            r.max.x as f32,
+            r.max.y as f32,
+        ]
+    });
+    queue.write_buffer(
+        &buffer.0,
+        (LOOK_WATER_RECT * 4) as u64,
+        bytemuck::cast_slice(&r),
+    );
+    // `quality.y`'s one writer, for the same reason: whether the floor is occluded this frame is
+    // known after visibility. Off, the fragment does not march, and nothing reads the pyramids
+    // and the plane pass's images, which this frame did not build.
+    let floor = floor.map_or_else(FloorOnScreen::default, |f| *f);
+    let on = [f32::from(floor.occluded)];
+    queue.write_buffer(
+        &buffer.0,
+        ((LOOK_QUALITY + 1) * 4) as u64,
+        bytemuck::cast_slice(&on),
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use benilla_formats::LiquidKind;
+    use benilla_world::liquid::LiquidSource;
+
+    /// The block's layout is the shader's `WaterReflect`: twelve shared rows, the probe slot array,
+    /// then the dome's seven rows. A lane written past the probe block, or a probe block that grew
+    /// without the dome moving, lands in the wrong member on the GPU with nothing to say so.
+    #[test]
+    fn the_reflect_block_matches_the_shader_struct() {
+        assert_eq!(PROBE_LANES.start, 48);
+        assert_eq!(PROBE_LANES.len(), super::super::probe::PROBE_SLOT_MAX * 16);
+        assert_eq!(DOME_LANES.start, PROBE_LANES.end);
+        assert_eq!(DOME_LANES.len(), 7 * 4);
+        assert_eq!(MARCH_LANES.start, DOME_LANES.end);
+        assert_eq!(MARCH_LANES.len(), 4);
+        assert_eq!(std::mem::size_of::<WaterReflectData>(), REFLECT_FLOATS * 4);
+        let wgsl = include_str!("../../benilla-assets/src/shaders/liquid.wgsl");
+        let body = &wgsl[wgsl.find("struct WaterReflect {").unwrap()..];
+        let body = &body[..body.find("};").unwrap()];
+        let probes = body
+            .find("probes: array<ProbeSlot, PROBE_SLOT_MAX>")
+            .unwrap();
+        let dome = body.find("dome: DomeColors").unwrap();
+        assert!(probes < dome, "the dome rows come after the probe slots");
+        let march = body.find("march: vec4<f32>").unwrap();
+        assert!(dome < march, "the march row comes after the dome rows");
+        assert_eq!(MIRROR2_LANES.start, MARCH_LANES.end);
+        let mirror2 = body.find("mirror2: vec4<f32>").unwrap();
+        assert!(
+            march < mirror2,
+            "the second mirror's row comes after the march row"
+        );
+        // The clock: eight `vec2` offsets (stride 8 in a storage buffer), then one `vec4` of cycles.
+        assert_eq!(CLOCK_LANES.start, MIRROR2_LANES.end);
+        assert_eq!(CLOCK_LANES.len(), 8 * 2 + 4);
+        let drift = body.find("drift: array<vec2<f32>, 8>").unwrap();
+        let cycle = body.find("cycle: vec4<f32>").unwrap();
+        assert!(
+            mirror2 < drift && drift < cycle,
+            "the clock's offsets, then its cycles, come after the second mirror's row"
+        );
+        // The look block: 139 rows after the clock, 16-byte aligned, and the last member before the preview's block.
+        assert_eq!(LOOK_LANES.start, CLOCK_LANES.end);
+        assert_eq!(LOOK_LANES.len(), 556);
+        assert_eq!(LOOK_LANES.start % 4, 0, "a vec4 row starts on 16 bytes");
+        assert_eq!(PREVIEW_LANES.start, LOOK_LANES.end);
+        assert_eq!(REFLECT_FLOATS, PREVIEW_LANES.end);
+        let look = body.find("look: WaterLook").unwrap();
+        assert!(cycle < look, "the look rows come after the clock");
+        let tail: Vec<&str> = body[look..]
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with("//"))
+            .collect();
+        assert_eq!(
+            tail,
+            ["look: WaterLook,", "preview: WaterPreview,"],
+            "the look rows are the struct's last member but the preview's"
+        );
+        // Each row's lane, in the order and size of `WaterLook` and `WaterBody`.
+        use benilla_world::liquid::{
+            LOOK_BODY, LOOK_COMPOSITE, LOOK_DETAIL, LOOK_GRADE, LOOK_QUALITY, LOOK_RIPPLE_LOSS,
+            LOOK_RIPPLE_MEAN, LOOK_SHORE, LOOK_SHORE_KIND, LOOK_SURF, RIPPLE_LOSS_ROWS,
+        };
+        let loss = format!("ripple_loss: array<vec4<f32>, {RIPPLE_LOSS_ROWS}>");
+        let rows = [
+            ("quality: vec4<f32>", LOOK_QUALITY, 1),
+            ("composite: vec4<f32>", LOOK_COMPOSITE, 1),
+            ("water_rect: vec4<f32>", LOOK_WATER_RECT, 1),
+            ("surf: vec4<f32>", LOOK_SURF, 1),
+            ("grade: vec4<f32>", LOOK_GRADE, 1),
+            ("detail: vec4<f32>", LOOK_DETAIL, 1),
+            (loss.as_str(), LOOK_RIPPLE_LOSS, RIPPLE_LOSS_ROWS),
+            ("ripple_mean: vec4<f32>", LOOK_RIPPLE_MEAN, 1),
+            ("body: WaterBody", LOOK_BODY, 10),
+            ("shore: vec4<f32>", LOOK_SHORE, 1),
+            ("shore_kind: vec4<f32>", LOOK_SHORE_KIND, 1),
+        ];
+        assert_eq!(members(wgsl, "WaterLook"), rows.map(|(m, ..)| m));
+        let mut at = LOOK_LANES.start;
+        for (member, lane, len) in rows {
+            assert_eq!(lane, at, "{member}");
+            at += 4 * len;
+        }
+        assert_eq!(at, LOOK_LANES.end);
+        assert_eq!(
+            members(wgsl, "WaterBody"),
+            [
+                "sig_river: vec4<f32>",
+                "sig_ocean: vec4<f32>",
+                "e_sky: vec4<f32>",
+                "e_sun: vec4<f32>",
+                "look: vec4<f32>",
+                "refr: vec4<f32>",
+                "shadow: vec4<f32>",
+                "spare: vec4<f32>",
+                "e_sky_foam: vec4<f32>",
+                "e_sun_foam: vec4<f32>",
+            ]
+        );
+        // The rect row and the floor occlusion's lane have one writer: `upload_reflect` in the
+        // render world, over the zeros `look_lanes` leaves there.
+        let src = include_str!("reflect.rs");
+        let upload = &src[src.find("fn upload_reflect(").unwrap()..];
+        let upload = &upload[..upload.find("\n}\n").unwrap()];
+        assert!(upload.contains("(LOOK_WATER_RECT * 4) as u64"));
+        assert!(upload.contains("((LOOK_QUALITY + 1) * 4) as u64"));
+        // `quality.y` holds the floor's occlusion; the body's light reads no screen depth, so
+        // `body_visibility` reads no lane and no image at all.
+        assert!(upload.contains("[f32::from(floor.occluded)]"));
+        let wgsl = include_str!("../../benilla-assets/src/shaders/liquid.wgsl");
+        let shader_fn = |name: &str| {
+            let at = wgsl.find(&format!("\nfn {name}(")).unwrap();
+            &wgsl[at..at + wgsl[at..].find("\n}\n").unwrap()]
+        };
+        let floor = shader_fn("floor_occlusion_wanted");
+        assert!(floor.contains("look.quality.y > 0.5") && !floor.contains("quality.z"));
+        let vis = shader_fn("body_visibility");
+        assert!(!vis.contains("quality") && !vis.contains("water_occl"));
+        let lanes = super::super::look::look_lanes(
+            &super::super::look::WaterLook::default(),
+            &super::super::look::LookInputs::default(),
+        );
+        let rect = LOOK_WATER_RECT - LOOK_LANES.start;
+        assert_eq!(lanes[rect..rect + 4], [0.0; 4]);
+        assert_eq!(lanes[LOOK_QUALITY + 1 - LOOK_LANES.start], 0.0);
+        assert_eq!(lanes[LOOK_QUALITY + 2 - LOOK_LANES.start], 0.0);
+    }
+
+    /// The members of the WGSL struct `name`, in order, comments and trailing commas dropped.
+    fn members<'a>(wgsl: &'a str, name: &str) -> Vec<&'a str> {
+        let at = wgsl.find(&format!("struct {name} {{")).unwrap();
+        let body = &wgsl[at..];
+        body[body.find('{').unwrap() + 1..body.find("};").unwrap()]
+            .lines()
+            .map(|l| l.split_once("//").map_or(l, |(code, _)| code).trim())
+            .filter(|l| !l.is_empty())
+            .map(|l| l.trim_end_matches(','))
+            .collect()
+    }
+
+    /// A 3x3-vertex grid at height `z` with exactly ONE wet cell — the far corner one — so three
+    /// quarters of its footprint is dry ground inside a wet surface's box, which is the shape a
+    /// WMO pool has around a bridge or a quay.
+    fn holed_chunk(z: f32) -> WaterChunkInfo {
+        let positions = (0..3)
+            .flat_map(|j| (0..3).map(move |i| [10.0 * i as f32, 10.0 * j as f32, z]))
+            .collect();
+        WaterChunkInfo::new(
+            LiquidSource::AdtChunk,
+            LiquidKind::Still,
+            [3, 3],
+            positions,
+            vec![false, false, false, true],
+        )
+    }
+
+    /// **The reported bug** (the Stormwind screencast): standing over a DRY cell of a pool whose
+    /// box you are inside must not read as "no water here". `surface_z_at` answers wet/dry at a
+    /// point, and taking its `None` for the surface's answer left the canals reflecting from some
+    /// positions and not from others a few yards away.
+    #[test]
+    fn a_dry_point_inside_a_pools_footprint_still_finds_its_water() {
+        let chunk = holed_chunk(42.0);
+        // The dry corner of the same footprint: the point test says nothing is here …
+        assert!(chunk.surface_z_at(1.0, 1.0).is_none());
+        // … and the surface's own answer is still its water, with the distance to it.
+        let (z, d2) = wet_height_near(&chunk, 1.0, 1.0, true).expect("the wet cell is found");
+        assert!(
+            (z - 42.0).abs() < 1e-3,
+            "the pool's height, not a guess: {z}"
+        );
+        assert!(d2 > 0.0, "the sample is somewhere else on the surface");
+        // A point over the wet cell answers directly, at no distance.
+        let (z, d2) = wet_height_near(&chunk, 15.0, 15.0, false).expect("wet under the point");
+        assert!((z - 42.0).abs() < 1e-3);
+        assert!(d2 < 1e-6, "the near point itself was wet: {d2}");
+        // Note this surface never needs the lattice: `xy_bounds` is the bounding box of the WET
+        // cells, so clamping a point outside the water into it already lands on water. What the
+        // lattice is for is the box whose own nearest corner is dry — see [`elled_chunk`].
+    }
+
+    /// A wet region that is not convex: an L, so the bounding box of its wet cells has a DRY corner
+    /// in it. This is the only shape that reaches the lattice, and the shape a canal bend has.
+    fn elled_chunk(z: f32) -> WaterChunkInfo {
+        let positions = (0..3)
+            .flat_map(|j| (0..3).map(move |i| [10.0 * i as f32, 10.0 * j as f32, z]))
+            .collect();
+        WaterChunkInfo::new(
+            LiquidSource::AdtChunk,
+            LiquidKind::Still,
+            [3, 3],
+            positions,
+            // Cells are `j * (cols - 1) + i`: the two off-diagonal ones, so the box spans the whole
+            // grid while the corner the query sits over is dry.
+            vec![false, true, true, false],
+        )
+    }
+
+    /// The lattice is what the far surfaces skip, and skipping it is the only difference.
+    ///
+    /// The walk reaches out to [`look_reach`] now, several times the surfaces it used to
+    /// visit, and 25 grid probes on every one of them once a frame is not what that reach is for.
+    /// Near, the L still answers with its water; far, it declines rather than pays — and the cheap
+    /// clamped point test is untouched at both distances, which is what keeps every convex surface
+    /// (all but this shape) answering exactly as it did.
+    #[test]
+    fn only_the_far_surfaces_skip_the_lattice() {
+        let chunk = elled_chunk(7.0);
+        // The corner of the box the query sits over really is dry, or this proves nothing.
+        assert!(
+            chunk.surface_z_at(1.0, 1.0).is_none(),
+            "the fixture's corner is dry"
+        );
+        let (z, d2) = wet_height_near(&chunk, 1.0, 1.0, true).expect("the lattice finds the L");
+        assert!((z - 7.0).abs() < 1e-3, "the L's height: {z}");
+        assert!(d2 > 0.0, "the water is somewhere else on the surface");
+        assert!(
+            wet_height_near(&chunk, 1.0, 1.0, false).is_none(),
+            "without the lattice a dry corner is simply not a candidate"
+        );
+    }
+
+    /// A square footprint of `side` yards centred on WoW `(x, y)` at height `z`, as the four Bevy
+    /// corners [`Frame::footprint_share`] takes.
+    fn patch(x: f32, y: f32, z: f32, side: f32) -> [Vec3; 4] {
+        let h = side * 0.5;
+        [
+            wow_to_bevy([x - h, y - h, z]),
+            wow_to_bevy([x + h, y - h, z]),
+            wow_to_bevy([x + h, y + h, z]),
+            wow_to_bevy([x - h, y + h, z]),
+        ]
+    }
+
+    /// **The ocean regression, as arithmetic.** A camera 12 yd above sea level, 400 yd up the
+    /// beach, pitched 3 deg down: the sea is plainly in the upper half of its frame, and the old
+    /// centre-ray test could not see it because the middle of the screen was sand.
+    ///
+    /// The numbers are the measured ones from the Savage Coast sweep, and the depression angle to
+    /// the water — about 1.7 deg — is why the ray fan that replaced the single ray failed too: at
+    /// seven rays over a 46 deg frame the gaps are 7.7 deg wide.
+    #[test]
+    fn the_sea_up_the_beach_is_in_frame_even_when_the_centre_ray_misses() {
+        // Bevy: −Z is WoW +x, −X is WoW +y. Facing WoW +y (out to sea) is Bevy −X.
+        let forward = Vec3::new(-1.0, -0.052, 0.0).normalize(); // ~3 deg down
+        let frame = Frame::new(forward, Vec3::Y, 0.8, 16.0 / 9.0);
+        let eye = Vec3::new(0.0, 12.0, 0.0);
+
+        // The sea, a 200 yd stretch centred 400 yd ahead at sea level: 1.7 deg below the horizon,
+        // well inside a 23 deg half-frame, so it is on screen and the test must say so.
+        let (depth, share) = frame
+            .footprint_share(eye, patch(0.0, 400.0, 0.0, 200.0))
+            .expect("the sea is in the upper half of the frame");
+        assert!(share > 0.0, "it covers some of the window: {share}");
+        assert!(
+            depth > 250.0 && depth < 400.0,
+            "the near edge of the stretch: {depth}"
+        );
+
+        // The centre ray, for contrast: it crosses sea level at 12/tan(3 deg) ≈ 229 yd — dry sand,
+        // 170 yd short of the water. This is the whole bug in one number.
+        let centre_hit = 12.0 / (3.0_f32.to_radians()).tan();
+        assert!(
+            centre_hit < 300.0,
+            "the centre ray lands on the beach, not the sea: {centre_hit}"
+        );
+    }
+
+    /// **The water you are standing over is the water most likely to be missed.** Scoring a surface
+    /// at the point of its footprint nearest the eye put that point directly underfoot — off the
+    /// bottom of the screen — so the chunk filling the frame was dropped as "not visible" and the
+    /// plane went to whatever was on the horizon. Measuring the footprint trims the part behind the
+    /// camera and keeps the part in front, which is the part being looked at.
+    #[test]
+    fn a_surface_the_camera_stands_over_still_fills_the_frame() {
+        // Level-ish, looking along WoW +x (Bevy −Z), eye four yards up.
+        let frame = Frame::new(
+            Vec3::new(0.0, -0.2, -1.0).normalize(),
+            Vec3::Y,
+            0.8,
+            16.0 / 9.0,
+        );
+        let eye = Vec3::new(0.0, 4.0, 0.0);
+        // A 33 yd chunk centred on the camera: it reaches 16 yd behind and 16 yd ahead.
+        let (_, share) = frame
+            .footprint_share(eye, patch(0.0, 0.0, 0.0, 33.0))
+            .expect("the half in front of the camera is on screen");
+        assert!(
+            share > 0.2,
+            "the water underfoot covers a real part of the window: {share}"
+        );
+    }
+
+    /// A surface cannot claim more window than there is, however close it comes — the property that
+    /// made the old `area / depth²` term run away as a chunk neared the eye.
+    #[test]
+    fn a_footprint_never_claims_more_than_the_whole_window() {
+        // Straight down, so `up` must be something other than +Y or the basis is degenerate.
+        let frame = Frame::new(Vec3::new(0.0, -1.0, 0.0), Vec3::NEG_Z, 0.8, 16.0 / 9.0);
+        let eye = Vec3::new(0.0, 2.0, 0.0); // water two yards below
+        for side in [50.0, 500.0, 5000.0] {
+            let (_, share) = frame
+                .footprint_share(eye, patch(0.0, 0.0, 0.0, side))
+                .expect("directly below the camera");
+            assert!(
+                share <= 1.0 + f32::EPSILON,
+                "a {side} yd sheet still covers one window at most: {share}"
+            );
+            assert!(share > 0.99, "and it does cover it: {share}");
+        }
+    }
+
+    /// A body leaving the frame loses its share smoothly. This is what a hysteresis rule needs in
+    /// order to have anything to hold, and it is now a property of the measurement rather than a
+    /// fade bolted onto a point test.
+    #[test]
+    fn a_surface_leaves_the_frame_continuously() {
+        let eye = Vec3::new(0.0, 5.0, 0.0);
+        let mut prev: Option<f32> = None;
+        let mut biggest_step = 0.0_f32;
+        let mut partials = 0;
+        // Swing the camera away from a patch off to one side and watch its share decay.
+        for step in 0..40 {
+            let yaw = step as f32 * 0.05;
+            let forward = Vec3::new(-yaw.cos(), -0.1, yaw.sin()).normalize();
+            let frame = Frame::new(forward, Vec3::Y, 0.8, 16.0 / 9.0);
+            let share = frame
+                .footprint_share(eye, patch(0.0, 60.0, 0.0, 40.0))
+                .map_or(0.0, |(_, s)| s);
+            if let Some(p) = prev {
+                biggest_step = biggest_step.max((share - p).abs());
+            }
+            if share > 0.0 {
+                partials += 1;
+            }
+            prev = Some(share);
+        }
+        // The property that matters is that no single step drops the whole contribution — that is
+        // what a step function does, and what made the plane change hands in one frame.
+        assert!(
+            biggest_step < 0.02,
+            "the share moves smoothly, never all at once: {biggest_step}"
+        );
+        assert!(
+            partials > 3,
+            "it was in frame for a while first: {partials}"
+        );
+        assert_eq!(prev, Some(0.0), "and it is gone by the end");
+    }
+
+    /// **The Savage Coast ranking, with the measured geometry.** A single pool at the roadside
+    /// against the ocean 400 yd out: the ocean is further and each of its chunks is no bigger, but
+    /// there are a hundred of them and they are all one height, so it covers the screen and must
+    /// win. Ranking by nearest-in-frame instead is what returned the pool's 10.07 at every distance
+    /// from 100 to 700 yd.
+    #[test]
+    fn the_ocean_outranks_a_roadside_pool_it_is_further_away_than() {
+        let mut seen = Prominence::default();
+        // One pool chunk, 60x60 yd of it, 150 yd off.
+        seen.add(10.07, 3600.0 / (150.0 * 150.0));
+        // The sea: ADT chunks are 33.3 yd square, and a farclip's worth of them is in frame.
+        for i in 0..100 {
+            let depth = 400.0 + i as f32 * 3.0;
+            seen.add(0.0, 1109.0 / (depth * depth));
+        }
+        assert_eq!(
+            seen.best(),
+            Some(0.0),
+            "the sea covers more screen than the pool"
+        );
+    }
+
+    /// …and the same arithmetic the other way: standing AT a pond, it is what you are looking at,
+    /// however much ocean is on the horizon behind it.
+    #[test]
+    fn a_pond_you_are_standing_at_outranks_a_distant_sea() {
+        let mut seen = Prominence::default();
+        seen.add(10.07, 3600.0 / (12.0 * 12.0));
+        for i in 0..100 {
+            let depth = 600.0 + i as f32 * 1.0;
+            seen.add(0.0, 1109.0 / (depth * depth));
+        }
+        assert_eq!(seen.best(), Some(10.07));
+    }
+
+    /// One body is many surfaces at one height, so they must ADD rather than compete — that is the
+    /// whole reason the score is bucketed. Heights further apart than the bucket stay separate.
+    #[test]
+    fn one_water_body_accumulates_across_its_chunks() {
+        let mut seen = Prominence::default();
+        for _ in 0..10 {
+            seen.add(57.63, 1.0);
+        }
+        seen.add(57.9, 1.0); // within BUCKET_YARDS — the same body, folded in
+        seen.add(70.0, 5.0); // a different body, on its own
+        assert_eq!(seen.used, 2, "two bodies, not twelve surfaces");
+        assert_eq!(seen.best(), Some(57.63), "11.0 of river beats 5.0 of pond");
+    }
+
+    /// Overflow folds into the nearest height instead of dropping the surface — a view with more
+    /// water heights than slots must still answer, just less precisely.
+    #[test]
+    fn more_heights_than_slots_still_answers() {
+        let mut seen = Prominence::default();
+        for i in 0..(PROMINENCE_SLOTS + 4) {
+            seen.add(i as f32 * 10.0, 1.0);
+        }
+        assert_eq!(seen.used, PROMINENCE_SLOTS);
+        assert!(
+            seen.best().is_some(),
+            "an overfull view still has an answer"
+        );
+    }
+
+    /// **The switch, as arithmetic**, in shares of the frame — see [`Frame::footprint_share`]. The
+    /// pool under the camera fills the window against an ocean at a quarter of it, so it wins
+    /// outright; when the camera turns and its share decays, the incumbent holds until the ocean is
+    /// clearly better, instead of the two trading the capture the instant they cross.
+    #[test]
+    fn the_incumbent_holds_until_a_challenger_is_clearly_better() {
+        let mut seen = Prominence::default();
+        seen.add(10.069875, 1.00); // the pool, filling the frame
+        seen.add(0.0, 0.27); // the ocean behind it
+        assert_eq!(
+            seen.best_sticky(None),
+            Some(10.069875),
+            "no incumbent: the top score"
+        );
+        assert_eq!(
+            seen.best_sticky(Some(10.069875)),
+            Some(10.069875),
+            "it defends its own"
+        );
+
+        // The camera turns: the pool fades toward the frame edge and the ocean gains. A near-tie
+        // must NOT flip — that is the twitch.
+        let mut turning = Prominence::default();
+        turning.add(10.069875, 0.63);
+        turning.add(0.0, 0.72);
+        assert_eq!(
+            turning.best_sticky(Some(10.069875)),
+            Some(10.069875),
+            "a 14% lead is not enough to move the capture"
+        );
+
+        // Further round, the ocean is unambiguously the subject and the handover happens.
+        let mut past = Prominence::default();
+        past.add(10.069875, 0.16);
+        past.add(0.0, 0.74);
+        assert_eq!(
+            past.best_sticky(Some(10.069875)),
+            Some(0.0),
+            "4.6x and three-fifths of the window clears both bars"
+        );
+    }
+
+    /// **The reported flight, as arithmetic.** The measured shares from the Savage Coast recording,
+    /// flying north with the stream alongside and the ocean opening ahead — one capture every ten
+    /// yards, scored by [`Frame::footprint_share`].
+    ///
+    /// What the numbers show is a body that is simply *there* the whole way in: the stream holds
+    /// about six tenths of the frame from -140 to -60, because that is how much of the window it
+    /// fills. The scorer these replaced reported the same stretch as 2.32, 0.16, 0.53, 2.03, 0.075,
+    /// 1.01, 0.043 — the same water, sampled at one point that kept falling off the bottom of the
+    /// screen — and the capture changed hands three times chasing it.
+    ///
+    /// So the assertion is the whole flight: one handover, at the end, when the stream really has
+    /// gone.
+    #[test]
+    fn the_capture_changes_hands_once_on_the_reported_flight() {
+        // (y, stream share, ocean share)
+        let flight = [
+            (-160, 0.170_f32, 0.030_f32),
+            (-150, 0.508, 0.034),
+            (-140, 0.586, 0.051),
+            (-130, 0.603, 0.060),
+            (-120, 0.602, 0.072),
+            (-110, 0.596, 0.089),
+            (-100, 0.588, 0.117),
+            (-90, 0.574, 0.148),
+            (-80, 0.545, 0.192),
+            (-70, 0.527, 0.257),
+            (-60, 0.519, 0.369),
+            (-50, 0.425, 0.553),
+            (-40, 0.167, 0.575),
+            (-30, 0.0, 0.583), // the stream is out of frame
+            (-20, 0.0, 0.583),
+        ];
+        let stream = 10.069875_f32;
+        let mut held = Some(stream);
+        let mut handovers = Vec::new();
+        for (y, pool, ocean) in flight {
+            let mut seen = Prominence::default();
+            if pool > 0.0 {
+                seen.add(stream, pool);
+            }
+            seen.add(0.0, ocean);
+            let next = seen.best_sticky(held);
+            if next != held {
+                handovers.push(y);
+            }
+            held = next;
+        }
+        assert_eq!(
+            handovers.len(),
+            1,
+            "one handover on the whole flight, not three: {handovers:?}"
+        );
+        assert!(
+            handovers[0] >= -50,
+            "and it happens at the mouth, once the stream has thinned: y={}",
+            handovers[0]
+        );
+        assert_eq!(held, Some(0.0), "the ocean ends up with the capture");
+    }
+
+    /// A plane that has left the frame entirely cannot defend itself — otherwise turning your back
+    /// on a pool would keep the whole scene captured for it.
+    #[test]
+    fn an_incumbent_that_left_the_frame_gives_way_at_once() {
+        let mut seen = Prominence::default();
+        seen.add(0.0, 0.74); // only the ocean is left in frame
+        assert_eq!(seen.best_sticky(Some(10.069875)), Some(0.0));
+    }
+
+    /// The frame has sides, and things behind the camera are not in it.
+    #[test]
+    fn the_frame_rejects_what_is_behind_it_and_off_its_edges() {
+        let frame = Frame::new(Vec3::new(0.0, 0.0, -1.0), Vec3::Y, 0.8, 16.0 / 9.0);
+        let eye = Vec3::new(0.0, 5.0, 0.0);
+        // Bevy −Z is WoW +x, so "dead ahead" is WoW +x and "behind" is WoW −x.
+        assert!(
+            frame
+                .footprint_share(eye, patch(-100.0, 0.0, 0.0, 20.0))
+                .is_none(),
+            "a pool behind the camera is not what the player is looking at"
+        );
+        assert!(
+            frame
+                .footprint_share(eye, patch(100.0, 0.0, 0.0, 20.0))
+                .is_some(),
+            "dead ahead is in frame"
+        );
+        assert!(
+            frame
+                .footprint_share(eye, patch(1.0, 500.0, 0.0, 20.0))
+                .is_none(),
+            "far off to the side is out"
+        );
+    }
+
+    /// A surface half outside the window contributes half, not all of it and not nothing. The old
+    /// point test had to approximate this with a fade across an invented slop band; clipping the
+    /// footprint gives it exactly.
+    #[test]
+    fn a_footprint_straddling_the_edge_counts_only_what_is_inside() {
+        let frame = Frame::new(Vec3::new(0.0, 0.0, -1.0), Vec3::Y, 0.8, 16.0 / 9.0);
+        let eye = Vec3::new(0.0, 5.0, 0.0);
+        // Two identical patches 100 yd ahead: one centred, one pushed sideways so about half of it
+        // is outside the window.
+        let (_, centred) = frame
+            .footprint_share(eye, patch(100.0, 0.0, 0.0, 60.0))
+            .expect("centred");
+        let half_out = frame
+            .footprint_share(eye, patch(100.0, 60.0, 0.0, 60.0))
+            .map_or(0.0, |(_, s)| s);
+        assert!(
+            half_out < centred,
+            "the part outside the window does not count: {half_out} vs {centred}"
+        );
+        assert!(
+            half_out > 0.0,
+            "but the part inside it still does: {half_out}"
+        );
+    }
+
+    /// The mirrored pose: the eye reflects through the plane, and the basis reflects with it. The
+    /// handedness flip this leaves behind is the shader's `1 − u`, and is asserted there in prose
+    /// rather than here — what this pins is that the *pose* is a reflection and not a rotation.
+    #[test]
+    fn the_mirrored_pose_reflects_through_the_plane() {
+        let plane = 12.0;
+        let eye =
+            Transform::from_xyz(3.0, 20.0, -7.0).looking_to(Vec3::new(0.0, -1.0, 1.0), Vec3::Y);
+        let mirror_v = |v: Vec3| Vec3::new(v.x, -v.y, v.z);
+        let pos = Vec3::new(
+            eye.translation.x,
+            2.0 * plane - eye.translation.y,
+            eye.translation.z,
+        );
+        let mirrored = Transform::from_translation(pos)
+            .looking_to(mirror_v(eye.forward().into()), mirror_v(eye.up().into()));
+        // As far below the plane as the eye is above it.
+        assert!((mirrored.translation.y - 4.0).abs() < 1e-5);
+        // Looking as far up as the eye looks down.
+        let f: Vec3 = eye.forward().into();
+        let mf: Vec3 = mirrored.forward().into();
+        assert!((mf.y + f.y).abs() < 1e-5, "{f:?} vs {mf:?}");
+        assert!((mf.x - f.x).abs() < 1e-5 && (mf.z - f.z).abs() < 1e-5);
+    }
+
+    /// Improved Water drives the mirrors and the probes; the reference water neither, and the
+    /// checkbox's two values survive the round trip the options page reads them back through.
+    #[test]
+    fn improved_water_is_mirrors_and_probes() {
+        assert!(WaterStyle::Stylised.wants_mirror() && WaterStyle::Stylised.wants_probe());
+        assert!(!WaterStyle::Reference.wants_mirror() && !WaterStyle::Reference.wants_probe());
+        for style in [WaterStyle::Reference, WaterStyle::Stylised] {
+            let back = WaterStyle::from_cvar(style.cvar().parse::<f32>().unwrap());
+            assert_eq!(back, style, "{style:?} did not survive its own CVar string");
+        }
+    }
+
+    /// **No water on screen, no mirror pass**, once the hold has run out: a mirror camera that
+    /// `drive_reflection` switched on stays on while water is in the rectangle and for
+    /// [`MIRROR_HOLD_S`] after, then goes idle, and the world camera is never touched.
+    #[test]
+    fn the_mirrors_idle_without_water_on_screen() {
+        use crate::world_view::WaterScreenRect;
+        let mut world = World::new();
+        world.insert_resource(Time::<()>::default());
+        world.insert_resource(WaterScreenRect {
+            visible: true,
+            ..default()
+        });
+        let mirror = world.spawn((Camera::default(), ReflectionCamera(0))).id();
+        let eye = world.spawn((Camera::default(), WorldCamera)).id();
+        let mut schedule = Schedule::default();
+        schedule.add_systems(idle_mirrors_off_screen);
+        let mut frame = |world: &mut World, visible: bool| {
+            world
+                .resource_mut::<Time>()
+                .advance_by(std::time::Duration::from_millis(400));
+            world.resource_mut::<WaterScreenRect>().visible = visible;
+            // `drive_reflection` elects a plane every frame and switches the camera on.
+            world.get_mut::<Camera>(mirror).unwrap().is_active = true;
+            schedule.run(world);
+            world.get::<Camera>(mirror).unwrap().is_active
+        };
+        assert!(frame(&mut world, true), "water on screen");
+        assert!(frame(&mut world, false), "0.4 s without water: held");
+        assert!(frame(&mut world, false), "0.8 s: held");
+        assert!(!frame(&mut world, false), "1.2 s: idle");
+        assert!(!frame(&mut world, false), "still none: idle");
+        assert!(frame(&mut world, true), "water back: on that frame");
+        assert!(frame(&mut world, false), "the hold starts over");
+        assert!(world.get::<Camera>(eye).unwrap().is_active);
+        let mut idle = 0.0;
+        assert!(mirrors_wanted(false, &mut idle, MIRROR_HOLD_S - 0.01));
+        assert!(!mirrors_wanted(false, &mut idle, 0.02));
+        assert!(mirrors_wanted(true, &mut idle, 5.0) && idle == 0.0);
+    }
+}

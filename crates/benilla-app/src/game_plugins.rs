@@ -334,6 +334,8 @@ pub(crate) mod schedule_tests {
             connect: false,
             start: crate::client_state::ClientState::Login,
         });
+        #[cfg(feature = "improved-water")]
+        app.add_plugins(benilla_water::ImprovedWaterPlugin { cache_dir: None });
         more(&mut app);
         app.finish();
         app
@@ -916,8 +918,20 @@ pub(crate) mod schedule_tests {
     }
 
     /// `PostUpdate`'s undeclared-order pairs on the declared graph; `GlobalTransform` and the
-    /// particle `EffectQuads` are most of it.
-    const POST_UPDATE_CEILING: usize = 370;
+    /// particle `EffectQuads` are most of it. The water cameras and the ripple window against the rig
+    /// and pose writers are `Transform` on disjoint lanes. The water's surface summary
+    /// (`floor_share::summarise_surfaces`) reads the liquid surfaces' `Mesh3d` against the zfill
+    /// and straddle twin writers, which set it only on their twins, and Bevy's mesh change marker,
+    /// which only flags it changed. The Improved Water preview's wake rows read the swimmers'
+    /// `Transform` against the conform and rig writers, its falls' rows the props' materials
+    /// against the straddle twins, and the sun's glint visibility the camera's `GlobalTransform`
+    /// against the nameplate, raid-mark and model-particle placers: each a frame late at worst.
+    /// The glue booth's `seat_on_stage_bones` writes its stage models' `Transform` beside the
+    /// mirror, probe and ripple cameras' drivers (disjoint entities), and the loading screen's
+    /// `hand_back_the_pointer` sets the `Window`'s cursor while the mirror driver's look rows
+    /// read it.
+    /// `WOW_AMBIGUITY_DUMP=1` prints every pair after `Update`'s.
+    const POST_UPDATE_CEILING: usize = 396;
     const POST_UPDATE_SLACK: usize = 20;
     /// The actionable pairs in `Update`: conflicting access, no declared order, and nothing
     /// [`Classes`] explains, so the executor orders them however the graph falls. The count may
@@ -969,12 +983,25 @@ pub(crate) mod schedule_tests {
     ///   too, meets the same way, none a host;
     /// - the minimap's draw (`minimap::emit_minimap`), which reads `QuestGiver`'s dialog statuses,
     ///   against `ui_panes::feed_character_panes`, which lends the call host, whose quest verbs
-    ///   write that window's cell and panel latches and never a status.
+    ///   write that window's cell and panel latches and never a status;
+    /// - the water's style switch, ripple anisotropy, bindable view depth, layer stamp, world-view
+    ///   marker and probe gizmos against `apply_net_updates`, `finish_colliders`, the lanes' drain
+    ///   and the input records' dispatch over the world, as `drift::setup_drift`: they touch only
+    ///   water and cameras (the ripple map's sampler and the liquid materials, which neither
+    ///   creates); the gizmos read `DebugState` a frame late at worst;
+    /// - the Improved Water preview's dry sky and haze (`lighting::resolve::update_dry_sky`,
+    ///   `ffx_glow::sync_haze`, `ffx_glow::sync_gain`) against `publish_viewer` and the glue
+    ///   booth's FFX sync: they read the viewer and the glue's gain a frame late at worst;
+    /// - the surface height's fine ring swap (`liquid::surface::swap_fine_liquids`, 7 pairs; it
+    ///   runs after `WorldStage::Present`, so after the drains that write the style and the tier)
+    ///   against the `Mesh3d` writers (collider construction, the glue booth, the rig reaper and
+    ///   the part parker) and the `DebugState` writers: it swaps the mesh of ADT liquid surfaces
+    ///   only, which no other system meshes, and reads the debug switch a frame late at worst.
     ///
     /// Raising the ceiling is a claim that a new undeclared order is acceptable: make it with the
     /// reason read off the dump, or declare the order (`.after`, a set, a `chain`). A resource
     /// that commutes by construction belongs in [`Classes`].
-    const UPDATE_ACTIONABLE_CEILING: usize = 1_467;
+    const UPDATE_ACTIONABLE_CEILING: usize = 1_488;
     const UPDATE_ACTIONABLE_SLACK: usize = 40;
 
     fn ratchet(what: &str, n: usize, ceiling: usize, slack: usize) {
@@ -992,6 +1019,36 @@ pub(crate) mod schedule_tests {
             "only {n} ambiguous pairs in {what} and the ceiling still says {ceiling}. Lower the \
              ceiling to {n} so it keeps ratcheting."
         );
+    }
+
+    /// Print each pair by name, sorted and in canonical order within the pair, so two dumps diff
+    /// by text.
+    fn dump<'a>(
+        c: &Census,
+        pairs: impl Iterator<Item = (SystemKey, SystemKey, &'a [ComponentId])>,
+    ) {
+        let mut rows: Vec<String> = pairs
+            .map(|(a, b, what)| {
+                let (x, y) = if c.name(a) <= c.name(b) {
+                    (a, b)
+                } else {
+                    (b, a)
+                };
+                format!(
+                    "  {}  <->  {}\n      on {}",
+                    c.name(x),
+                    c.name(y),
+                    what.iter()
+                        .map(|id| c.component(*id))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })
+            .collect();
+        rows.sort();
+        for r in rows {
+            eprintln!("{r}");
+        }
     }
 
     /// The ratchet. Ids, not names, so it runs in the player build too; prints the class
@@ -1027,30 +1084,19 @@ pub(crate) mod schedule_tests {
             actionable.len(),
         );
         if std::env::var_os("WOW_AMBIGUITY_DUMP").is_some() {
-            let mut rows: Vec<String> = actionable
-                .iter()
-                .map(|(a, b, what)| {
-                    // Canonical order within the pair, so two dumps diff by text.
-                    let (x, y) = if update.name(*a) <= update.name(*b) {
-                        (*a, *b)
-                    } else {
-                        (*b, *a)
-                    };
-                    format!(
-                        "  {}  <->  {}\n      on {}",
-                        update.name(x),
-                        update.name(y),
-                        what.iter()
-                            .map(|id| update.component(*id))
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    )
-                })
-                .collect();
-            rows.sort();
-            for r in rows {
-                eprintln!("{r}");
-            }
+            dump(
+                &update,
+                actionable
+                    .iter()
+                    .map(|(a, b, what)| (*a, *b, what.as_slice())),
+            );
+            eprintln!("PostUpdate:");
+            dump(
+                &post,
+                post.conflicts
+                    .iter()
+                    .map(|(a, b, what)| (*a, *b, what.as_slice())),
+            );
         }
         ratchet(
             "Update (actionable)",

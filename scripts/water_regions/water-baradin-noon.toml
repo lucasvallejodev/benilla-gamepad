@@ -1,0 +1,110 @@
+# wg-baradin-noon and wg-baradin-burst: Baradin Bay in the Wetlands at noon, the far water's
+# horizon at y 490 under a mountain ridge, whose reflection fills the bay below it. Burst rows read
+# a 2 s static burst; the roughness rows read the ROUGHNESS view (its still and its 2 s static
+# burst), three columns from the bay's far shore to the bottom edge. Flake: patches of the bay at
+# x660-1300 y615-690 land in one of two states, so the water box starts below them.
+scene = "water-baradin-noon"
+[box]
+far_band = [0, 492, 1450, 520]
+far_water = [0, 492, 1450, 510]
+sky = [0, 300, 200, 380]
+ridge = [550, 150, 650, 250]
+ridge_sky = [300, 150, 450, 250]
+ridge_refl = [550, 730, 650, 830]
+ridge_sky_refl = [300, 730, 450, 830]
+deep = [0, 720, 1200, 900]
+wall = [0, 470, 1500, 560]
+water = [0, 700, 1200, 900]
+rough_a = [190, 470, 210, 900]
+rough_b = [790, 470, 810, 900]
+rough_c = [1090, 470, 1110, 900]
+sky_water_a = [0, 600, 380, 900]
+sky_water_b = [420, 700, 880, 900]
+sky_water_c = [900, 840, 1250, 900]
+[[row]]
+metric = "horizon_ratio"
+water = "far_water"
+sky = "sky"
+[[row]]
+metric = "ridge_contrast"
+object = "ridge"
+sky = "ridge_sky"
+object_refl = "ridge_refl"
+sky_refl = "ridge_sky_refl"
+[[row]]
+metric = "deep_luma"
+box = "deep"
+[[row]]
+metric = "deep_chroma"
+box = "deep"
+[[row]]
+metric = "deep_hue"
+box = "deep"
+[[row]]
+metric = "zero_band"
+box = "wall"
+[[row]]
+metric = "luma_sd"
+box = "water"
+[[row]]
+metric = "lum_vs_ref"
+box = "water"
+[[row]]
+metric = "far_band_std"
+box = "far_band"
+[[row]]
+metric = "frame_std"
+label = "far_frame_std"
+box = "far_band"
+[[row]]
+metric = "frame_std"
+label = "water_frame_std"
+box = "water"
+[[row]]
+metric = "shimmer"
+box = "water"
+[[row]]
+metric = "pop"
+box = "water"
+[[row]]
+metric = "luma_sd"
+label = "far_detail"
+box = "far_band"
+# The roughness rises toward the far shore, no step against the rise over half a code (phase1.md
+# P1-17: non-decreasing toward the horizon), with no step over 2% of the unresolved surface's
+# alpha (0.02 * 0.1037 / (0.1037 - 0.0548) of the view's 255 codes).
+[[row]]
+metric = "roughness_profile"
+label = "rough_a"
+box = "rough_a"
+max = 10.8
+rising = true
+require = { monotone = { min = 1.0 } }
+[[row]]
+metric = "roughness_profile"
+label = "rough_b"
+box = "rough_b"
+max = 10.8
+rising = true
+require = { monotone = { min = 1.0 } }
+[[row]]
+metric = "roughness_profile"
+label = "rough_c"
+box = "rough_c"
+max = 10.8
+rising = true
+require = { monotone = { min = 1.0 } }
+# Still water: the roughness is the footprint's alone, so a static burst holds it exactly.
+[[row]]
+metric = "view_std"
+label = "alpha_still"
+box = "far_band"
+view = "roughness"
+channel = 0
+max = 0.0
+# The sky floor against the mirror where both see open sky (R-C3): the floor-served still
+# (WOW_PROBE=0 WOW_NO_REFLECT=1) as ~floor, its FLOOR_OCC view as ~floor@floor_occ and the shipped
+# TIERS view, inside boxes where the mirror shows only the dome and its clouds.
+[[row]]
+metric = "tier_consistency"
+box = ["sky_water_a", "sky_water_b", "sky_water_c"]

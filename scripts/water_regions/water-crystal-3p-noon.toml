@@ -1,0 +1,52 @@
+# wg-crystal-3p-noon: Crystal Lake from a third-person camera, 11.5° down: murloc huts on the far
+# strip (waterline y 380-400), reeds and the near bank along the bottom. Burst rows read a 2 s
+# static burst.
+scene = "water-crystal-3p-noon"
+[box]
+hut = [1265, 265, 1305, 292]         # the right-hand hut's roof, on the island's far side
+grass = [1330, 265, 1370, 292]       # the grass right of it
+hut_refl = [1242, 518, 1282, 542]    # the roof's reflection, a light arc below the island
+grass_refl = [1292, 518, 1332, 542]  # the water right of it, the same rows
+water = [100, 480, 1500, 680]
+near_bank = [400, 700, 1600, 800]
+# P1-30's objective (R-E4): softer than the baseline's mirror, never washed out. The reflection
+# boxes sit ~22 px left of the roof's: the world's verticals converge 11.5° down. Over a 2 s
+# static burst the row moves with wave phase by sd 3% of its value (min to max about 12%).
+[[row]]
+metric = "refl_contrast"
+object = "hut"
+sky = "grass"
+object_refl = "hut_refl"
+sky_refl = "grass_refl"
+within = [0.6, 1.0]
+[[row]]
+metric = "luma_sd"
+box = "water"
+[[row]]
+metric = "lum_vs_ref"
+box = "water"
+[[row]]
+metric = "contact_cov"
+label = "collar_cov"
+box = "near_bank"
+[[row]]
+metric = "frame_std"
+label = "water_frame_std"
+box = "water"
+[[row]]
+metric = "shimmer"
+box = "water"
+# The bands (P1-27) against the albedo view with the bands off, ~unbanded@albedo: what they add
+# to the scene's own edges (R-E3).
+[[row]]
+metric = "band_step"
+box = "water"
+# P1-27 holds the deep hue within 10° of the albedo view, judged under P1-35's light (R-E3).
+[[row]]
+metric = "deep_hue"
+box = "water"
+# P1-32: no refracted read pulls the huts' legs, the reeds or the near bank into the water.
+# Views from Medium or High: Low does not refract, and the row reads n/a there.
+[[row]]
+metric = "refract_leak"
+box = [0, 0, 1600, 900]

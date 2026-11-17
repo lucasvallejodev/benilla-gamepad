@@ -441,6 +441,18 @@
             .. "Sounds keep running while they are silenced, so a long one may have finished by "
             .. "the time you return."
 
+        -- Improved Water. benilla's own row: the tooltip says plainly that unchecked is the
+        -- client's own water, so the row does not read as "on is fixed, off is broken".
+        BENILLA_TOOLTIP_WATER_STYLE =
+            "Off draws water the way the 1.12 client does.\n\n"
+            .. "Improved Water is benilla's own look: a rippling surface with a moving glint, a "
+            .. "sky sheen at glancing angles, reflections of the world around it, and foam along "
+            .. "the shoreline. It keeps each zone's own water colours and follows the time of day "
+            .. "like the reference does.\n\n"
+            .. "Lakes, rivers and the sea reflect as mirrors; falls, rapids and small pools reflect "
+            .. "a snapshot taken from the water itself. The mirrors draw the world a second time "
+            .. "near water and cost some frame rate."
+
         -- 1.12's WINDOWED_MODE text describes a checkbox and exclusive-mode gamma.
         BENILLA_TOOLTIP_DISPLAY_MODE =
             "Windowed (Fullscreen) fills the screen with a borderless window; Windowed runs in "
@@ -474,7 +486,7 @@
             Graphics = {
                 "RowUiScale", "RowFarclip", "RowWorldDetail", "RowSpellDetail", "RowBrightness",
                 "RowWeatherDensity",
-                "RowDisplayMode", "RowVerticalSync", "RowRenderScale",
+                "RowDisplayMode", "RowVerticalSync", "RowRenderScale", "RowWaterStyle",
             },
             -- Guild Names and Player Titles are children of Player Names
             -- (UIOptionsFrame.lua:703-709).
@@ -2018,6 +2030,21 @@
                                                     "BENILLA_TOOLTIP_RENDER_SCALE")
                                                 BenillaOptionsSliderRow_Setup(this, 0.5, 2.0, 0.05)
                                                 this.deferred = 1
+                                            </OnLoad></Scripts>
+                                        </Frame>
+                                        <Frame name="$parentRowWaterStyle" inherits="BenillaOptionsCheckboxRowTemplate">
+                                            <Anchors>
+                                                <Anchor point="TOPLEFT" relativeTo="$parentRowRenderScale" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                                                <Anchor point="TOPRIGHT" relativeTo="$parentRowRenderScale" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                                            </Anchors>
+                                            <Scripts><OnLoad>
+                                                -- Improved Water: benilla's own row, with no 1.12
+                                                -- counterpart. Unchecked (the CVar's "0") is the
+                                                -- reference water and the default. Not deferred:
+                                                -- the look is one uniform lane on the shared
+                                                -- materials, so it lands on the click.
+                                                BenillaOptionsRow_OnLoad(this, "waterStyle", "Improved Water",
+                                                    "BENILLA_TOOLTIP_WATER_STYLE")
                                             </OnLoad></Scripts>
                                         </Frame>
                                     </Frames>

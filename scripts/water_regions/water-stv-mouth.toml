@@ -1,0 +1,20 @@
+# wg-stv-mouth: Stranglethorn's river where it meets the coast, across a grassy bank; the water in
+# the lower left (x 0-450, y 490-650) between sandbars.
+scene = "water-stv-mouth"
+[box]
+water = [0, 500, 400, 640]
+# P1-27 holds the deep hue within 10° of the albedo view, judged under P1-35's light (R-E3).
+[[row]]
+metric = "deep_hue"
+box = "water"
+[[row]]
+metric = "luma_sd"
+box = "water"
+[[row]]
+metric = "lum_vs_ref"
+box = "water"
+# The bands (P1-27) against the albedo view with the bands off, ~unbanded@albedo: what they add
+# to the scene's own edges (R-E3).
+[[row]]
+metric = "band_step"
+box = "water"

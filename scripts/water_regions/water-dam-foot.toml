@@ -1,0 +1,19 @@
+# wg-dam-foot: the pool at the Stonewrought Dam's foot, 6° up at the dam and its falls; the pool's
+# far waterline at y 600, the falls' plunge at x 780-930. Under the far waterline floor-served water
+# gives way to the probe's; tier_seam traces that boundary from the TIERS view (needs
+# water-dam-foot@tiers.png and water-dam-foot~noliquid.png), and leaves out where it runs along the
+# dam's submerged base, the world's own edge.
+scene = "water-dam-foot"
+[box]
+pool = [300, 610, 1100, 880]
+[[row]]
+metric = "halo_count"
+box = "pool"
+[[row]]
+metric = "luma_sd"
+box = "pool"
+[[row]]
+metric = "lum_vs_ref"
+box = "pool"
+[[row]]
+metric = "tier_seam"

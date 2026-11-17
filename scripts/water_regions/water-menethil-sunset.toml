@@ -1,0 +1,33 @@
+# wg-menethil-sunset-45: Menethil Bay at 19:40 facing the sun's 45° bearing, a ship behind the
+# pier (the pier's waterline y 502: its deck at y 464-479 reflects at 525-540), the glint path
+# below the sun. The deck stands nearer than the ship, so its reflection covers the ship's
+# reflected hull: the contrast row reads the deck, left of the ship, clear of the glint and posts.
+scene = "water-menethil-sunset"
+[box]
+deck = [410, 464, 450, 479]          # the pier's deck against the sky
+sky = [410, 436, 450, 451]           # the dusk sky just above it
+deck_refl = [410, 525, 450, 540]     # both mirrored about the pier's waterline
+sky_refl = [410, 553, 450, 568]
+glint = [450, 500, 1100, 850]
+water = [0, 750, 400, 900]
+# P1-30's objective (R-E4): softer than the baseline's mirror, never washed out.
+[[row]]
+metric = "refl_contrast"
+object = "deck"
+sky = "sky"
+object_refl = "deck_refl"
+sky_refl = "sky_refl"
+within = [0.6, 1.0]
+[[row]]
+metric = "glint_peak"
+box = "glint"
+[[row]]
+metric = "glint_width"
+box = "glint"
+[[row]]
+metric = "deep_hue"
+label = "sunset_hue"
+box = "water"
+[[row]]
+metric = "lum_vs_ref"
+box = "water"

@@ -12,8 +12,10 @@ use bevy::pbr::{
 };
 use bevy::prelude::*;
 use bevy::render::render_resource::{
-    AsBindGroup, BlendComponent, BlendFactor, BlendOperation, BlendState, Buffer, ColorWrites,
-    CompareFunction, RenderPipelineDescriptor, SpecializedMeshPipelineError,
+    AsBindGroup, BindGroupLayoutEntry, BindingType, BlendComponent, BlendFactor, BlendOperation,
+    BlendState, Buffer, BufferBindingType, ColorWrites, CompareFunction, DownlevelFlags,
+    RenderPipelineDescriptor, ShaderStages, SpecializedMeshPipelineError, StorageTextureAccess,
+    WgpuLimits,
 };
 use bevy::shader::ShaderRef;
 
@@ -140,6 +142,12 @@ pub struct WowModelExt {
 }
 
 impl MaterialExtension for WowModelExt {
+    /// Out of the depth prepass: `specialize` rebuilds the vertex layout around attributes Bevy's
+    /// prepass shader does not declare.
+    fn enable_prepass() -> bool {
+        false
+    }
+
     /// Bevy's mesh vertex plus the point-light term, per vertex like the reference's FFP.
     fn vertex_shader() -> ShaderRef {
         "embedded://benilla_assets/shaders/wow_model.wgsl".into()
@@ -342,6 +350,23 @@ pub struct WdlExt {
 }
 
 impl MaterialExtension for WdlExt {
+    /// **Out of the depth prepass**, for the reason the model lane is out of it: a pass that cannot
+    /// reproduce this material's discards writes depth for fragments the main pass throws away.
+    ///
+    /// The WDL hull is the coarse horizon, and its fragment stage cuts everything NEARER than
+    /// `farclip − 33` so the fine terrain owns the near field. Bevy's stock prepass has no such cut,
+    /// so an armed prepass wrote the whole hull's depth — including the near part that never draws.
+    /// The coarse surface sits above the fine one wherever the ground is flat, which is exactly the
+    /// river valleys and lake beds, so the detailed terrain there failed `GreaterEqual` against a
+    /// horizon that was not drawn either, and the sky came through the hole. That is the
+    /// "terrain vanishes wherever a river or lake runs over it" this whole prepass has been off for.
+    ///
+    /// Opting out costs the water nothing: it measures its column against the real terrain, and the
+    /// coarse hull only exists past the far-clip wall where there is no water to measure.
+    fn enable_prepass() -> bool {
+        false
+    }
+
     fn vertex_shader() -> ShaderRef {
         "embedded://benilla_assets/shaders/wdl.wgsl".into()
     }
@@ -354,14 +379,336 @@ impl MaterialExtension for WdlExt {
 /// `ocean0_s.bls` combine), WMO exterior and interior water, and magma and slime.
 pub type LiquidMaterial = ExtendedMaterial<StandardMaterial, LiquidExt>;
 
+/// The liquid pipeline key: what a material's own lanes say its pipeline must compile, read from the
+/// lanes the shader branches on, so the key and the branch never disagree. Zero on the reference
+/// lane; magma and slime are [`Self::FULLBRIGHT`] on both lanes.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Default, Debug)]
+pub struct LiquidKey(u16);
+
+impl LiquidKey {
+    /// `path.y > 0.5`: the stylised lane.
+    pub const STYLISED: u16 = 1 << 0;
+    /// `kind.x > 0.5`: magma and slime, whose sheet is the body.
+    pub const FULLBRIGHT: u16 = 1 << 1;
+    /// `WATER_VIEW`, the debug views: `path.w` bit 0.
+    pub const VIEW: u16 = 1 << 2;
+    /// The quality tier's two bits (`path.w` bits 1-2): 0 Low, 1 Medium, 2 High, each pushing
+    /// its own `WATER_TIER_*` def ([`Self::TIER_DEFS`]).
+    pub const TIER_SHIFT: u16 = 3;
+    /// The highlight excess stored for the glow (`path.w` bit 5): a pipeline of its own, for which
+    /// [`Self::frag_defs`] pushes `WATER_GLOW_STORE` while the preview's `glow` runs.
+    pub const GLOW: u16 = 1 << 7;
+    /// Per-channel transmittance through dual-source blending (`path.w` bit 6): a pipeline of its
+    /// own, for which [`Self::frag_defs`] pushes no def.
+    pub const DUAL_SOURCE: u16 = 1 << 8;
+    /// The authored sheet as painted detail (`path.w` bit 7): a pipeline of its own, for which
+    /// [`Self::frag_defs`] pushes no def.
+    pub const PAINTED: u16 = 1 << 9;
+    /// `path.w` holds the key's cap bits shifted down by this.
+    pub const CAPS_SHIFT: u16 = 2;
+    /// The def each tier compiles under, by [`Self::tier`].
+    pub const TIER_DEFS: [&'static str; 3] =
+        ["WATER_TIER_LOW", "WATER_TIER_MEDIUM", "WATER_TIER_HIGH"];
+    /// The key bits `path.w` may set: bits 2..=9 but the spare bits 5 and 6 (`path.w` bits 3 and 4;
+    /// bit 3 was the screen-space march's, deleted by the owner's ruling: no screen-space
+    /// reflection at all).
+    pub const CAPS_MASK: u16 = 0x39C;
+
+    /// The key of a material with these `kind` and `path` lanes. Magma and slime return
+    /// [`Self::FULLBRIGHT`] before any other lane is read, so both lanes share their pipeline.
+    pub fn from_lanes(kind: Vec4, path: Vec4) -> Self {
+        if kind.x > 0.5 {
+            return Self(Self::FULLBRIGHT);
+        }
+        if path.y <= 0.5 {
+            return Self(0);
+        }
+        let caps = (path.w.max(0.0) as u32 as u16) << Self::CAPS_SHIFT;
+        Self(Self::STYLISED | (caps & Self::CAPS_MASK))
+    }
+
+    /// Stylised water, not magma or slime: the only pipelines an Improved Water def reaches.
+    pub fn composite(self) -> bool {
+        self.0 & (Self::STYLISED | Self::FULLBRIGHT) == Self::STYLISED
+    }
+
+    /// Whether the key carries `bit`.
+    pub fn has(self, bit: u16) -> bool {
+        self.0 & bit != 0
+    }
+
+    /// The quality tier, 0 Low, 1 Medium, 2 High; tier bits reading 3 (a stale or hand-edited
+    /// `path.w`) are High, so the tier is always a valid index.
+    pub fn tier(self) -> u8 {
+        (((self.0 >> Self::TIER_SHIFT) & 3) as u8).min(2)
+    }
+
+    /// The `path.y` and `path.w` lanes a stylised or reference material carries for this key, so
+    /// [`Self::from_lanes`] reads it back. Magma and slime take their key from `kind.x` alone.
+    pub fn path_lanes(self) -> (f32, f32) {
+        let caps = (self.0 & Self::CAPS_MASK) >> Self::CAPS_SHIFT;
+        (f32::from(self.has(Self::STYLISED)), f32::from(caps))
+    }
+
+    /// The keys a player reaches without a debug switch: the reference lane, magma and slime, and
+    /// stylised water at each tier, carrying [`Self::GLOW`] from Medium up when `glow`,
+    /// [`Self::DUAL_SOURCE`] when `dual` and [`Self::PAINTED`] when `painted`. The pipeline warm
+    /// pass compiles these; [`Self::VIEW`] is a debug variant, compiled on first use.
+    pub fn shipped(glow: bool, dual: bool, painted: bool) -> impl Iterator<Item = LiquidKey> {
+        let stylised = (0..3u16).map(move |tier| {
+            let mut k = Self::STYLISED | tier << Self::TIER_SHIFT;
+            if glow && tier >= 1 {
+                k |= Self::GLOW;
+            }
+            if dual {
+                k |= Self::DUAL_SOURCE;
+            }
+            if painted {
+                k |= Self::PAINTED;
+            }
+            LiquidKey(k)
+        });
+        [LiquidKey(0), LiquidKey(Self::FULLBRIGHT)]
+            .into_iter()
+            .chain(stylised)
+    }
+
+    /// The fragment-stage defs [`LiquidExt::specialize`] pushes for this key: on stylised water,
+    /// the stylised region, the complete depth and the tier, the bed's refraction from Medium up,
+    /// and each variant the key carries.
+    pub fn frag_defs(self) -> Vec<&'static str> {
+        let mut defs = Vec::new();
+        if !self.composite() {
+            return defs;
+        }
+        defs.extend([
+            "WATER_STYLISED",
+            "WATER_SCENE_DEPTH",
+            Self::TIER_DEFS[usize::from(self.tier())],
+        ]);
+        if self.tier() >= 1 {
+            defs.push("WATER_REFRACT");
+        }
+        if self.has(Self::VIEW) {
+            defs.push("WATER_VIEW");
+        }
+        // The Improved Water preview (`crate::preview`), on every stylised pipeline while any of
+        // its features runs; the features branch on the reflection block's mask row.
+        if crate::preview::any() {
+            defs.push("WATER_PREVIEW");
+            // Its glow store, on the glow variant alone.
+            if self.has(Self::GLOW) && crate::preview::on(crate::preview::GLOW) {
+                defs.push("WATER_GLOW_STORE");
+            }
+        }
+        defs
+    }
+
+    /// Whether the pipeline blends premultiplied (`One, OneMinusSrcAlpha`): stylised water's linear
+    /// composite hands the blender `C − β·snapshot` with `1 − β` in alpha, so `dst' = src + β·dst`.
+    pub fn premultiplied(self) -> bool {
+        self.composite()
+    }
+}
+
+impl From<&LiquidExt> for LiquidKey {
+    fn from(e: &LiquidExt) -> Self {
+        Self::from_lanes(e.kind, e.path)
+    }
+}
+
+/// The bindings one shader stage of a pipeline sees, by the kinds `wgpu::Limits` caps per stage.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StageCount {
+    pub sampled_textures: u32,
+    pub samplers: u32,
+    pub storage_buffers: u32,
+    pub storage_textures: u32,
+    pub uniform_buffers: u32,
+    /// Of the storage buffers and textures, those the stage may write.
+    pub writable_storage: u32,
+}
+
+impl StageCount {
+    /// Count the entries visible to `stage`, over every bind group of a pipeline; a binding array
+    /// counts each of its elements.
+    pub fn of<'a>(
+        stage: ShaderStages,
+        entries: impl IntoIterator<Item = &'a BindGroupLayoutEntry>,
+    ) -> Self {
+        let mut c = Self::default();
+        for e in entries {
+            if !e.visibility.contains(stage) {
+                continue;
+            }
+            let n = e.count.map_or(1, |n| n.get());
+            match e.ty {
+                BindingType::Texture { .. } => c.sampled_textures += n,
+                BindingType::Sampler(_) => c.samplers += n,
+                BindingType::StorageTexture { access, .. } => {
+                    c.storage_textures += n;
+                    if access != StorageTextureAccess::ReadOnly {
+                        c.writable_storage += n;
+                    }
+                }
+                BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only },
+                    ..
+                } => {
+                    c.storage_buffers += n;
+                    if !read_only {
+                        c.writable_storage += n;
+                    }
+                }
+                BindingType::Buffer {
+                    ty: BufferBindingType::Uniform,
+                    ..
+                } => c.uniform_buffers += n,
+                _ => {}
+            }
+        }
+        c
+    }
+
+    /// One line per limit this count exceeds on a device with `limits` and `downlevel`; empty
+    /// when the stage fits. A fragment stage that writes storage also needs
+    /// `FRAGMENT_WRITABLE_STORAGE`.
+    pub fn overruns(
+        &self,
+        stage: ShaderStages,
+        limits: &WgpuLimits,
+        downlevel: DownlevelFlags,
+    ) -> Vec<String> {
+        let rows = [
+            (
+                "max_sampled_textures_per_shader_stage",
+                self.sampled_textures,
+                limits.max_sampled_textures_per_shader_stage,
+            ),
+            (
+                "max_samplers_per_shader_stage",
+                self.samplers,
+                limits.max_samplers_per_shader_stage,
+            ),
+            (
+                "max_storage_buffers_per_shader_stage",
+                self.storage_buffers,
+                limits.max_storage_buffers_per_shader_stage,
+            ),
+            (
+                "max_storage_textures_per_shader_stage",
+                self.storage_textures,
+                limits.max_storage_textures_per_shader_stage,
+            ),
+            (
+                "max_uniform_buffers_per_shader_stage",
+                self.uniform_buffers,
+                limits.max_uniform_buffers_per_shader_stage,
+            ),
+        ];
+        let mut out: Vec<String> = rows
+            .into_iter()
+            .filter(|&(_, count, limit)| count > limit)
+            .map(|(name, count, limit)| format!("{count} against {name} {limit}"))
+            .collect();
+        if stage.contains(ShaderStages::FRAGMENT)
+            && self.writable_storage > 0
+            && !downlevel.contains(DownlevelFlags::FRAGMENT_WRITABLE_STORAGE)
+        {
+            out.push(format!(
+                "{} writable storage bindings without FRAGMENT_WRITABLE_STORAGE",
+                self.writable_storage
+            ));
+        }
+        out
+    }
+}
+
 /// Liquid inputs: the animated frames and the per-material lanes; all light comes off the shared
 /// global light. The `Vec4` uniforms pack into binding 102, in the WGSL struct's field order.
 #[derive(Asset, AsBindGroup, Clone, TypePath)]
+#[bind_group_data(LiquidKey)]
 pub struct LiquidExt {
     /// The kind's animated frames (`lake_a`, `fast_a`, `ocean_h`): RGB near-black, alpha ripple.
     #[texture(100, dimension = "2d_array", visibility(fragment))]
     #[sampler(101, visibility(fragment))]
     pub frames: Handle<Image>,
+    /// The stylised look's generated ripple map (`benilla_world::liquid::ripple`): R/G a tiling
+    /// slope field, B its height. The vertex stage reads its height for the surface height.
+    #[texture(103, visibility(vertex, fragment))]
+    #[sampler(104, visibility(vertex, fragment))]
+    pub ripples: Handle<Image>,
+    /// The first planar mirror's capture (`benilla_world::liquid::reflect`), alpha as coverage.
+    #[texture(105, visibility(fragment))]
+    #[sampler(106, visibility(fragment))]
+    pub reflection: Handle<Image>,
+    /// The second planar mirror's capture, for a second water height in view; read through the
+    /// first one's sampler.
+    #[texture(110, visibility(fragment))]
+    pub reflection2: Handle<Image>,
+    /// The stylised look's live wave field (`benilla_world::liquid::ripple_sim`): R/G slope, B its
+    /// height, A foam; the vertex stage reads the height for the surface height.
+    #[texture(108, visibility(vertex, fragment))]
+    #[sampler(109, visibility(vertex, fragment))]
+    pub wake: Handle<Image>,
+    /// The opaque scene before transparents, in 10 bits (`benilla_water::scene_color`): the colour
+    /// behind the water, the refracted bed, the floor march's occluder and the reflection's hit.
+    #[texture(111, visibility(fragment))]
+    #[sampler(112, visibility(fragment))]
+    pub scene_color: Handle<Image>,
+    /// The cubemap reflection probes (`benilla_world::liquid::probe`), one cube per array slice.
+    #[texture(113, dimension = "cube_array", visibility(fragment))]
+    #[sampler(114, visibility(fragment))]
+    pub probe: Handle<Image>,
+    /// The march's nearest-depth pyramid (`benilla_world::liquid::hiz`), read by `textureLoad`.
+    #[texture(115, sample_type = "float", filterable = false, visibility(fragment))]
+    pub hiz: Handle<Image>,
+    /// The farthest-depth twin of [`Self::hiz`], which lets the march pass behind a tile.
+    #[texture(117, sample_type = "float", filterable = false, visibility(fragment))]
+    pub hiz_far: Handle<Image>,
+    /// The opaque world's linear depth behind each pixel (`benilla_water`'s `hiz`), view Z in yards,
+    /// 0 where nothing was drawn: what the stylised lane measures its water column against. Written
+    /// inside the water's screen rectangle alone; a texel outside it holds what an earlier frame
+    /// wrote there, or 0 where none has since the image was made (at boot or a resize). Read by
+    /// `textureLoad`, and only under `WATER_SCENE_DEPTH`.
+    #[texture(116, sample_type = "float", filterable = false, visibility(fragment))]
+    pub scene_depth: Handle<Image>,
+    /// The sky floor's occlusion over the mirror planes (`benilla_water`'s `water_compute`), a
+    /// quarter of the view's resolution: the open sky, the body's sky and sun visibility, and
+    /// whether the march reached a verdict. Read bilinearly through [`Self::scene_color`]'s sampler.
+    #[texture(120, visibility(fragment))]
+    pub water_occl: Handle<Image>,
+    /// The sky floor (`benilla_water`'s `sky_lut`): the dome and its clouds, linear and unlit, a
+    /// 64² cube whose mips are blurred for rougher water. Read through [`Self::scene_color`]'s
+    /// sampler.
+    #[texture(119, dimension = "cube", visibility(fragment))]
+    pub sky_lut: Handle<Image>,
+    /// The occluder's radiance times the shut share of the sky, linear, and `rho_c` in alpha; the
+    /// size of [`Self::water_occl`].
+    #[texture(121, visibility(fragment))]
+    pub floor_occ: Handle<Image>,
+    /// The lighting sun's terrain shadow around the camera (`benilla_water`'s `mcsh`): the ADT
+    /// chunks' MCSH bytes in a 2048² `R8Unorm` torus, 1 shadowed. Read through
+    /// [`Self::ripples`]' repeating sampler.
+    #[texture(122, visibility(fragment))]
+    pub shadow: Handle<Image>,
+    /// The first planar mirror's roughness chain (`benilla_water`'s mirror chain): the capture at
+    /// half its size through five levels, premultiplied by coverage, for the preview's rough
+    /// reflections. Read through [`Self::reflection`]'s sampler; a 1x1 placeholder reads as none.
+    #[texture(123, visibility(fragment))]
+    pub reflection_chain: Handle<Image>,
+    /// The second planar mirror's chain, as [`Self::reflection_chain`].
+    #[texture(124, visibility(fragment))]
+    pub reflection_chain2: Handle<Image>,
+    /// The reflection's per-frame parameters (`benilla_world::liquid::reflect`), a buffer so the
+    /// per-frame write does not rebuild every liquid material's bind group. The vertex stage reads
+    /// the preview's rows for the surface height.
+    #[storage(107, read_only, buffer, visibility(vertex, fragment))]
+    pub reflect_buf: Buffer,
+    /// The preview glow's accumulator (`WATER_GLOW_STORE`): the water's highlight excess per
+    /// quarter-resolution texel, 16.16 fixed point, which FFXGlow's water downsample reads.
+    #[storage(118, buffer, visibility(fragment))]
+    pub glow_acc: Buffer,
     /// Which lanes of the shared light this surface reads:
     /// - `x` = fullbright (magma, slime): the sheet is the opaque body.
     /// - `y` = ocean: rows 15/16 (`Light.dbc` IntBand 14/15), else rows 13/14 (IntBand 16/17).
@@ -373,9 +720,14 @@ pub struct LiquidExt {
     pub kind: Vec4,
     /// `x` = the renderer (`liquid::surface::LiquidPath`): `0` ADT MCLQ, `1` WMO exterior, `2` WMO
     /// interior.
+    /// `y` = the stylised look (`benilla_world::liquid::WaterStyle`), rewritten on toggle. `z` =
+    /// magma rather than slime, read by the stylised lane only. `w` = the stylised pipeline's
+    /// variant bits (`benilla_world::liquid::WaterPipelineCaps::bits`, [`LiquidKey`]), 0 on the
+    /// reference lane.
     #[uniform(102)]
     pub path: Vec4,
-    /// `y` = frame count, `z` = scroll flag, `w` = clock enable.
+    /// `x` = the frame sheet's mean alpha (the stylised lane only: the reference combine's
+    /// `0.25·detail.a` lift), `y` = frame count, `z` = scroll flag, `w` = clock enable.
     #[uniform(102)]
     pub anim: Vec4,
     /// The shared global light, read in both stages (the vertex stage evaluates the sun sheen).
@@ -383,26 +735,154 @@ pub struct LiquidExt {
     pub light_buf: Buffer,
 }
 
+/// A liquid vertex's **offset to the nearest point on the waterline**, in world XZ yards
+/// (`benilla_world::liquid::surface`).
+///
+/// It replaces carrying the shore DISTANCE and interpolating that, and the difference is the whole
+/// point. Distance to a curve is not a linear function — it has a V-shaped crease along the curve
+/// itself — so interpolating it across a triangle cuts that crease's corner, and where the crease
+/// falls inside a triangle the reconstructed zero lands in the wrong place by up to half a vertex
+/// spacing. With a foam band a fifth of a yard wide drawn from vertices half a yard apart, that is
+/// most of a band, and it is why the line jogged, thinned and doubled as the camera moved along it.
+///
+/// The offset has no crease: `nearest − position` is smooth wherever the nearest point is, and both
+/// terms interpolate linearly, so the interpolated offset is exactly the offset of the interpolated
+/// point. Taking its LENGTH in the fragment shader puts the non-linearity where it belongs, after
+/// interpolation, and the band comes out the same width everywhere at any mesh density.
+///
+/// Own attribute id and shader location 10, for the same reason the rig's attributes have theirs —
+/// Bevy's builtin set ends at 7 and a mesh must not accidentally look like one of its lanes.
+pub const ATTRIBUTE_WOW_SHORE_OFFSET: bevy::mesh::MeshVertexAttribute =
+    bevy::mesh::MeshVertexAttribute::new(
+        "Wow_ShoreOffset",
+        988_540_921,
+        bevy::render::render_resource::VertexFormat::Float32x2,
+    );
+
+/// The water surface's **smooth normal**, mesh-local: each lattice corner's normal from its
+/// neighbours' heights, blended bilinearly to the vertex — so the reflection direction bends
+/// smoothly across a sloping stream instead of stepping at every triangle edge. Read by the
+/// stylised lane only; `ATTRIBUTE_NORMAL` stays flat for the reference lane's lighting.
+///
+/// Own attribute id and shader location 11, beside [`ATTRIBUTE_WOW_SHORE_OFFSET`].
+pub const ATTRIBUTE_WOW_SURFACE_NORMAL: bevy::mesh::MeshVertexAttribute =
+    bevy::mesh::MeshVertexAttribute::new(
+        "Wow_SurfaceNormal",
+        988_540_922,
+        bevy::render::render_resource::VertexFormat::Float32x3,
+    );
+
+/// Per vertex, the water's two reflection tiers (`benilla_formats::PlanarMap`): `x` how far the
+/// planar mirrors serve it, 0 on probe water ramping to 1 over a few cells; `y`, `z` the two probe
+/// spots it reads, lower id first (65535: none); `w` the second spot's share at the vertex
+/// (`WaterClasses::mix_at`), so it runs on smoothly across the cells reading one pair. The spot ids
+/// are constant across a cell, so interpolation leaves them whole. Read by the stylised lane only;
+/// `(1, 65535, 65535, 0)` on a mesh without it.
+///
+/// Own attribute id and shader location 12, beside [`ATTRIBUTE_WOW_SURFACE_NORMAL`].
+pub const ATTRIBUTE_WOW_PLANAR: bevy::mesh::MeshVertexAttribute =
+    bevy::mesh::MeshVertexAttribute::new(
+        "Wow_Planar",
+        988_540_923,
+        bevy::render::render_resource::VertexFormat::Float32x4,
+    );
+
+/// Per vertex, the water's **current**, mesh-local XZ yards a second: downstream, zero on still
+/// water (`benilla_formats::WaterClasses::flow`). The stylised lane carries its ripple along it; zero
+/// on a mesh without it.
+///
+/// Own attribute id and shader location 13, beside [`ATTRIBUTE_WOW_PLANAR`].
+pub const ATTRIBUTE_WOW_FLOW: bevy::mesh::MeshVertexAttribute =
+    bevy::mesh::MeshVertexAttribute::new(
+        "Wow_Flow",
+        988_540_924,
+        bevy::render::render_resource::VertexFormat::Float32x2,
+    );
+
 impl MaterialExtension for LiquidExt {
     fn vertex_shader() -> ShaderRef {
-        "embedded://benilla_assets/shaders/liquid.wgsl".into()
+        ShaderRef::Path(crate::dev_shaders::shader_path(
+            "embedded://benilla_assets/shaders/liquid.wgsl",
+        ))
     }
     fn fragment_shader() -> ShaderRef {
-        "embedded://benilla_assets/shaders/liquid.wgsl".into()
+        ShaderRef::Path(crate::dev_shaders::shader_path(
+            "embedded://benilla_assets/shaders/liquid.wgsl",
+        ))
     }
 
+    /// Admits [`ATTRIBUTE_WOW_SHORE_OFFSET`], [`ATTRIBUTE_WOW_SURFACE_NORMAL`],
+    /// [`ATTRIBUTE_WOW_PLANAR`] and [`ATTRIBUTE_WOW_FLOW`] into the vertex layout, each behind its
+    /// shader def, since Bevy builds the layout from its own attributes only.
+    ///
     /// `sky_order::WATER_BIAS` (−2e4) is a sort rung, kept out of the rasterizer: as a depth-bias
     /// constant it would move the waterline, by an amount that doubles at every float exponent
     /// boundary, so neighbouring triangles' shorelines would disagree.
+    ///
+    /// The [`LiquidKey`] defs go to the fragment stage before the attribute check returns, so a
+    /// mesh without our attributes takes them all the same, and so does stylised water's
+    /// premultiplied blend ([`LiquidKey::premultiplied`]); sort, phase and depth state stay
+    /// `AlphaMode::Blend`'s.
     fn specialize(
         _pipeline: &MaterialExtensionPipeline,
         descriptor: &mut RenderPipelineDescriptor,
-        _layout: &MeshVertexBufferLayoutRef,
-        _key: MaterialExtensionKey<Self>,
+        layout: &MeshVertexBufferLayoutRef,
+        key: MaterialExtensionKey<Self>,
     ) -> Result<(), SpecializedMeshPipelineError> {
+        // Clear the depth bias that StandardMaterial would have added
         if let Some(ds) = descriptor.depth_stencil.as_mut() {
             ds.bias.constant = 0;
         }
+        // The vertex stage takes the lane's defs too: the Improved Water's surface height
+        // (`pv_surface_height`) displaces the vertex under `WATER_PREVIEW`.
+        descriptor
+            .vertex
+            .shader_defs
+            .extend(key.bind_group_data.frag_defs().into_iter().map(Into::into));
+        if let Some(f) = descriptor.fragment.as_mut() {
+            f.shader_defs
+                .extend(key.bind_group_data.frag_defs().into_iter().map(Into::into));
+            if key.bind_group_data.premultiplied() {
+                for target in f.targets.iter_mut().flatten() {
+                    target.blend = Some(BlendState::PREMULTIPLIED_ALPHA_BLENDING);
+                }
+            }
+        }
+
+        // Our own attributes, where the mesh carries them, each behind its shader def.
+        let ours = [
+            (ATTRIBUTE_WOW_SHORE_OFFSET, 10, "LIQUID_SHORE_OFFSET"),
+            (ATTRIBUTE_WOW_SURFACE_NORMAL, 11, "LIQUID_SURFACE_NORMAL"),
+            (ATTRIBUTE_WOW_PLANAR, 12, "LIQUID_PLANAR"),
+            (ATTRIBUTE_WOW_FLOW, 13, "LIQUID_FLOW"),
+        ];
+        if !ours.iter().any(|(a, _, _)| layout.0.contains(*a)) {
+            return Ok(());
+        }
+        let mut attrs = Vec::with_capacity(8);
+        for (attr, loc) in [
+            (Mesh::ATTRIBUTE_POSITION, 0),
+            (Mesh::ATTRIBUTE_NORMAL, 1),
+            (Mesh::ATTRIBUTE_UV_0, 2),
+            (Mesh::ATTRIBUTE_UV_1, 3),
+            (Mesh::ATTRIBUTE_TANGENT, 4),
+            (Mesh::ATTRIBUTE_COLOR, 5),
+        ] {
+            if layout.0.contains(attr) {
+                attrs.push(attr.at_shader_location(loc));
+            }
+        }
+        for (attr, loc, def) in ours {
+            if !layout.0.contains(attr) {
+                continue;
+            }
+            attrs.push(attr.at_shader_location(loc));
+            descriptor.vertex.shader_defs.push(def.into());
+            if let Some(f) = descriptor.fragment.as_mut() {
+                f.shader_defs.push(def.into());
+            }
+        }
+        descriptor.vertex.buffers = vec![layout.0.get_layout(&attrs)?];
         Ok(())
     }
 }
@@ -1338,5 +1818,500 @@ mod tests {
         );
         // The tail and the shortfall are deep-end only.
         assert_eq!(at(0), shallow, "row 0 is the shallow endpoint verbatim");
+    }
+
+    /// The liquid key reads the lanes the shader branches on: magma and slime are fullbright
+    /// whatever their other lanes say, the reference lane is zero, and a stylised material
+    /// carries its `path.w` bits.
+    #[test]
+    fn the_liquid_key_follows_the_lanes() {
+        use super::LiquidKey;
+        use bevy::math::Vec4;
+        let key = |fullbright: f32, stylised: f32, caps: f32| {
+            LiquidKey::from_lanes(
+                Vec4::new(fullbright, 0.0, 0.0, 6.0),
+                Vec4::new(0.0, stylised, 0.0, caps),
+            )
+        };
+        assert_eq!(
+            key(0.0, 0.0, 0.0),
+            LiquidKey::default(),
+            "the reference lane"
+        );
+        assert_eq!(
+            key(0.0, 0.0, 1.0),
+            LiquidKey::default(),
+            "no variant off the stylised lane"
+        );
+        for caps in [0.0, 1.0, 255.0] {
+            for stylised in [0.0, 1.0] {
+                let k = key(1.0, stylised, caps);
+                assert!(k.has(LiquidKey::FULLBRIGHT) && !k.has(LiquidKey::STYLISED));
+                assert!(!k.has(LiquidKey::VIEW) && !k.composite());
+                assert!(
+                    k.frag_defs().is_empty(),
+                    "magma and slime take no Improved Water def, or a def's code drops their draw"
+                );
+            }
+        }
+        let plain = key(0.0, 1.0, 0.0);
+        assert!(plain.composite() && !plain.has(LiquidKey::VIEW));
+        // The preview (`crate::preview`, on unless `WOW_PREVIEW=0`) rides every stylised pipeline.
+        let mut want = vec!["WATER_STYLISED", "WATER_SCENE_DEPTH", "WATER_TIER_LOW"];
+        if crate::preview::any() {
+            want.push("WATER_PREVIEW");
+        }
+        assert_eq!(plain.frag_defs(), want);
+        assert!(
+            key(0.0, 0.0, 0.0).frag_defs().is_empty(),
+            "the reference lane takes no def"
+        );
+        let view = key(0.0, 1.0, 1.0);
+        assert!(view.composite() && view.has(LiquidKey::VIEW));
+        assert!(view.frag_defs().contains(&"WATER_VIEW"));
+        // The spare bit the screen-space march held (`path.w` bit 3) reads as none.
+        assert_eq!(key(0.0, 1.0, 8.0), plain);
+        // Stylised water blends premultiplied with every variant; nothing else does.
+        assert!(plain.premultiplied() && view.premultiplied());
+        assert!(
+            !key(1.0, 1.0, 0.0).premultiplied() && !key(0.0, 0.0, 0.0).premultiplied(),
+            "magma, slime and the reference lane keep the alpha blend"
+        );
+        // A negative lane reads as no bits, and the spare bit as none.
+        assert_eq!(key(0.0, 1.0, -3.0), plain);
+        assert_eq!(key(0.0, 1.0, 16.0), plain);
+        // The tier's two bits, each tier its one def; a stale 3 reads as High.
+        for (bits, tier) in [(0.0, 0), (2.0, 1), (4.0, 2), (6.0, 2)] {
+            let k = key(0.0, 1.0, bits);
+            assert_eq!(k.tier(), tier, "path.w {bits}");
+            let defs = k.frag_defs();
+            let tiers: Vec<&&str> = defs
+                .iter()
+                .filter(|d| d.starts_with("WATER_TIER_"))
+                .collect();
+            assert_eq!(
+                tiers,
+                [&LiquidKey::TIER_DEFS[usize::from(tier)]],
+                "path.w {bits}"
+            );
+            assert_eq!(
+                defs.contains(&"WATER_REFRACT"),
+                tier >= 1,
+                "the bed refracts from Medium up, path.w {bits}"
+            );
+            assert!(
+                key(1.0, 1.0, bits).frag_defs().is_empty()
+                    && key(0.0, 0.0, bits).frag_defs().is_empty(),
+                "magma, slime and the reference lane take no tier"
+            );
+        }
+    }
+
+    /// The warm set: five keys for every argument set (the reference lane, magma and slime,
+    /// stylised water at each tier), the glow bit from Medium up, the other two wherever asked,
+    /// no debug bit, and each one read back from the lanes [`LiquidKey::path_lanes`] writes.
+    #[test]
+    fn the_shipped_keys_are_every_lane_at_every_tier() {
+        use super::LiquidKey as K;
+        use bevy::math::Vec4;
+        let mut union = std::collections::HashSet::new();
+        for set in 0..8 {
+            let (glow, dual, painted) = (set & 1 != 0, set & 2 != 0, set & 4 != 0);
+            let keys: Vec<K> = K::shipped(glow, dual, painted).collect();
+            assert_eq!(keys.len(), 5, "{set:03b}");
+            assert_eq!(keys[0], K::default(), "the reference lane first");
+            assert!(keys[1].has(K::FULLBRIGHT) && !keys[1].composite());
+            for (tier, k) in (0u8..).zip(&keys[2..]) {
+                assert!(k.composite(), "{k:?}");
+                assert_eq!(k.tier(), tier);
+                assert_eq!(k.has(K::GLOW), glow && tier >= 1, "{k:?}");
+                assert_eq!(k.has(K::DUAL_SOURCE), dual, "{k:?}");
+                assert_eq!(k.has(K::PAINTED), painted, "{k:?}");
+                assert!(k.premultiplied(), "{k:?}");
+                assert!(!k.has(K::VIEW));
+            }
+            for k in &keys {
+                let kind = Vec4::new(f32::from(k.has(K::FULLBRIGHT)), 0.0, 0.0, 6.0);
+                let (y, w) = k.path_lanes();
+                assert_eq!(K::from_lanes(kind, Vec4::new(0.0, y, 0.0, w)), *k);
+            }
+            union.extend(keys);
+        }
+        // The reference lane, magma and slime, and 4 + 8 + 8 stylised keys (Low has no glow).
+        assert_eq!(union.len(), 22);
+    }
+
+    /// The per-stage count reads visibility, binding arrays and write access, and names each
+    /// limit it exceeds.
+    #[test]
+    fn a_stage_count_names_every_limit_it_exceeds() {
+        use super::{StageCount, WgpuLimits};
+        use bevy::render::render_resource::{
+            BindGroupLayoutEntry, BindingType, BufferBindingType, DownlevelFlags,
+            SamplerBindingType, ShaderStages, TextureSampleType, TextureViewDimension,
+        };
+        let entry = |visibility, ty, count: Option<u32>| BindGroupLayoutEntry {
+            binding: 0,
+            visibility,
+            ty,
+            count: count.and_then(std::num::NonZeroU32::new),
+        };
+        let texture = BindingType::Texture {
+            sample_type: TextureSampleType::Float { filterable: true },
+            view_dimension: TextureViewDimension::D2,
+            multisampled: false,
+        };
+        let storage = |read_only| BindingType::Buffer {
+            ty: BufferBindingType::Storage { read_only },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        };
+        let entries = [
+            entry(ShaderStages::FRAGMENT, texture, None),
+            entry(ShaderStages::FRAGMENT, texture, Some(4)),
+            entry(ShaderStages::VERTEX, texture, None),
+            entry(
+                ShaderStages::FRAGMENT,
+                BindingType::Sampler(SamplerBindingType::Filtering),
+                None,
+            ),
+            entry(ShaderStages::VERTEX_FRAGMENT, storage(true), None),
+            entry(ShaderStages::FRAGMENT, storage(false), None),
+        ];
+        let frag = StageCount::of(ShaderStages::FRAGMENT, &entries);
+        assert_eq!(
+            frag,
+            StageCount {
+                sampled_textures: 5,
+                samplers: 1,
+                storage_buffers: 2,
+                writable_storage: 1,
+                ..StageCount::default()
+            }
+        );
+        let vert = StageCount::of(ShaderStages::VERTEX, &entries);
+        assert_eq!((vert.sampled_textures, vert.storage_buffers), (1, 1));
+        let roomy = WgpuLimits::default();
+        let all = DownlevelFlags::all();
+        assert!(frag
+            .overruns(ShaderStages::FRAGMENT, &roomy, all)
+            .is_empty());
+        let tight = WgpuLimits {
+            max_sampled_textures_per_shader_stage: 4,
+            ..WgpuLimits::default()
+        };
+        let lines = frag.overruns(ShaderStages::FRAGMENT, &tight, DownlevelFlags::empty());
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].contains("max_sampled_textures_per_shader_stage 4"));
+        assert!(lines[1].contains("FRAGMENT_WRITABLE_STORAGE"));
+        // A vertex stage's write needs no fragment flag.
+        assert!(vert
+            .overruns(ShaderStages::VERTEX, &roomy, DownlevelFlags::empty())
+            .is_empty());
+    }
+
+    /// `liquid.wgsl` with `#ifdef`/`#ifndef`/`#else`/`#endif` resolved against `defs`: the text a
+    /// pipeline with those defs compiles.
+    fn liquid_under(defs: &[&str]) -> String {
+        let src = include_str!("shaders/liquid.wgsl");
+        let mut live = vec![true];
+        let mut out = String::new();
+        for line in src.lines() {
+            let t = line.trim_start();
+            if let Some(def) = t.strip_prefix("#ifdef ") {
+                let on = *live.last().unwrap() && defs.contains(&def.trim());
+                live.push(on);
+            } else if let Some(def) = t.strip_prefix("#ifndef ") {
+                let on = *live.last().unwrap() && !defs.contains(&def.trim());
+                live.push(on);
+            } else if t.starts_with("#else") {
+                let on = live.pop().unwrap();
+                let outer = *live.last().unwrap();
+                live.push(outer && !on);
+            } else if t.starts_with("#endif") {
+                live.pop();
+            } else if *live.last().unwrap() {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+        assert_eq!(live.len(), 1, "liquid.wgsl's #ifdef/#endif do not balance");
+        out
+    }
+
+    /// The names the `WATER_STYLISED` region declares at module scope (`fn`, `struct`, `const`,
+    /// `var`, `alias`), the region's own list rather than a hand-picked one.
+    fn stylised_region_names() -> Vec<String> {
+        let src = include_str!("shaders/liquid.wgsl");
+        let (mut names, mut depth, mut inside) = (Vec::new(), 0usize, false);
+        for line in src.lines() {
+            let t = line.trim_start();
+            if t.starts_with("#ifdef") || t.starts_with("#ifndef") {
+                depth += 1;
+                if t.trim() == "#ifdef WATER_STYLISED" && depth == 1 {
+                    inside = true;
+                }
+            } else if t.starts_with("#endif") {
+                depth -= 1;
+                if depth == 0 {
+                    inside = false;
+                }
+            } else if inside && !line.starts_with(char::is_whitespace) {
+                let decl = ["fn ", "struct ", "const ", "var ", "alias "]
+                    .iter()
+                    .find_map(|kw| line.strip_prefix(kw))
+                    .or_else(|| {
+                        line.strip_prefix("var<")
+                            .and_then(|r| r.split_once("> "))
+                            .map(|(_, r)| r)
+                    });
+                if let Some(rest) = decl {
+                    let name: String = rest
+                        .chars()
+                        .take_while(|c| c.is_alphanumeric() || *c == '_')
+                        .collect();
+                    if !name.is_empty() {
+                        names.push(name);
+                    }
+                }
+            }
+        }
+        names
+    }
+
+    /// The text of `liquid.wgsl`'s function whose declaration starts with `head`, to its closing
+    /// brace at column 0.
+    fn liquid_function(head: &str) -> &'static str {
+        let src = include_str!("shaders/liquid.wgsl");
+        let at = src
+            .find(head)
+            .unwrap_or_else(|| panic!("liquid.wgsl lost `{head}`"));
+        let rest = &src[at..];
+        &rest[..rest.find("\n}\n").expect("a closing brace at column 0")]
+    }
+
+    /// Every identifier in `text` outside its `//` comments (the shader has no block comments).
+    fn identifiers(text: &str) -> std::collections::HashSet<&str> {
+        text.lines()
+            .map(|l| l.split_once("//").map_or(l, |(code, _)| code))
+            .flat_map(|code| code.split(|c: char| !(c.is_alphanumeric() || c == '_')))
+            .filter(|w| !w.is_empty())
+            .collect()
+    }
+
+    /// The reference and magma pipelines compile none of the stylised region: a name declared there
+    /// that one of them used would fail its shader and drop every draw it makes. The stylised
+    /// pipelines with every def compile all of it, and no liquid pipeline reads the depth prepass.
+    #[test]
+    fn only_the_stylised_pipelines_compile_the_stylised_region() {
+        use super::LiquidKey;
+        use bevy::math::Vec4;
+        let region = stylised_region_names();
+        for name in ["stylised_water", "SceneBehind", "sample_probe"] {
+            assert!(region.iter().any(|n| n == name), "the region lost `{name}`");
+        }
+        let reference = LiquidKey::from_lanes(Vec4::ZERO, Vec4::ZERO);
+        let magma = LiquidKey::from_lanes(Vec4::X, Vec4::new(0.0, 1.0, 1.0, 1.0));
+        for key in [reference, magma] {
+            let text = liquid_under(&key.frag_defs());
+            let seen = identifiers(&text);
+            let leaked: Vec<&String> = region
+                .iter()
+                .filter(|n| seen.contains(n.as_str()))
+                .collect();
+            assert!(leaked.is_empty(), "{key:?} compiles {leaked:?}");
+            assert!(
+                text.contains("fn stylised_lava("),
+                "{key:?} lost the magma grade"
+            );
+        }
+        // The debug views (`path.w` bit 0) carry `WATER_VIEW`, the region's guard whose names only
+        // they declare, and `WATER_DUAL_SOURCE`
+        // the composite's second output. Every def means the preview's too: `WATER_PREVIEW`, its
+        // glow store (`WATER_GLOW_STORE`) and the mirrors' distance chain (`WATER_MIRROR_DIST`). The floor march law's tier branches declare module-scope
+        // names too (`FLOOR_MARCH_LEVEL`, `FLOOR_MARCH_STEPS`), the same ones in every branch, so
+        // this key's tier declares them all.
+        let water = LiquidKey::from_lanes(Vec4::ZERO, Vec4::new(0.0, 1.0, 0.0, 1.0));
+        let mut defs = water.frag_defs();
+        for def in [
+            "WATER_DUAL_SOURCE",
+            "WATER_PREVIEW",
+            "WATER_GLOW_STORE",
+            "WATER_MIRROR_DIST",
+        ] {
+            if !defs.contains(&def) {
+                defs.push(def);
+            }
+        }
+        let text = liquid_under(&defs);
+        let seen = identifiers(&text);
+        let missing: Vec<&String> = region
+            .iter()
+            .filter(|n| !seen.contains(n.as_str()))
+            .collect();
+        assert!(missing.is_empty(), "{water:?} lacks {missing:?}");
+        assert!(
+            !include_str!("shaders/liquid.wgsl").contains("DEPTH_PREPASS"),
+            "a liquid pipeline reads the depth prepass again: the world camera carries none \
+             (`benilla_water::depth`), and the water measures its column against the linear \
+             depth"
+        );
+    }
+
+    /// **The stylised lane is lit by its own light, never the terrain's.** The body and foam take
+    /// the sky's irradiance and the lighting sun's under its MCSH shadow (`body_irradiance`, from
+    /// `benilla_water::body`'s rows); the terrain's `clamp(ambient + diffuse·N·L)` would light
+    /// water under a canopy or a deck as if it stood in the open. Neither the stylised branch of
+    /// `fragment` nor the functions it lights with name a `lit` or read the terrain's ambient or
+    /// diffuse row.
+    #[test]
+    fn the_stylised_lane_reads_no_terrain_light() {
+        let function = liquid_function;
+        let frag = function("fn fragment(");
+        let branch = &frag[frag
+            .find("#ifdef WATER_STYLISED")
+            .expect("the stylised branch of fragment")..];
+        let branch = &branch[..branch.find("#endif").unwrap()];
+        for (name, text) in [
+            ("stylised_water", function("fn stylised_water(")),
+            ("water_body_light", function("fn water_body_light(")),
+            ("body_irradiance", function("fn body_irradiance(")),
+            ("open_illuminant_g", function("fn open_illuminant_g(")),
+            ("the stylised branch of fragment", branch),
+        ] {
+            let seen = identifiers(text);
+            for banned in ["lit", "light_ambient", "light_diffuse"] {
+                assert!(!seen.contains(banned), "{name} reads `{banned}`");
+            }
+        }
+        assert!(
+            function("fn water_body_light(").contains("body_irradiance("),
+            "the body's light is no longer the irradiance"
+        );
+    }
+
+    /// **Each term of the water is fogged once** (REF-8). The world the mirror reflects is fogged
+    /// as its camera drew it; nothing in the stylised region fogs the layer as a whole or calls the
+    /// reference's `apply_fog`; both of the probe's returns and the floor's occluder are re-based
+    /// to the mirror's fog; the body (what it scatters and what it absorbs, one opaque share), the
+    /// glints, foam and the reflected sky (the floor's, the probe's and the mirror's dome) take
+    /// the surface's. `fog_law` is `apply_fog`'s
+    /// arithmetic, so the two lanes fog by one law.
+    #[test]
+    fn the_stylised_lane_fogs_each_term_once() {
+        let src = include_str!("shaders/liquid.wgsl");
+        let law = liquid_function("fn fog_law(");
+        let apply = liquid_function("fn apply_fog(");
+        let denom = "let denom = max(fog_span.y - fog_span.x, 0.001);";
+        assert!(
+            law.contains(denom) && apply.contains(denom),
+            "the fog's span differs"
+        );
+        let factor = "clamp((fog_span.y - eye_z) / denom, 0.0, 1.0)";
+        assert!(
+            law.contains(&format!("return {factor};")),
+            "fog_law lost the law"
+        );
+        assert!(
+            apply.contains(&format!("let factor = {factor};")),
+            "apply_fog's law moved: fog_law must follow it"
+        );
+        // The same eye Z, colour, span and WMO room gate as `apply_fog`.
+        let eye_z = liquid_function("fn water_eye_z(");
+        let fog = liquid_function("fn water_fog(");
+        for (a, b, what) in [
+            (
+                "let eye_z = -(view.view_from_world * vec4<f32>(world_pos, 1.0)).z;",
+                (
+                    &eye_z,
+                    "return -(view.view_from_world * vec4<f32>(p, 1.0)).z;",
+                ),
+                "the fog's eye Z",
+            ),
+            (
+                "if (w.kind.z > 0.5 && room_fog != 0u) {",
+                (&fog, "if (w.kind.z > 0.5 && room_fog != 0u) {"),
+                "the room gate",
+            ),
+            (
+                "fog_span = wow_light.wmo_fog_params.xy;",
+                (&fog, "span = wow_light.wmo_fog_params.xy;"),
+                "the room's span",
+            ),
+            (
+                "fog_color = wow_light.wmo_fog_color;",
+                (&fog, "colour = wow_light.wmo_fog_color;"),
+                "the room's colour",
+            ),
+        ] {
+            assert!(
+                apply.contains(a) && b.0.contains(b.1),
+                "{what} differs from apply_fog's"
+            );
+        }
+        let start = src.find("#ifdef WATER_STYLISED\n").expect("the region");
+        let end = src
+            .find("#endif // WATER_STYLISED")
+            .expect("the region's end");
+        let region = identifiers(&src[start..end]);
+        for banned in ["apply_fog", "layer_fog"] {
+            assert!(
+                !region.contains(banned),
+                "the stylised region names `{banned}`"
+            );
+        }
+        let probe = liquid_function("fn sample_probe(");
+        assert_eq!(
+            probe.matches("return ").count(),
+            2,
+            "sample_probe's returns"
+        );
+        assert_eq!(
+            probe.matches("return probe_refog(").count(),
+            2,
+            "a probe return skips the re-fog"
+        );
+        let water = liquid_function("fn stylised_water(");
+        assert!(
+            water.contains("floor_tone(occ, water_dec(probe_rgb), probe_k, world_pos, to_view)"),
+            "the floor's occluder does not take its world tone"
+        );
+        assert!(
+            water.contains(
+                "* (gw * pow(MOON_SPEC_WEIGHT, WATER_GAMMA) * water_reflect.moon.w))\n        \
+                 * fog.f;"
+            ),
+            "the glints are not fogged at the surface"
+        );
+        assert!(
+            water.contains(
+                "var refl_out = refl_g;\n    if (!eye_above) {\n        \
+                 refl_out = fog_diffuse(refl_g, fog.f, fog.g);\n    }"
+            ),
+            "the reflection is fogged at the surface from above too"
+        );
+        assert!(
+            water.contains("fog_diffuse(water_dec(FOAM_COLOR) * light.foam, fog.f, fog.g)"),
+            "foam is not fogged at the surface"
+        );
+        assert!(
+            water.contains("body_fog(light.in_scatter, vec3<f32>(body.w_in), body.t_bed, fog),"),
+            "the body is not fogged at the surface as one opaque share"
+        );
+        for (line, what) in [
+            (
+                "let sky_seen = fog_diffuse(sky, fog.f, fog.g);",
+                "the floor's sky",
+            ),
+            ("var floor_l = occ.v * sky_seen;", "the floor's open share"),
+            ("mirror_fog(mirror_g, sky, fog)", "the mirror's dome"),
+        ] {
+            assert!(water.contains(line), "{what} is not fogged at the surface");
+        }
+        let shares = liquid_function("fn probe_fog_shares(");
+        assert!(
+            shares.contains("if (d_geom > 9000.0) {\n        return vec2<f32>(1.0, fog_law(water_eye_z(p), span));"),
+            "the probe's sky is not fogged at the surface"
+        );
     }
 }

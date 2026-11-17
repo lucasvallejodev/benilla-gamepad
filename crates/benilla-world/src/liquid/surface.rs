@@ -4,14 +4,17 @@
 //! off the wall clock, so no CPU mutates a material; a deterministic run bakes the clock off
 //! (frame 0, scroll 0). Day and night follow server time.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use bevy::asset::RenderAssetUsages;
+use bevy::camera::visibility::RenderLayers;
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::pbr::ExtendedMaterial;
 use bevy::prelude::*;
 
-use super::query::{wet_footprint, FoamPatch, LiquidSource, WmoPool};
+use super::query::{wet_footprint, world_planes, FoamPatch, LiquidSource, WmoPool};
+use super::{ripple, WaterStyle};
 use crate::collision::liquid_layers;
 use crate::lighting::WATER_SHININESS;
 use avian3d::prelude::{Collider, RigidBody};
@@ -19,7 +22,10 @@ use benilla_assets::coords::wow_to_bevy;
 use benilla_assets::materials::{LiquidExt, LiquidMaterial};
 use benilla_assets::LockRecover;
 use benilla_assets::{liquid_frame_array, RenderConfig, WorldAssets};
-use benilla_formats::{read_texture_mip_chain, BlpMipChain, LiquidKind, LiquidMesh};
+use benilla_formats::{
+    read_texture_mip_chain, terrain_height_at, BlpMipChain, ChunkMesh, LiquidKind, LiquidMesh,
+    WaterClasses, NO_SPOT,
+};
 
 /// The shared liquid materials by [`LiquidKey`]; absent without client data.
 #[derive(Resource, Default)]
@@ -116,9 +122,15 @@ impl LiquidAssets {
     }
 }
 
-/// Marks a spawned liquid surface: one per MCNK liquid layer or WMO group pool.
+/// The map's water classification on an ADT surface: where the probe placement finds the fixed
+/// probe spots.
 #[derive(Component)]
-pub(crate) struct LiquidSurface;
+pub struct WaterMapRef(pub std::sync::Arc<dyn WaterClasses>);
+
+/// Marks a spawned liquid surface: one per MCNK liquid layer or WMO group pool. Public as a seam:
+/// it marks a drawn liquid surface, and the water plugin projects these for its screen rect.
+#[derive(Component)]
+pub struct LiquidSurface;
 
 /// `WOW_NO_LIQUID`: hide every liquid surface and only the surface, since the swim grid, foam and
 /// sound ride sibling components. An override run after both per-frame `Visibility` owners (the
@@ -143,6 +155,12 @@ pub(crate) struct LiquidSoundSource {
 pub(crate) fn spawn_liquids<'a>(
     commands: &mut Commands,
     liquids: impl Iterator<Item = &'a LiquidMesh>,
+    // The owning tile's terrain, for the shore foam: the waterline on a coast is where the ground
+    // rises through the water plane, and nothing in the liquid data alone records it
+    // ([`shore_distances`]).
+    chunks: &[ChunkMesh],
+    // The map's water classification: which water the mirrors serve, where the probes stand.
+    planar: Option<&std::sync::Arc<dyn WaterClasses>>,
     liquid_assets: Option<&LiquidAssets>,
     meshes: &mut Assets<Mesh>,
     entities: &mut Vec<Entity>,
@@ -150,21 +168,38 @@ pub(crate) fn spawn_liquids<'a>(
     let Some(liquid) = liquid_assets else {
         return;
     };
-    for lq in liquids {
+    // One lattice for the whole tile: a chunk cannot tell where its water ends from itself alone.
+    let batch: Vec<&LiquidMesh> = liquids.collect();
+    let lattice = WetLattice::build(batch.iter().copied()).map(Arc::new);
+    let shoreline = Shoreline::build(&batch, chunks).map(Arc::new);
+    for lq in batch {
         // The scene fog (the ADT passes submit none and draw under the scene submit `0x66ff20`),
         // and never a scroll, though ADT magma is nibble 6: its kernel zeroes the v-translate.
         let Some(material) = liquid.material(lq.kind, LiquidPath::Adt, false) else {
             continue; // this kind's frames failed to load (warned at setup)
         };
-        let info = wet_footprint(lq, &Transform::IDENTITY, LiquidSource::AdtChunk);
+        let info = wet_footprint(lq, &Transform::IDENTITY, LiquidSource::AdtChunk)
+            .with_planes(planar.map(|p| p.planes(lq)));
         let foam = !lq.kind.is_fullbright(); // white surf is a water thing
+        let coarse = meshes.add(liquid_bevy_mesh(
+            lq,
+            None,
+            lattice.as_deref(),
+            planar.map(|p| &**p),
+            true,
+            shoreline.as_deref(),
+        ));
+        let fine = (!lq.kind.is_fullbright())
+            .then(|| LiquidFine::new(lq, coarse.clone(), &lattice, &shoreline, planar));
         entities.push(
             commands
                 .spawn((
-                    Mesh3d(meshes.add(liquid_bevy_mesh(lq, None))),
+                    Mesh3d(coarse),
                     MeshMaterial3d(material),
                     Transform::IDENTITY,
                     LiquidSurface,
+                    // Liquid rides its own layer, so the stylised look's mirrors can leave it out.
+                    RenderLayers::layer(super::WATER_RENDER_LAYER),
                     // Exterior scene: the ADT liquid producer `0x683ab0` is called only from the
                     // per-window populate `0x682fa0`, like ADT terrain (`0x683bf0`) and doodads
                     // (`0x683700`), one entity per MCNK layer. The exterior cull is its only
@@ -182,11 +217,142 @@ pub(crate) fn spawn_liquids<'a>(
                 .entity(*entities.last().expect("just pushed"))
                 .insert(FoamPatch);
         }
+        if let Some(fine) = fine.flatten() {
+            commands
+                .entity(*entities.last().expect("just pushed"))
+                .insert(fine);
+        }
+        if let Some(p) = planar {
+            commands
+                .entity(*entities.last().expect("just pushed"))
+                .insert(WaterMapRef(p.clone()));
+        }
         // The waterline for the camera sweep under `cameraWaterCollision`; nothing else queries it.
         if let Some(collider) = liquid_collider(lq) {
             commands
                 .entity(*entities.last().expect("just pushed"))
                 .insert((collider, RigidBody::Static, liquid_layers()));
+        }
+    }
+}
+
+/// The fine ring's open cells are split this many ways a side for the Improved Water's surface
+/// height (`liquid.wgsl`'s `pv_surface_height`), which the 4.17 yd lattice cannot carry: two
+/// yards below High, half a yard (the waterline cells' own [`SHORE_CELL_SUB`]) at High. The heavy
+/// fragment pays for every thin far triangle in the quads it half covers: at Loch Modan, Medium,
+/// the half-yard ring cost 2.7 ms of GPU, the two-yard one 0.5. The shader stitches a waterline
+/// cell's finer edge to the open grid (`pv_height_stitch`, its `PV_HEIGHT_OPEN_SUB` the same per
+/// tier), so no edge of a risen surface opens a crack.
+fn fine_ring_sub(quality: super::WaterQuality) -> usize {
+    match quality {
+        super::WaterQuality::High => SHORE_CELL_SUB,
+        _ => SHORE_CELL_SUB / 4,
+    }
+}
+/// A chunk takes its fine mesh when its nearest point comes this near the eye, horizontally, and
+/// gives it back past [`FINE_RING_OUT`]. The shader's height is gone by 56 yd, so a chunk drawn
+/// coarse is always flat and the two meshes meet without a crack.
+const FINE_RING_IN: f32 = 64.0;
+const FINE_RING_OUT: f32 = 80.0;
+/// The fine meshes built in one frame at most: a camera cut spreads its ring over a few frames.
+const FINE_RING_BUILDS: usize = 6;
+
+/// What an ADT surface needs to build its fine mesh on demand, and the two meshes: the Improved
+/// Water's surface height draws the chunks near the eye on a finer grid ([`fine_ring_sub`]), the far
+/// ones on the reference's lattice, unchanged.
+#[derive(Component)]
+pub(crate) struct LiquidFine {
+    lq: LiquidMesh,
+    lattice: Option<Arc<WetLattice>>,
+    shoreline: Option<Arc<Shoreline>>,
+    planar: Option<Arc<dyn WaterClasses>>,
+    coarse: Handle<Mesh>,
+    /// The fine mesh and the split it was built at.
+    fine: Option<(Handle<Mesh>, usize)>,
+    // The wet cells' bounds in Bevy XZ, for the distance to the eye.
+    lo: Vec2,
+    hi: Vec2,
+}
+
+impl LiquidFine {
+    /// `None` for a surface with no wet cell.
+    fn new(
+        lq: &LiquidMesh,
+        coarse: Handle<Mesh>,
+        lattice: &Option<Arc<WetLattice>>,
+        shoreline: &Option<Arc<Shoreline>>,
+        planar: Option<&Arc<dyn WaterClasses>>,
+    ) -> Option<Self> {
+        let (mut lo, mut hi) = (Vec2::splat(f32::MAX), Vec2::splat(f32::MIN));
+        for p in lq.positions.iter().filter(|p| p[2].abs() < 1.0e8) {
+            let b = wow_to_bevy(*p);
+            lo = lo.min(Vec2::new(b.x, b.z));
+            hi = hi.max(Vec2::new(b.x, b.z));
+        }
+        (lo.x <= hi.x).then(|| Self {
+            lq: lq.clone(),
+            lattice: lattice.clone(),
+            shoreline: shoreline.clone(),
+            planar: planar.cloned(),
+            coarse,
+            fine: None,
+            lo,
+            hi,
+        })
+    }
+
+    /// Horizontal yards from `eye` (Bevy XZ) to the surface's nearest point.
+    fn distance(&self, eye: Vec2) -> f32 {
+        (eye.clamp(self.lo, self.hi) - eye).length()
+    }
+}
+
+/// The fine ring: while the Improved Water's surface height is on, each ADT surface within
+/// [`FINE_RING_IN`] of the eye draws its fine mesh, built on demand, and one past
+/// [`FINE_RING_OUT`] its coarse one again, the fine one dropped.
+pub(super) fn swap_fine_liquids(
+    eye: Query<&GlobalTransform, With<crate::view::WorldCamera>>,
+    dev: Option<Res<crate::dev_state::DebugState>>,
+    style: Res<super::WaterStyle>,
+    quality: Option<Res<super::WaterQuality>>,
+    mut surfaces: Query<(&mut Mesh3d, &mut LiquidFine)>,
+    mut meshes: ResMut<Assets<Mesh>>,
+) {
+    let on = *style == super::WaterStyle::Stylised
+        && dev.as_ref().is_some_and(|d| d.water.surface_height);
+    let eye = eye.iter().next().map(|t| t.translation());
+    let sub = fine_ring_sub(quality.map_or(super::WaterQuality::Medium, |q| *q));
+    let mut builds = 0;
+    for (mut mesh, mut fine) in &mut surfaces {
+        let d = eye.map_or(f32::MAX, |e| fine.distance(Vec2::new(e.x, e.z)));
+        let want = on && (d < FINE_RING_IN || (fine.fine.is_some() && d < FINE_RING_OUT));
+        if want {
+            // None yet, or built at another tier's split.
+            if fine.fine.as_ref().is_none_or(|(_, s)| *s != sub) {
+                if builds >= FINE_RING_BUILDS {
+                    continue;
+                }
+                builds += 1;
+                let m = liquid_bevy_mesh_sub(
+                    &fine.lq,
+                    None,
+                    fine.lattice.as_deref(),
+                    fine.planar.as_deref(),
+                    true,
+                    fine.shoreline.as_deref(),
+                    sub,
+                );
+                if let Some((old, _)) = fine.fine.replace((meshes.add(m), sub)) {
+                    meshes.remove(&old);
+                }
+            }
+            let h = fine.fine.as_ref().expect("built above").0.clone();
+            if mesh.0 != h {
+                mesh.0 = h;
+            }
+        } else if let Some((h, _)) = fine.fine.take() {
+            mesh.0 = fine.coarse.clone();
+            meshes.remove(&h);
         }
     }
 }
@@ -208,14 +374,576 @@ fn liquid_collider(lq: &LiquidMesh) -> Option<Collider> {
     Some(Collider::trimesh(verts, tris))
 }
 
-/// The render mesh for one [`LiquidMesh`] in its own space (absolute for MCLQ, model-local for WMO
-/// liquid): a flat up normal, the tiling UVs, and the per-vertex depth `V` in UV1.x.
-fn liquid_bevy_mesh(lq: &LiquidMesh, body_color: Option<[f32; 3]>) -> Mesh {
-    let positions: Vec<[f32; 3]> = lq
+/// Every liquid cell a batch of surfaces covers, on one shared lattice, so a surface can measure
+/// its distance to the water's edge across chunk seams.
+///
+/// A [`LiquidMesh`] is one MCNK's 9x9 grid, 33 yards square. Asking a single grid where its water
+/// ends gives the wrong answer at every chunk border, because a chunk whose water runs straight into
+/// the next one looks, from the inside, exactly like a chunk whose water stops there — and drawing
+/// foam on that reading would put a line across open sea every 33 yards. The tile streamer hands
+/// [`spawn_liquids`] every chunk of a tile at once, so the lattice is built from all of them
+/// together and each surface measures against the whole.
+///
+/// `known` is the union of the batch's grids — the ground this batch can actually speak for. A cell
+/// outside it is *unknown*, not dry: at a tile seam the water continues into a tile whose own
+/// surfaces are a different batch, and treating that seam as land would draw the same false line
+/// 533 yards long. The cost is a chunk entirely covered by water whose neighbour carries no liquid
+/// at all, where the true edge lies on the seam and goes unmarked; that needs the coastline to run
+/// along a chunk border for its whole length, which real ones do not.
+pub(crate) struct WetLattice {
+    /// The wet/dry boundary as a **traced curve**, not as the set of cells it separates.
+    ///
+    /// Built over a whole TILE on the ADT path and a whole PLACEMENT on the WMO one, never over a
+    /// single surface. Stormwind's canal is a couple of dozen small grids, one per group, and each
+    /// carries a ring of dry cells around its own water where its group's data ends. Traced alone,
+    /// every segment calls the join with its neighbour a shore, and the canal drew a foam line
+    /// straight across itself at each of them — a line in the middle of the water, repeating down
+    /// its whole length. Folded onto one lattice, a cell one segment calls dry and the next calls
+    /// wet is simply wet, and the only boundary left is the one against the quay. (The groups'
+    /// grids share a common 4.1667-yard lattice, checked against the shipped data, so folding them
+    /// is exact rather than approximate.)
+    ///
+    /// Measuring straight to the dry cells is the obvious thing and it is what this did first. It
+    /// is also wrong, and visibly so: a union of axis-aligned 4.17-yard squares IS a staircase, so
+    /// however exactly you measure to it, a band of constant distance around it comes out as a
+    /// staircase too — a bright zig-zag with square corners running along a shoreline that is
+    /// actually a smooth diagonal. Reading the same cells as a *fractional wetness at their
+    /// corners* and following its half-way contour cuts each corner cell across the diagonal
+    /// instead, which is the line the cells were a coarse sampling of in the first place.
+    ///
+    /// The cost is features one cell across: a lone dry cell in open water has all four of its
+    /// corners at three-quarters wet, so no contour passes through it and it gets no foam. On an
+    /// ADT that is exactly the case the traced depth contour ([`Shoreline`]) already covers — a
+    /// lone dry cell is dry because the ground there is out of the water — so the two sources are
+    /// complementary. A WMO pool has no ground to trace against and would lose a one-cell island,
+    /// which is a shape no authored pool has.
+    edge: Option<Shoreline>,
+}
+
+impl WetLattice {
+    /// Fold every mesh in a batch onto one lattice. `None` when the batch has no usable grid.
+    ///
+    /// Cells are keyed by their CENTRE, which sits half a pitch off the lattice lines and so lands
+    /// unambiguously inside one cell however the floor rounds. Positions are taken as they come —
+    /// absolute WoW yards for MCLQ, model-local for a WMO pool — which is consistent as long as one
+    /// batch is all of one kind, and it is.
+    pub(crate) fn build<'a>(meshes: impl Iterator<Item = &'a LiquidMesh>) -> Option<Self> {
+        let mut cell = 0.0_f32;
+        let mut wet = HashSet::new();
+        let mut known = HashSet::new();
+        for lq in meshes {
+            let (cols, rows) = (lq.grid[0] as usize, lq.grid[1] as usize);
+            if cols < 2 || rows < 2 {
+                continue;
+            }
+            if cell <= 0.0 {
+                let (a, b) = (lq.positions[0], lq.positions[1]);
+                cell = ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2)).sqrt();
+                if cell.is_nan() || cell <= 1e-3 {
+                    return None;
+                }
+            }
+            let (xt, yt) = (cols - 1, rows - 1);
+            for j in 0..yt {
+                for i in 0..xt {
+                    // The cell's centre, as the mean of its four corners — right whichever way the
+                    // grid axes happen to lie in the world.
+                    let corners = [
+                        lq.positions[j * cols + i],
+                        lq.positions[j * cols + i + 1],
+                        lq.positions[(j + 1) * cols + i],
+                        lq.positions[(j + 1) * cols + i + 1],
+                    ];
+                    let cx = corners.iter().map(|p| p[0]).sum::<f32>() / 4.0;
+                    let cy = corners.iter().map(|p| p[1]).sum::<f32>() / 4.0;
+                    if !cx.is_finite() || !cy.is_finite() {
+                        continue;
+                    }
+                    let key = ((cx / cell).floor() as i32, (cy / cell).floor() as i32);
+                    known.insert(key);
+                    if lq.wet[j * xt + i] {
+                        wet.insert(key);
+                    }
+                }
+            }
+        }
+        if cell.is_nan() || cell <= 0.0 || known.is_empty() {
+            return None;
+        }
+
+        // Fractional wetness at a lattice CORNER: the share of the four cells meeting there that
+        // carry liquid. Cells outside the batch are not counted at all rather than counted dry —
+        // the same rule the cell set itself follows, and what keeps a tile's outer edge (where the
+        // neighbouring tile's cells simply are not loaded) from reading as a shoreline five
+        // hundred yards long.
+        let corner = |i: i32, j: i32| -> Option<f32> {
+            let (mut w, mut k) = (0u32, 0u32);
+            for (dx, dy) in [(-1, -1), (0, -1), (-1, 0), (0, 0)] {
+                let key = (i + dx, j + dy);
+                if known.contains(&key) {
+                    k += 1;
+                    if wet.contains(&key) {
+                        w += 1;
+                    }
+                }
+            }
+            (k > 0).then(|| w as f32 / k as f32)
+        };
+
+        // Marching squares over the lattice at the half-wet contour, cell by cell. Same shape as
+        // [`Shoreline::build`]'s march: two crossings are one segment, four are a saddle.
+        let mut raw: Vec<[f32; 4]> = Vec::new();
+        for &(i, j) in &known {
+            let q = [(i, j), (i + 1, j), (i + 1, j + 1), (i, j + 1)].map(|(ci, cj)| {
+                corner(ci, cj).map(|w| ([ci as f32 * cell, cj as f32 * cell], w - 0.5))
+            });
+            if q.iter().any(|c| c.is_none()) {
+                continue;
+            }
+            let q: Vec<([f32; 2], f32)> = q.into_iter().flatten().collect();
+            let mut cross: Vec<[f32; 2]> = Vec::with_capacity(4);
+            for e in 0..4 {
+                let (a, b) = (q[e], q[(e + 1) % 4]);
+                if (a.1 > 0.0) != (b.1 > 0.0) {
+                    let t = a.1 / (a.1 - b.1);
+                    cross.push([
+                        a.0[0] + (b.0[0] - a.0[0]) * t,
+                        a.0[1] + (b.0[1] - a.0[1]) * t,
+                    ]);
+                }
+            }
+            if cross.len() == 2 {
+                raw.push([cross[0][0], cross[0][1], cross[1][0], cross[1][1]]);
+            } else if cross.len() == 4 {
+                raw.push([cross[0][0], cross[0][1], cross[1][0], cross[1][1]]);
+                raw.push([cross[2][0], cross[2][1], cross[3][0], cross[3][1]]);
+            }
+        }
+        Some(Self {
+            edge: Shoreline::from_segments(raw),
+        })
+    }
+
+    /// Distance in yards from a point to the water's edge as the liquid GRID draws it — the traced
+    /// contour, not the cells. [`FAR_FROM_SHORE`] when the batch had no boundary at all.
+    fn distance_to_dry(&self, px: f32, py: f32) -> f32 {
+        self.edge
+            .as_ref()
+            .map_or(FAR_FROM_SHORE, |e| e.distance(px, py))
+    }
+}
+
+/// The waterline itself, traced as line segments, with a coarse spatial index.
+///
+/// Two earlier readings of where the water ends both failed, and for the same underlying reason:
+/// they inferred the edge from the liquid data instead of finding it. The authored depth byte's
+/// zero crossing works on a river bank, where the water really does taper out, and misses a coast
+/// entirely. The liquid grid's own edge is right for a WMO pool and wrong for a coast too, because
+/// the sea's surface carries straight on *underneath* the beach — the waterline you see is where the
+/// terrain rises through that plane, an intersection which neither the depth byte nor the grid
+/// records.
+///
+/// So it is traced directly: sample `surface height − ground height` over the tile, and follow its
+/// zero contour with marching squares. That crossing is the waterline by construction, on a coast
+/// and a river bank alike, and being a real curve it yields a real distance — where `f / |grad f|`
+/// only extrapolated one, and inflated it over every flat spot in the sand.
+struct Shoreline {
+    /// Spatial index pitch, in yards.
+    bucket: f32,
+    /// Segments `[ax, ay, bx, by]`, filed under every bucket their extent touches.
+    segs: HashMap<(i32, i32), Vec<[f32; 4]>>,
+}
+
+/// How finely the depth field is sampled when tracing, as a multiple of the liquid lattice. Four
+/// puts the samples about a yard apart, and the traced polyline's segments with them.
+///
+/// This was two, on the argument that the terrain's own vertices are about two yards apart and
+/// tracing finer would invent detail. The argument does not hold: what the player sees is not the
+/// terrain's vertices but the SURFACE interpolated between them, and the waterline is where that
+/// interpolated surface crosses the water — so sampling at a yard follows the drawn ground more
+/// closely rather than inventing anything. At two yards the traced curve is a polyline with
+/// two-yard segments, and a band a fifth of a yard wide drawn around it wears every one of those
+/// facets as a visible kink.
+const CONTOUR_SUB: usize = 4;
+
+impl Shoreline {
+    /// Trace every waterline in a batch of surfaces. `None` without terrain to measure against,
+    /// which is every WMO pool (its coordinates are model-local and there is no ground under them).
+    fn build(meshes: &[&LiquidMesh], chunks: &[ChunkMesh]) -> Option<Self> {
+        if chunks.is_empty() {
+            return None;
+        }
+        let mut raw: Vec<[f32; 4]> = Vec::new();
+        for lq in meshes {
+            let (cols, rows) = (lq.grid[0] as usize, lq.grid[1] as usize);
+            if cols < 2 || rows < 2 || lq.positions.len() != cols * rows {
+                continue;
+            }
+            // A representative surface height, standing in for the corners MCLQ leaves as a
+            // sentinel under dry ground.
+            let (mut sum, mut cnt) = (0.0_f32, 0_u32);
+            for p in &lq.positions {
+                if p[2].abs() < 1.0e8 {
+                    sum += p[2];
+                    cnt += 1;
+                }
+            }
+            let Some(level) = (cnt > 0).then(|| sum / cnt as f32) else {
+                continue;
+            };
+            // The chunk this surface sits on, found once. Every sample below lands inside it, so the
+            // per-sample lookup is a single chunk's test rather than a walk over the tile's 256.
+            let mid = surface_point(lq, level, (cols - 1) as f32 * 0.5, (rows - 1) as f32 * 0.5);
+            let own = chunks.iter().find(|c| c.height_at(mid).is_some());
+            let ground = |p: [f32; 3]| -> Option<f32> {
+                own.and_then(|c| c.height_at(p))
+                    .or_else(|| terrain_height_at(chunks, p))
+            };
+
+            let (sw, sh) = (CONTOUR_SUB * (cols - 1) + 1, CONTOUR_SUB * (rows - 1) + 1);
+            let mut pts: Vec<Option<([f32; 2], f32)>> = Vec::with_capacity(sw * sh);
+            for sj in 0..sh {
+                for si in 0..sw {
+                    let p = surface_point(
+                        lq,
+                        level,
+                        si as f32 / CONTOUR_SUB as f32,
+                        sj as f32 / CONTOUR_SUB as f32,
+                    );
+                    pts.push(ground(p).map(|gz| ([p[0], p[1]], p[2] - gz)));
+                }
+            }
+
+            // Marching squares. A cell with two sign changes carries one piece of the waterline;
+            // four is a saddle, where either pairing is as defensible as the other at this scale.
+            for sj in 0..sh - 1 {
+                for si in 0..sw - 1 {
+                    let corner = [
+                        pts[sj * sw + si],
+                        pts[sj * sw + si + 1],
+                        pts[(sj + 1) * sw + si + 1],
+                        pts[(sj + 1) * sw + si],
+                    ];
+                    if corner.iter().any(|c| c.is_none()) {
+                        continue;
+                    }
+                    let q: Vec<([f32; 2], f32)> = corner.into_iter().flatten().collect();
+                    let mut cross: Vec<[f32; 2]> = Vec::with_capacity(4);
+                    for e in 0..4 {
+                        let (a, b) = (q[e], q[(e + 1) % 4]);
+                        if (a.1 > 0.0) != (b.1 > 0.0) {
+                            let t = a.1 / (a.1 - b.1);
+                            cross.push([
+                                a.0[0] + (b.0[0] - a.0[0]) * t,
+                                a.0[1] + (b.0[1] - a.0[1]) * t,
+                            ]);
+                        }
+                    }
+                    if cross.len() == 2 {
+                        raw.push([cross[0][0], cross[0][1], cross[1][0], cross[1][1]]);
+                    } else if cross.len() == 4 {
+                        raw.push([cross[0][0], cross[0][1], cross[1][0], cross[1][1]]);
+                        raw.push([cross[2][0], cross[2][1], cross[3][0], cross[3][1]]);
+                    }
+                }
+            }
+        }
+        Self::from_segments(raw)
+    }
+
+    /// File a set of traced segments into the spatial index. Shared with [`WetLattice`], which
+    /// traces the grid's own boundary through the same marching squares and wants the same lookup.
+    fn from_segments(raw: Vec<[f32; 4]>) -> Option<Self> {
+        if raw.is_empty() {
+            return None;
+        }
+        let bucket = 4.0_f32;
+        let mut segs: HashMap<(i32, i32), Vec<[f32; 4]>> = HashMap::new();
+        for s in raw {
+            let (x0, x1) = (s[0].min(s[2]), s[0].max(s[2]));
+            let (y0, y1) = (s[1].min(s[3]), s[1].max(s[3]));
+            for by in (y0 / bucket).floor() as i32..=(y1 / bucket).floor() as i32 {
+                for bx in (x0 / bucket).floor() as i32..=(x1 / bucket).floor() as i32 {
+                    segs.entry((bx, by)).or_default().push(s);
+                }
+            }
+        }
+        Some(Self { bucket, segs })
+    }
+
+    /// The nearest POINT on the waterline to `(px, py)`, and how far it is — or `None` when no
+    /// piece of waterline is within the searched ring of buckets, which is far further out than any
+    /// foam reaches.
+    ///
+    /// The point matters as much as the distance: the mesh carries the OFFSET to it per vertex
+    /// (`benilla_assets::materials::ATTRIBUTE_WOW_SHORE_OFFSET`) so the shader can take the length itself,
+    /// after interpolation. See that attribute for why.
+    fn nearest(&self, px: f32, py: f32) -> Option<([f32; 2], f32)> {
+        let (bx, by) = (
+            (px / self.bucket).floor() as i32,
+            (py / self.bucket).floor() as i32,
+        );
+        let mut best: Option<([f32; 2], f32)> = None;
+        for dy in -1..=1 {
+            for dx in -1..=1 {
+                let Some(list) = self.segs.get(&(bx + dx, by + dy)) else {
+                    continue;
+                };
+                for s in list {
+                    let (vx, vy) = (s[2] - s[0], s[3] - s[1]);
+                    let len2 = vx * vx + vy * vy;
+                    let t = if len2 > 1e-12 {
+                        (((px - s[0]) * vx + (py - s[1]) * vy) / len2).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    let (cx, cy) = (s[0] + vx * t, s[1] + vy * t);
+                    let d = ((px - cx).powi(2) + (py - cy).powi(2)).sqrt();
+                    if best.is_none_or(|(_, bd)| d < bd) {
+                        best = Some(([cx, cy], d));
+                    }
+                }
+            }
+        }
+        best
+    }
+
+    /// Distance only — the far field, and every consumer that does not draw a band.
+    fn distance(&self, px: f32, py: f32) -> f32 {
+        self.nearest(px, py).map_or(FAR_FROM_SHORE, |(_, d)| d)
+    }
+}
+
+/// A point on a liquid surface at grid parameter `(u, v)`, bilinear over the four corners around it.
+/// Corners MCLQ left as a height sentinel under dry ground take `level` instead, so a cell that is
+/// half under the bank still interpolates a sane surface.
+fn surface_point(lq: &LiquidMesh, level: f32, u: f32, v: f32) -> [f32; 3] {
+    let (cols, rows) = (lq.grid[0] as usize, lq.grid[1] as usize);
+    let i = (u.max(0.0).floor() as usize).min(cols - 2);
+    let j = (v.max(0.0).floor() as usize).min(rows - 2);
+    let (fu, fv) = (u - i as f32, v - j as f32);
+    let c = [
+        lq.positions[j * cols + i],
+        lq.positions[j * cols + i + 1],
+        lq.positions[(j + 1) * cols + i],
+        lq.positions[(j + 1) * cols + i + 1],
+    ];
+    let mix = |a: f32, b: f32, t: f32| a + (b - a) * t;
+    let z = |k: usize| {
+        if c[k][2].abs() < 1.0e8 {
+            c[k][2]
+        } else {
+            level
+        }
+    };
+    [
+        mix(mix(c[0][0], c[1][0], fu), mix(c[2][0], c[3][0], fu), fv),
+        mix(mix(c[0][1], c[1][1], fu), mix(c[2][1], c[3][1], fu), fv),
+        mix(mix(z(0), z(1), fu), mix(z(2), z(3), fu), fv),
+    ]
+}
+
+/// Each lattice corner's normal, WoW axes: the cross of the central differences to its neighbours
+/// along both grid axes (one-sided at the edge), turned up. Corners MCLQ left as a height sentinel
+/// take `level`, as [`surface_point`] does.
+fn corner_normals(lq: &LiquidMesh, level: f32) -> Vec<[f32; 3]> {
+    let (cols, rows) = (lq.grid[0] as usize, lq.grid[1] as usize);
+    let at = |i: usize, j: usize| {
+        let p = lq.positions[j * cols + i];
+        Vec3::new(p[0], p[1], if p[2].abs() < 1.0e8 { p[2] } else { level })
+    };
+    let mut out = Vec::with_capacity(cols * rows);
+    for j in 0..rows {
+        for i in 0..cols {
+            let du = at((i + 1).min(cols - 1), j) - at(i.saturating_sub(1), j);
+            let dv = at(i, (j + 1).min(rows - 1)) - at(i, j.saturating_sub(1));
+            let n = du.cross(dv).normalize_or(Vec3::Z);
+            out.push((if n.z < 0.0 { -n } else { n }).to_array());
+        }
+    }
+    out
+}
+
+/// Stands in for "no waterline anywhere near this point" — most of any open water.
+///
+/// Deliberately only a few cells' worth, not a huge number. It is interpolated across the triangles
+/// that touch the shore, so the value chosen sets how steeply the coordinate climbs there, and the
+/// shader takes `fwidth` of it to anti-alias the foam edge. At 4096 that slope put `fwidth` in the
+/// hundreds of yards, the anti-aliasing width swamped the band it was meant to soften, and the foam
+/// smeared at half strength across the whole surface instead of drawing a line.
+const FAR_FROM_SHORE: f32 = 24.0;
+
+/// How finely a cell carrying the waterline is broken up for drawing.
+///
+/// This is what cures the "teeth". The foam is a band well under a yard across and the liquid
+/// lattice is 4.17 yards, so a distance carried only at the lattice corners cannot describe it:
+/// where the waterline passes between corners, none is near enough for any foam to appear at all,
+/// and where one happens to fall close the band swells to fill the triangle. Gap, blob, gap, blob.
+/// Splitting the cells the waterline actually crosses puts a corner every half yard along it, finer
+/// than the line being drawn, and the band becomes even. Only those cells pay for it.
+const SHORE_CELL_SUB: usize = 8;
+
+/// How near the waterline a cell must come, in yards, to earn that subdivision — comfortably past
+/// the foam's whole reach, so the band never ends up straddling a coarse cell.
+const SHORE_CELL_REACH: f32 = 5.0;
+
+/// Build the Bevy render mesh for one [`LiquidMesh`]: positions mapped WoW→Bevy (`lq.positions` are
+/// raw WoW coords — absolute for MCLQ, WMO-model-local for WMO liquid), a flat up normal, the tiling
+/// UVs, the per-vertex swatch `V` in UV1.x and the distance to the waterline in UV1.y. The caller
+/// decides the surface's world placement via the spawned entity's `Transform` (`IDENTITY` for
+/// absolute MCLQ water; the WMO placement transform for WMO liquid).
+///
+/// The triangles are emitted per wet cell rather than from `lq.indices`, because the cells along the
+/// waterline are subdivided ([`SHORE_CELL_SUB`]) and the rest are not. Sharing no vertices between
+/// cells costs a little memory and buys a uniform rule. It cannot crack: the water surface is
+/// bilinear, so a split edge's new points lie exactly on the coarse edge its neighbour draws.
+fn liquid_bevy_mesh(
+    lq: &LiquidMesh,
+    body_color: Option<[f32; 3]>,
+    lattice: Option<&WetLattice>,
+    planar: Option<&dyn WaterClasses>,
+    // Whether the spot ids are this batch's map's (ADT) and not a WMO placement's own.
+    bind_spots: bool,
+    shoreline: Option<&Shoreline>,
+) -> Mesh {
+    liquid_bevy_mesh_sub(lq, body_color, lattice, planar, bind_spots, shoreline, 1)
+}
+
+/// [`liquid_bevy_mesh`] with every open cell (one not on the waterline) split `open_sub` ways a
+/// side: the fine ring's mesh ([`LiquidFine`]) at [`fine_ring_sub`], the far one's at 1.
+fn liquid_bevy_mesh_sub(
+    lq: &LiquidMesh,
+    body_color: Option<[f32; 3]>,
+    lattice: Option<&WetLattice>,
+    planar: Option<&dyn WaterClasses>,
+    bind_spots: bool,
+    shoreline: Option<&Shoreline>,
+    open_sub: usize,
+) -> Mesh {
+    let (cols, rows) = (lq.grid[0] as usize, lq.grid[1] as usize);
+    let (xt, yt) = (cols.saturating_sub(1), rows.saturating_sub(1));
+    let (mut sum, mut cnt) = (0.0_f32, 0_u32);
+    for p in &lq.positions {
+        if p[2].abs() < 1.0e8 {
+            sum += p[2];
+            cnt += 1;
+        }
+    }
+    let level = if cnt > 0 { sum / cnt as f32 } else { 0.0 };
+
+    // Both sources answer for any point, not just a lattice corner, which is the whole reason the
+    // subdivision below is worth anything.
+    //
+    // `shore_at` returns the distance AND, when the traced contour is the nearer of the two, the
+    // offset to the point on it — see `benilla_assets::materials::ATTRIBUTE_WOW_SHORE_OFFSET`. The offset is
+    // what the band is actually drawn from; the distance stays for the far field, where nothing is
+    // drawn and a scalar is all anyone needs.
+    let shore_at = |x: f32, y: f32| -> (f32, [f32; 2]) {
+        let traced = shoreline.and_then(|s| s.nearest(x, y));
+        let edge = lattice.map_or(FAR_FROM_SHORE, |l| l.distance_to_dry(x, y));
+        match traced {
+            Some((p, d)) if d <= edge => (d, [p[0] - x, p[1] - y]),
+            // The grid's own edge won, or there is no traced contour here. It has no point to
+            // offer, so the offset is left at the distance along +X: past the near field the
+            // shader reads the scalar instead, and inside it the traced contour is what wins on
+            // every surface that has one.
+            _ => (traced.map_or(edge, |(_, d)| d.min(edge)), [edge, 0.0]),
+        }
+    };
+    let dist = |x: f32, y: f32| -> f32 { shore_at(x, y).0 };
+
+    let mut positions: Vec<[f32; 3]> = Vec::new();
+    let mut uvs: Vec<[f32; 2]> = Vec::new();
+    let mut uv1: Vec<[f32; 2]> = Vec::new();
+    let mut shore_offsets: Vec<[f32; 2]> = Vec::new();
+    let mut normals: Vec<[f32; 3]> = Vec::new();
+    let mut planar_w: Vec<[f32; 4]> = Vec::new();
+    let mut flows: Vec<[f32; 2]> = Vec::new();
+    let cell_water = planar.map(|p| p.cells(lq));
+    let mut indices: Vec<u32> = Vec::new();
+    let corner_n = corner_normals(lq, level);
+    let corner_w: Vec<f32> = lq
         .positions
         .iter()
-        .map(|p| wow_to_bevy(*p).to_array())
+        .map(|p| planar.map_or(1.0, |m| m.corner(p[0], p[1])))
         .collect();
+    let mix = |a: f32, b: f32, t: f32| a + (b - a) * t;
+
+    for j in 0..yt {
+        for i in 0..xt {
+            if !lq.wet[j * xt + i] {
+                continue;
+            }
+            let mid = surface_point(lq, level, i as f32 + 0.5, j as f32 + 0.5);
+            let sub = if dist(mid[0], mid[1]) < SHORE_CELL_REACH {
+                SHORE_CELL_SUB
+            } else {
+                open_sub.max(1)
+            };
+            let corner = [
+                j * cols + i,
+                j * cols + i + 1,
+                (j + 1) * cols + i,
+                (j + 1) * cols + i + 1,
+            ];
+            let base = positions.len() as u32;
+            for sj in 0..=sub {
+                for si in 0..=sub {
+                    let (fu, fv) = (si as f32 / sub as f32, sj as f32 / sub as f32);
+                    let p = surface_point(lq, level, i as f32 + fu, j as f32 + fv);
+                    positions.push(wow_to_bevy(p).to_array());
+                    let uv = |k: usize| lq.uvs[corner[k]];
+                    uvs.push([
+                        mix(mix(uv(0)[0], uv(1)[0], fu), mix(uv(2)[0], uv(3)[0], fu), fv),
+                        mix(mix(uv(0)[1], uv(1)[1], fu), mix(uv(2)[1], uv(3)[1], fu), fv),
+                    ]);
+                    let d = |k: usize| lq.depths[corner[k]];
+                    let (shore_d, shore_off) = shore_at(p[0], p[1]);
+                    uv1.push([mix(mix(d(0), d(1), fu), mix(d(2), d(3), fu), fv), shore_d]);
+                    // WoW's +X/+Y is Bevy's −Z/−X (`wow_to_bevy`), and this is a DIRECTION, so it
+                    // takes the same rotation without the translation: the shader adds it to a
+                    // Bevy world XZ.
+                    let off = wow_to_bevy([shore_off[0], shore_off[1], 0.0]);
+                    shore_offsets.push([off.x, off.z]);
+                    // The current, a direction and speed like the offset.
+                    let flow = planar.map_or([0.0, 0.0], |m| m.flow(p[0], p[1]));
+                    let flow = wow_to_bevy([flow[0], flow[1], 0.0]);
+                    flows.push([flow.x, flow.z]);
+                    // The smooth normal: the four corners' normals, blended like the position.
+                    let cn = |k: usize| corner_n[corner[k]];
+                    let blend = Vec3::from(cn(0))
+                        .lerp(Vec3::from(cn(1)), fu)
+                        .lerp(Vec3::from(cn(2)).lerp(Vec3::from(cn(3)), fu), fv);
+                    normals.push(wow_to_bevy(blend.normalize_or(Vec3::Z).to_array()).to_array());
+                    let cw = |k: usize| corner_w[corner[k]];
+                    let here = cell_water
+                        .as_ref()
+                        .and_then(|c| c.get(j * xt + i))
+                        .filter(|_| bind_spots);
+                    // The second spot's share at this vertex, so it runs smoothly across cells.
+                    let (lo, hi, share) = here.map_or((NO_SPOT, NO_SPOT, 0.0), |c| {
+                        let share = planar.map_or(c.mix, |m| m.mix_at(p[0], p[1], c));
+                        (c.spots[0], c.spots[1], share)
+                    });
+                    planar_w.push([
+                        mix(mix(cw(0), cw(1), fu), mix(cw(2), cw(3), fu), fv),
+                        f32::from(lo),
+                        f32::from(hi),
+                        share,
+                    ]);
+                }
+            }
+            let stride = (sub + 1) as u32;
+            for sj in 0..sub as u32 {
+                for si in 0..sub as u32 {
+                    let tl = base + sj * stride + si;
+                    let (tr, bl) = (tl + 1, tl + stride);
+                    indices.extend_from_slice(&[tl, bl, bl + 1, tl, bl + 1, tr]);
+                }
+            }
+        }
+    }
+
     let n = positions.len();
     let mut mesh = Mesh::new(
         PrimitiveTopology::TriangleList,
@@ -224,16 +952,52 @@ fn liquid_bevy_mesh(lq: &LiquidMesh, body_color: Option<[f32; 3]>) -> Mesh {
     mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
     // WoW up (0, 0, 1) is Bevy up (0, 1, 0).
     mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, vec![[0.0, 1.0, 0.0]; n]);
-    mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, lq.uvs.clone());
-    let uv1: Vec<[f32; 2]> = lq.depths.iter().map(|&d| [d, 0.0]).collect();
+    mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
     mesh.insert_attribute(Mesh::ATTRIBUTE_UV_1, uv1);
+    // The offset to the nearest point on the waterline, which the foam band is drawn from.
+    mesh.insert_attribute(
+        benilla_assets::materials::ATTRIBUTE_WOW_SHORE_OFFSET,
+        shore_offsets,
+    );
+    // The heightfield's smooth normal, for the stylised lane's reflections.
+    mesh.insert_attribute(
+        benilla_assets::materials::ATTRIBUTE_WOW_SURFACE_NORMAL,
+        normals,
+    );
+    // The mirrors' weight, 0 on probe water, and the probe spots read; see `ATTRIBUTE_WOW_PLANAR`.
+    mesh.insert_attribute(benilla_assets::materials::ATTRIBUTE_WOW_PLANAR, planar_w);
+    // The current the ripple is carried along; see `ATTRIBUTE_WOW_FLOW`.
+    mesh.insert_attribute(benilla_assets::materials::ATTRIBUTE_WOW_FLOW, flows);
     // An interior pool's `MOMT.diffColor` rides the vertex colour, where the reference's interior
     // vertex carries it, keeping one material per lane; other lanes take the shader's white.
     if let Some([red, green, blue]) = body_color {
         mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, vec![[red, green, blue, 1.0]; n]);
     }
-    mesh.insert_indices(Indices::U32(lq.indices.clone()));
+    mesh.insert_indices(Indices::U32(indices));
     mesh
+}
+
+/// One wet cell through [`liquid_bevy_mesh`], so it carries every liquid surface's vertex layout,
+/// with an interior pool's vertex colour when `body_color`: the pipeline warm pass's stand-in.
+pub fn warm_liquid_mesh(body_color: bool) -> Mesh {
+    let lq = LiquidMesh {
+        grid: [2, 2],
+        wet: vec![true],
+        shared: vec![false],
+        positions: vec![
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [1.0, 1.0, 0.0],
+        ],
+        uvs: vec![[0.0, 0.0]; 4],
+        depths: vec![0.0; 4],
+        indices: vec![0, 1, 2, 1, 3, 2],
+        sound_nibble: 0,
+        material_id: None,
+        kind: LiquidKind::Still,
+    };
+    liquid_bevy_mesh(&lq, body_color.then_some([1.0; 3]), None, None, false, None)
 }
 
 /// Spawn a WMO group's liquid surfaces at the building's placement `transform`, pushed onto
@@ -249,13 +1013,21 @@ pub(crate) fn spawn_wmo_liquids<'a>(
     pool: WmoPool,
     // The owning root's MOMT `diffColor` table: MOMT lives in the root, not the group file.
     material_diff_color: &[[f32; 3]],
+    // **The whole placement's** wet lattice, not this group's — see [`WetLattice`] and the note on
+    // the caller. A pool needs a lattice at all because its builder fills a single flat depth for
+    // the whole surface, which leaves the depth-field half of the shore distance with nothing to
+    // find; it needs the WHOLE model's because a WMO's liquid is not one grid.
+    lattice: Option<&WetLattice>,
+    // The whole placement's mirror classes, for the same reason as the lattice.
+    planar: Option<&dyn WaterClasses>,
     entities: &mut Vec<Entity>,
 ) {
     let Some(liquid) = liquid_assets else {
         return;
     };
     let path = LiquidPath::wmo(interior);
-    for lq in liquids {
+    let batch: Vec<&LiquidMesh> = liquids.collect();
+    for lq in batch {
         // The one path that can scroll, decided by the nibble, not the kind (`scrolls`).
         let scroll = scrolls(lq.sound_nibble);
         // The interior arm's body colour via the pool's MLIQ `materialId`; none when fullbright.
@@ -277,10 +1049,13 @@ pub(crate) fn spawn_wmo_liquids<'a>(
         }
         let surface = commands
             .spawn((
-                Mesh3d(meshes.add(liquid_bevy_mesh(lq, body_color))),
+                Mesh3d(meshes.add(liquid_bevy_mesh(
+                    lq, body_color, lattice, planar, false, None,
+                ))),
                 MeshMaterial3d(material),
                 transform,
                 LiquidSurface,
+                RenderLayers::layer(super::WATER_RENDER_LAYER),
                 // Bit 30 is the interior-fog lane (`liquid.wgsl`'s `room_fog`), written each frame
                 // by the `Visibility` authority off the pool's room; spawned clear.
                 bevy::mesh::MeshTag(0),
@@ -291,11 +1066,11 @@ pub(crate) fn spawn_wmo_liquids<'a>(
             ))
             .id();
         // Every kind carries the swim grid, so lava and slime swim; their damage is not modelled.
-        commands.entity(surface).insert(wet_footprint(
-            lq,
-            &transform,
-            LiquidSource::WmoGroup(pool),
-        ));
+        // The planes are voted in the pool's model space; the election reads world heights.
+        commands.entity(surface).insert(
+            wet_footprint(lq, &transform, LiquidSource::WmoGroup(pool))
+                .with_planes(planar.map(|p| world_planes(lq, &transform, p.planes(lq)))),
+        );
         if !lq.kind.is_fullbright() {
             commands.entity(surface).insert(FoamPatch);
         }
@@ -320,20 +1095,52 @@ const FRAME_SETS: &[(LiquidKind, &str, &str, u32)] = &[
     (LiquidKind::Slime, "slime", "slime", 30),
 ];
 
+/// The ripple map's seed. Arbitrary, and fixed: the map is generated at every startup, so a seed
+/// that moved would make two runs of the same scene two different pictures.
+pub(super) const RIPPLE_SEED: u32 = 0xB0A7_5EA5;
+
+/// The stylised look's one ripple map, shared by every liquid material: the handle a change to
+/// the image after setup goes through (its sampler; [`ripple::ripple_map`] keeps the CPU copy that
+/// a re-upload requires). Its [`ripple::RippleStats`] are a resource beside it.
+#[derive(Resource, Clone)]
+pub struct RippleMap {
+    pub image: Handle<Image>,
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(super) fn setup_liquid(
     mut commands: Commands,
     config: Option<Res<RenderConfig>>,
     world_assets: Option<ResMut<WorldAssets>>,
+    style: Res<WaterStyle>,
+    caps: Res<super::WaterPipelineCaps>,
+    pass: Option<Res<super::WaterPassImages>>,
     mut images: ResMut<Assets<Image>>,
     mut materials: ResMut<Assets<LiquidMaterial>>,
 ) {
-    let (Some(_config), Some(mut world_assets)) = (config, world_assets) else {
+    let (Some(_config), Some(mut world_assets), Some(pass)) = (config, world_assets, pass) else {
         return; // no client data → no terrain, so no water either
     };
+    let (style_flag, style_bits) = style_lanes(*style, *caps);
     // Light, fog and the water swatches come off the shared global-light buffer, as for terrain.
     let mut assets = LiquidAssets::default();
+    // The stylised look's ripple map: ONE generated 256² texture, shared by every liquid material
+    // and sampled only when `waterStyle` selects that look. Built here rather than lazily on the
+    // first flip because the binding is unconditional — a material cannot hold an empty texture
+    // slot — and because generating it costs a few milliseconds once, beside 150 BLP decodes. Its
+    // slope statistics feed the look rows' roughness table.
+    let (ripple_map, ripple_stats) = ripple::ripple_map(RIPPLE_SEED);
+    let ripples = images.add(ripple_map);
+    commands.insert_resource(ripple_stats);
+    commands.insert_resource(RippleMap {
+        image: ripples.clone(),
+    });
+    // The wave simulation's live field — one shared image too, and bound on every liquid material
+    // for the same reason the map above is: the binding cannot be conditional, so the toggle stays
+    // a uniform write rather than a material rebuild.
+    let wake = pass.wake.clone();
     for &(kind, dir, stem, count) in FRAME_SETS {
-        let Some((frames, frame_count)) =
+        let Some((frames, frame_count, mean_alpha)) =
             load_frame_array(&mut world_assets, &mut images, kind, dir, stem, count)
         else {
             warn!("liquid: no frames for {stem} — {kind:?} water will not render");
@@ -383,6 +1190,23 @@ pub(super) fn setup_liquid(
                 },
                 extension: LiquidExt {
                     frames: frames.clone(),
+                    ripples: ripples.clone(),
+                    reflection: pass.reflection.clone(),
+                    reflection2: pass.reflection2.clone(),
+                    reflection_chain: pass.reflection_chain.clone(),
+                    reflection_chain2: pass.reflection_chain2.clone(),
+                    scene_color: pass.scene_color.clone(),
+                    probe: pass.probe.clone(),
+                    hiz: pass.hiz.clone(),
+                    hiz_far: pass.hiz_far.clone(),
+                    scene_depth: pass.scene_depth.clone(),
+                    water_occl: pass.water_occl.clone(),
+                    floor_occ: pass.floor_occ.clone(),
+                    sky_lut: pass.sky_lut.clone(),
+                    shadow: pass.shadow.clone(),
+                    wake: wake.clone(),
+                    reflect_buf: pass.reflect_buf.clone(),
+                    glow_acc: pass.glow_acc.clone(),
                     // x = fullbright (the sheet as body, still fogged); y = the ocean swatch;
                     // z = the interior fog block; w = water's sun-sheen exponent.
                     kind: Vec4::new(
@@ -391,12 +1215,24 @@ pub(super) fn setup_liquid(
                         if path.interior_fog() { 1.0 } else { 0.0 },
                         WATER_SHININESS,
                     ),
-                    // Which of the reference's three liquid renderers `liquid.wgsl` runs.
-                    path: Vec4::new(path.shader_id(), 0.0, 0.0, 0.0),
-                    // x reserved; y = frame count; z = scroll; w = clock enable (0 on a
-                    // deterministic run: frame 0, scroll 0).
+                    // Which of the reference's three liquid renderers `liquid.wgsl` runs; the
+                    // stylised lane and its pipeline variants (both rewritten by
+                    // [`apply_water_style`]); magma rather than slime on the fullbright kinds,
+                    // and on water the authored rapids, which the preview's river terms read.
+                    path: Vec4::new(
+                        path.shader_id(),
+                        style_flag,
+                        if matches!(kind, LiquidKind::Magma | LiquidKind::Rapids) {
+                            1.0
+                        } else {
+                            0.0
+                        },
+                        style_bits,
+                    ),
+                    // x = the sheet's mean alpha, the stylised lane's lift; y = frame count;
+                    // z = scroll; w = clock enable (0 on a deterministic run: frame 0, scroll 0).
                     anim: Vec4::new(
-                        0.0,
+                        mean_alpha,
                         frame_count as f32,
                         if scroll { 1.0 } else { 0.0 },
                         if crate::dev_state::deterministic_run() {
@@ -424,8 +1260,61 @@ pub(super) fn setup_liquid(
     commands.insert_resource(assets);
 }
 
+/// The `path.y` and `path.w` lanes for a look: the stylised flag, and the pipeline variant bits on
+/// the stylised lane only (0 on the reference lane, whose pipeline has no variants).
+fn style_lanes(style: WaterStyle, caps: super::WaterPipelineCaps) -> (f32, f32) {
+    let bits = if style.is_stylised() {
+        caps.bits() as f32
+    } else {
+        0.0
+    };
+    (style.shader_flag(), bits)
+}
+
+/// Push the current [`WaterStyle`] and [`super::WaterPipelineCaps`] onto every liquid material's
+/// `path.y` and `path.w`: a uniform write, not a rebuild, change-gated on both resources.
+pub(super) fn apply_water_style(
+    style: Res<WaterStyle>,
+    caps: Res<super::WaterPipelineCaps>,
+    mut materials: ResMut<Assets<LiquidMaterial>>,
+) {
+    let (flag, bits) = style_lanes(*style, *caps);
+    for (_, material) in materials.iter_mut() {
+        material.extension.path.y = flag;
+        material.extension.path.w = bits;
+    }
+}
+
+/// Put [`super::RippleAniso`]'s clamp on the ripple map's sampler where it differs, and touch every
+/// liquid material: the modified image is re-extracted from its main-world copy to a new GPU
+/// texture and sampler, and a bind group built on the old one would keep sampling it.
+pub(super) fn apply_ripple_aniso(
+    aniso: Res<super::RippleAniso>,
+    map: Option<Res<RippleMap>>,
+    mut images: ResMut<Assets<Image>>,
+    mut materials: ResMut<Assets<LiquidMaterial>>,
+) {
+    let Some(map) = map else {
+        return;
+    };
+    let sampler = bevy::image::ImageSampler::Descriptor(ripple::ripple_sampler(aniso.0));
+    if images
+        .get(&map.image)
+        .is_none_or(|image| image.sampler == sampler)
+    {
+        return;
+    }
+    if let Some(image) = images.get_mut(&map.image) {
+        image.sampler = sampler;
+    }
+    // A mutable walk queues `AssetEvent::Modified` for every material, which rebuilds its bind
+    // group.
+    for _ in materials.iter_mut() {}
+}
+
 /// Decode frames `1..=count` with their authored mips into one repeating, anisotropic array,
-/// stopping at the first missing, non-square or mis-sized frame; returns it and the count loaded.
+/// stopping at the first missing, non-square or mis-sized frame; returns it, the count loaded and
+/// the loop's mean mip-0 alpha.
 fn load_frame_array(
     world_assets: &mut WorldAssets,
     images: &mut Assets<Image>,
@@ -433,7 +1322,7 @@ fn load_frame_array(
     dir: &str,
     stem: &str,
     count: u32,
-) -> Option<(Handle<Image>, u32)> {
+) -> Option<(Handle<Image>, u32, f32)> {
     let mut frames: Vec<BlpMipChain> = Vec::new();
     let mut size = 0u32;
     for i in 1..=count {
@@ -460,12 +1349,79 @@ fn load_frame_array(
     // mipping turns the shipped frames' drifting means into a flicker on distant water; magma and
     // slime keep theirs, the body's intended pulse.
     let normalize_dc = !kind.is_fullbright();
-    Some((images.add(liquid_frame_array(frames, normalize_dc)), loaded))
+    let (array, mean_alpha) = liquid_frame_array(frames, normalize_dc);
+    Some((images.add(array), loaded, mean_alpha))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A tier's clamp lands on the ripple map's sampler and touches the liquid materials, and the
+    /// same clamp again leaves both alone, so a steady state re-uploads and rebinds nothing.
+    #[test]
+    fn the_ripple_sampler_takes_the_tiers_anisotropy() {
+        use bevy::ecs::system::RunSystemOnce;
+        use bevy::image::ImageSampler;
+        let mut world = World::new();
+        let mut images = Assets::<Image>::default();
+        let (map, _) = ripple::ripple_map(RIPPLE_SEED);
+        let image = images.add(map);
+        world.insert_resource(images);
+        world.insert_resource(Assets::<LiquidMaterial>::default());
+        world.insert_resource(RippleMap {
+            image: image.clone(),
+        });
+        let clamp = |world: &World| match &world
+            .resource::<Assets<Image>>()
+            .get(&image)
+            .unwrap()
+            .sampler
+        {
+            ImageSampler::Descriptor(d) => d.anisotropy_clamp,
+            other => panic!("the ripple map lost its own sampler: {other:?}"),
+        };
+        let touched = |world: &World| {
+            world
+                .get_resource_change_ticks::<Assets<LiquidMaterial>>()
+                .unwrap()
+                .changed
+        };
+        // Each run on its own tick, so a write shows as a newer change tick.
+        let run = |world: &mut World| {
+            world.increment_change_tick();
+            world.run_system_once(apply_ripple_aniso).unwrap();
+        };
+        for n in [4, 1, 8] {
+            let before = touched(&world);
+            world.insert_resource(super::super::RippleAniso(n));
+            run(&mut world);
+            assert_eq!(clamp(&world), n);
+            assert_ne!(
+                touched(&world),
+                before,
+                "clamp {n} left the materials' bind groups"
+            );
+        }
+        let changed = |world: &World| {
+            world
+                .get_resource_change_ticks::<Assets<Image>>()
+                .unwrap()
+                .changed
+        };
+        let (before, materials) = (changed(&world), touched(&world));
+        run(&mut world);
+        assert_eq!(
+            changed(&world),
+            before,
+            "the same clamp re-uploaded the map"
+        );
+        assert_eq!(
+            touched(&world),
+            materials,
+            "the same clamp rebound the materials"
+        );
+    }
 
     #[test]
     fn only_nibbles_six_and_seven_scroll() {
@@ -558,6 +1514,8 @@ mod tests {
                     spawn_liquids(
                         &mut commands,
                         sheets.iter(),
+                        &[],
+                        None,
                         Some(&assets),
                         &mut meshes,
                         &mut ents,
@@ -583,6 +1541,66 @@ mod tests {
         assert!(!e.contains::<crate::wmo_portal::WmoGroupVis>());
         assert!(!e.contains::<crate::world_unit::WorldUnit>());
     }
+
+    /// The warm pass's stand-in carries every liquid surface's attributes, and the vertex colour
+    /// only when asked: its pipelines are the ones the world draws.
+    #[test]
+    fn the_warm_liquid_mesh_has_the_production_layout() {
+        use benilla_assets::materials::{
+            ATTRIBUTE_WOW_FLOW, ATTRIBUTE_WOW_PLANAR, ATTRIBUTE_WOW_SHORE_OFFSET,
+            ATTRIBUTE_WOW_SURFACE_NORMAL,
+        };
+        let lq = one_sheet([0.0, 0.0, 5.0]);
+        let production = liquid_bevy_mesh(&lq, None, None, None, false, None);
+        for body_color in [false, true] {
+            let warm = warm_liquid_mesh(body_color);
+            for attr in [
+                Mesh::ATTRIBUTE_POSITION,
+                Mesh::ATTRIBUTE_NORMAL,
+                Mesh::ATTRIBUTE_UV_0,
+                Mesh::ATTRIBUTE_UV_1,
+                ATTRIBUTE_WOW_SHORE_OFFSET,
+                ATTRIBUTE_WOW_SURFACE_NORMAL,
+                ATTRIBUTE_WOW_PLANAR,
+                ATTRIBUTE_WOW_FLOW,
+            ] {
+                assert!(warm.contains_attribute(attr), "{}", attr.name);
+                assert!(production.contains_attribute(attr), "{}", attr.name);
+            }
+            assert_eq!(warm.contains_attribute(Mesh::ATTRIBUTE_COLOR), body_color);
+            assert_eq!(
+                warm.attributes().count(),
+                production.attributes().count() + usize::from(body_color)
+            );
+        }
+    }
+
+    /// The mesh is built per wet cell, so every attribute has one entry per emitted vertex and
+    /// none is the lattice's own count; bevy truncates a mesh whose attributes disagree.
+    #[test]
+    fn every_liquid_mesh_attribute_has_one_entry_per_vertex() {
+        let mut lq = one_sheet([0.0, 0.0, 5.0]);
+        lq.grid = [3, 3];
+        lq.wet = vec![true; 4];
+        lq.shared = vec![false; 4];
+        lq.positions = (0..9)
+            .map(|k| [(k % 3) as f32 * 4.0, (k / 3) as f32 * 4.0, 5.0])
+            .collect();
+        lq.uvs = vec![[0.0, 0.0]; 9];
+        lq.depths = vec![1.0; 9];
+        let mesh = liquid_bevy_mesh(&lq, Some([1.0, 1.0, 1.0]), None, None, false, None);
+        let n = mesh.count_vertices();
+        assert_eq!(n, 16, "four wet cells, four corners each");
+        for (attr, values) in mesh.attributes() {
+            assert_eq!(
+                values.len(),
+                n,
+                "{} has {} entries",
+                attr.name,
+                values.len()
+            );
+        }
+    }
 }
 
 /// The scroll and fog-block rules against the real client files.
@@ -591,6 +1609,28 @@ mod real_data {
     use super::LiquidKind;
     use benilla_formats::{parse_wmo_root, wmo_group_liquid_mesh};
     use std::collections::HashMap;
+
+    /// The water sheets' loop-mean alpha, the stylised lane's lift (`anim.x`): `lake_a` 0.213,
+    /// `ocean_h` 0.223 and `fast_a` opaque, after the DC pass.
+    #[test]
+    fn the_water_sheets_mean_alpha_is_measured_at_load() {
+        let data = benilla_formats::wow_data_or_skip!();
+        let mut chain = benilla_formats::open_chain(&data).expect("open chain");
+        for (stem, want) in [("lake_a", 0.213), ("ocean_h", 0.223), ("fast_a", 1.0)] {
+            let &(_, dir, _, count) = super::FRAME_SETS
+                .iter()
+                .find(|s| s.2 == stem)
+                .expect("a frame set");
+            let frames: Vec<_> = (1..=count)
+                .map(|i| {
+                    let path = format!("XTextures\\{dir}\\{stem}.{i}.blp");
+                    super::read_texture_mip_chain(&mut chain, &path).expect("frame readable")
+                })
+                .collect();
+            let (_, mean) = benilla_assets::liquid_frame_array(frames, true);
+            assert!((mean - want).abs() < 0.0015, "{stem}: {mean}");
+        }
+    }
 
     /// The scroll gate over the shipped pools, where both behaviours share buildings: Ironforge has
     /// 9 static nibble-2 and 2 scrolling nibble-6 magma groups, Blackrock is nibble 6 throughout,

@@ -1,0 +1,26 @@
+# wg-darrowmere: Darrowmere Lake under the Plaguelands' red fog; a near doodad crosses the left
+# third. The far water meets the fog at y 460-466 (x 800-1200; the far box holds it, its rows read
+# each column's own waterline). Flake: a speck of terrain at x463-488 y797-822 lands in one of two
+# states.
+scene = "water-darrowmere"
+[box]
+water = [800, 600, 1600, 900]
+far = [800, 430, 1200, 500]
+[[row]]
+metric = "deep_hue"
+box = "water"
+[[row]]
+metric = "deep_luma"
+box = "water"
+[[row]]
+metric = "deep_chroma"
+box = "water"
+[[row]]
+metric = "horizon_step"
+box = "far"
+[[row]]
+metric = "far_over_land"
+box = "far"
+[[row]]
+metric = "lum_vs_ref"
+box = "water"

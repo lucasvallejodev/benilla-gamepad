@@ -1,0 +1,28 @@
+# wg-swamp-sorrows: murky swamp water in the Swamp of Sorrows under an orange fog; the far water
+# meets the fog at y 457-466 (x 550-850; the far box holds it, its rows read each column's own
+# waterline). Flake: x360-390 y460-476 moves by up to 3 codes run to run.
+scene = "water-swamp-sorrows"
+[box]
+water = [400, 600, 1100, 850]
+far = [550, 430, 850, 500]
+# P1-27 holds the deep hue within 10° of the albedo view, judged under P1-35's light (R-E3).
+[[row]]
+metric = "deep_hue"
+box = "water"
+[[row]]
+metric = "deep_luma"
+box = "water"
+[[row]]
+metric = "deep_chroma"
+box = "water"
+[[row]]
+metric = "horizon_step"
+box = "far"
+[[row]]
+metric = "lum_vs_ref"
+box = "water"
+# The bands (P1-27) against the albedo view with the bands off, ~unbanded@albedo: what they add
+# to the scene's own edges (R-E3).
+[[row]]
+metric = "band_step"
+box = "water"

@@ -943,6 +943,14 @@ fn session_values(world: &World) -> Vec<(&'static str, Option<String>)> {
         let v = world.get_resource::<crate::world_backdrop::RenderScale>();
         out.push(("renderScale", v.map(|r| r.0.to_string())));
     }
+    if set("WOW_WATER_STYLE") {
+        let v = world.get_resource::<benilla_world::liquid::WaterStyle>();
+        out.push(("waterStyle", v.map(|w| w.cvar().to_string())));
+    }
+    if set("WOW_WATER_QUALITY") {
+        let v = world.get_resource::<benilla_world::liquid::WaterQuality>();
+        out.push(("waterQuality", v.map(|q| q.cvar().to_string())));
+    }
     // `$WOW_HOST` is the session's realmlist, which a test run must never write into the file.
     if set("WOW_HOST") {
         let v = world.get_resource::<crate::realmlist::Realmlist>();
@@ -1609,6 +1617,16 @@ mod tests {
         assert_eq!(d["boothHalfRate"] != 0.0, PaneRate::default().half);
         // Every visual golden assumes a 1:1 backdrop.
         assert_eq!(d["renderScale"], 1.0);
+        // The reference's water.
+        assert_eq!(
+            benilla_world::liquid::WaterStyle::from_cvar(d["waterStyle"]),
+            benilla_world::liquid::WaterStyle::Reference
+        );
+        // Improved Water's default tier.
+        assert_eq!(
+            benilla_world::liquid::WaterQuality::from_cvar(d["waterQuality"]),
+            benilla_world::liquid::WaterQuality::Medium
+        );
     }
 
     /// The FFX pass's three switches reach it one by one (`ffx`, `ffxGlow`, `ffxDeath`).
@@ -1811,6 +1829,24 @@ mod tests {
         assert!(!res::<crate::perf::FpsJournalSetting>(&app).0);
         apply(&mut app, "fpsJournal", "1");
         assert!(res::<crate::perf::FpsJournalSetting>(&app).0);
+        {
+            use benilla_world::liquid::WaterStyle;
+            for (value, want) in [("1", WaterStyle::Stylised), ("0", WaterStyle::Reference)] {
+                apply(&mut app, "waterStyle", value);
+                assert_eq!(*res::<WaterStyle>(&app), want);
+                assert_eq!(res::<WaterStyle>(&app).cvar(), value);
+            }
+            use benilla_world::liquid::WaterQuality;
+            for (value, want) in [
+                ("2", WaterQuality::High),
+                ("0", WaterQuality::Low),
+                ("1", WaterQuality::Medium),
+            ] {
+                apply(&mut app, "waterquality", value);
+                assert_eq!(*res::<WaterQuality>(&app), want);
+                assert_eq!(res::<WaterQuality>(&app).cvar(), value);
+            }
+        }
         apply(&mut app, "fpsjournal", "0");
         assert!(!res::<crate::perf::FpsJournalSetting>(&app).0);
         assert!(res::<SoundConfig>(&app).liquid_sounds);
@@ -2863,6 +2899,10 @@ mod tests {
             .init_resource::<crate::combat_text::DamageTextGates>()
             .init_resource::<crate::ui_chat::combat::LogPeriodicSpells>()
             .init_resource::<benilla_world::weather::WeatherState>()
+            // Literal: `WaterStyle::default()` reads `$WOW_WATER_STYLE`.
+            .insert_resource(benilla_world::liquid::WaterStyle::Reference)
+            // Literal: `WaterQuality::default()` reads `$WOW_WATER_QUALITY`.
+            .insert_resource(benilla_world::liquid::WaterQuality::Medium)
             .init_resource::<benilla_world::particles::ParticleTuning>()
             .init_resource::<crate::video::SpellEffectLevel>()
             .init_resource::<crate::video::Widescreen>()

@@ -140,6 +140,8 @@ pub(super) fn setup_lighting(
         water_ocean: atmo.water_ocean,
         water_river_alpha: atmo.water_river_alpha,
         water_ocean_alpha: atmo.water_ocean_alpha,
+        // The seed is the clear, dry noon already.
+        water_noon: water_swatches(&atmo),
         glow: quantize_glow(atmo.glow),
         sky_warp: daynight::sky_warp(720.0, atmo.highlight_sky),
         sun_disc_scale: daynight::sun_disc_scale(720.0),
@@ -160,12 +162,140 @@ pub(super) fn setup_lighting(
     });
 }
 
+/// The water swatch `(shallow, deep, shallow alpha, deep alpha)` of an atmosphere, river then
+/// ocean, as [`WowLighting::water_colors`] reads it.
+fn water_swatches(atmo: &Atmosphere) -> [([f32; 3], [f32; 3], f32, f32); 2] {
+    let swatch = |rgb: [[f32; 3]; 2], a: [f32; 2]| (rgb[0], rgb[1], a[0], a[1]);
+    [
+        swatch(atmo.water_river, atmo.water_river_alpha),
+        swatch(atmo.water_ocean, atmo.water_ocean_alpha),
+    ]
+}
+
+/// How far the eye moves before the noon swatch is sampled again, in yards.
+const NOON_RESAMPLE_YD: f32 = 1.0;
+
+/// The noon swatch of [`WowLighting::water_colors_noon`] and the map and eye it was sampled at.
+pub(super) struct NoonSwatch {
+    map: u32,
+    at: [f32; 3],
+    rows: [([f32; 3], [f32; 3], f32, f32); 2],
+}
+
+impl NoonSwatch {
+    /// The clear, dry noon swatch at `wow_pos` on `map` (the area blend `setup_lighting` seeds
+    /// with), reused while the map is the same and the eye within [`NOON_RESAMPLE_YD`] of it.
+    fn rows(
+        cache: &mut Option<Self>,
+        catalog: Option<&LightCatalog>,
+        map: u32,
+        wow_pos: [f32; 3],
+    ) -> [([f32; 3], [f32; 3], f32, f32); 2] {
+        let near = |c: &Self| {
+            let d: f32 = (0..3).map(|i| (c.at[i] - wow_pos[i]).powi(2)).sum();
+            c.map == map && d < NOON_RESAMPLE_YD * NOON_RESAMPLE_YD
+        };
+        if let Some(c) = cache.as_ref().filter(|c| near(c)) {
+            return c.rows;
+        }
+        let atmo = catalog.map_or(Atmosphere::DEFAULT, |c| {
+            c.sample_blended(
+                map,
+                wow_pos,
+                1440,
+                false,
+                benilla_formats::Submersion::Dry,
+                false,
+            )
+        });
+        let rows = water_swatches(&atmo);
+        *cache = Some(Self {
+            map,
+            at: wow_pos,
+            rows,
+        });
+        rows
+    }
+}
+
 /// The reference's HSV value-only scale (`0x6d1620`: RGB to HSV `0x7bbc80`, V × f, HSV to RGB
 /// `0x7bbd60`), used by the ocean depth ramp. With H and S fixed it scales every channel by `f`,
 /// so it is exactly a plain multiply. Deviation: no 8-bit repack (`×255 + 512 >> 14`), because
 /// this light lane is float end to end.
 fn hsv_value_scale(c: [f32; 3], f: f32) -> [f32; 3] {
     [c[0] * f, c[1] * f, c[2] * f]
+}
+
+/// The dry atmosphere while the eye is under water, for the Improved Water preview's view from
+/// below (Snell's window, the waterline): the zone's dry sky stops, fog and sun colour, which the
+/// underwater `LightParams` slot replaces in [`WowLighting`]; a copy of the resolved ones while dry
+/// or with the preview off. The `wet_*` fog is the one the frame is drawn with.
+#[derive(Resource, Clone, Copy, Default, PartialEq)]
+pub struct DrySky {
+    pub sky_zenith: [f32; 3],
+    pub sky_horizon: [f32; 3],
+    pub fog_color: [f32; 3],
+    pub fog_start: f32,
+    pub fog_end: f32,
+    pub sun_color: [f32; 3],
+    pub wet_fog_color: [f32; 3],
+    pub wet_fog_start: f32,
+    pub wet_fog_end: f32,
+}
+
+/// [`DrySky`]: a second `Light.dbc` blend on the dry slot (with the storm lerp) while submerged.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn update_dry_sky(
+    sampler: Option<Res<LightSampler>>,
+    current_map: Option<Res<CurrentMap>>,
+    cam: Query<&GlobalTransform, With<WorldCamera>>,
+    clock: Res<GameClock>,
+    eye_liquid: crate::liquid::EyeLiquid,
+    viewer: Res<crate::view::Viewer>,
+    weather: Option<Res<crate::weather::WeatherState>>,
+    view: Res<crate::view::ViewDistance>,
+    lighting: Res<WowLighting>,
+    mut dry: ResMut<DrySky>,
+) {
+    let mut next = DrySky {
+        sky_zenith: lighting.sky[0],
+        sky_horizon: lighting.sky[4],
+        fog_color: lighting.fog_color,
+        fog_start: lighting.fog_start,
+        fog_end: lighting.fog_end,
+        sun_color: lighting.spec,
+        wet_fog_color: lighting.fog_color,
+        wet_fog_start: lighting.fog_start,
+        wet_fog_end: lighting.fog_end,
+    };
+    if eye_liquid.submersion().any() && benilla_assets::preview::any() {
+        if let (Some(s), Ok(t)) = (sampler.as_ref(), cam.single()) {
+            let wow_pos = bevy_to_wow(t.translation());
+            let map = current_map.as_ref().map_or(0, |m| m.0);
+            let storm = weather
+                .as_ref()
+                .map_or(0.0, |w| crate::weather::storm_blend(w.sky_density));
+            let dry_slot = benilla_formats::Submersion::Dry;
+            let at = clock.minute * 2;
+            let clear =
+                s.0.sample_blended(map, wow_pos, at, false, dry_slot, viewer.ghost);
+            let atmo = if storm > 0.0 {
+                let stormy =
+                    s.0.sample_blended(map, wow_pos, at, true, dry_slot, viewer.ghost);
+                clear.lerp(&stormy, storm)
+            } else {
+                clear
+            };
+            let (fog_start, fog_end) = scene_fog(atmo.fog_end, atmo.fog_start_frac, view.farclip);
+            next.sky_zenith = atmo.sky[0];
+            next.sky_horizon = atmo.sky[4];
+            next.fog_color = atmo.fog_color;
+            next.fog_start = fog_start;
+            next.fog_end = fog_end;
+            next.sun_color = atmo.sun_color;
+        }
+    }
+    dry.set_if_neq(next);
 }
 
 pub(super) fn update_time_lighting(
@@ -183,8 +313,8 @@ pub(super) fn update_time_lighting(
     mut wmo_ramp: ResMut<WmoCrossfade>,
     mut clock: ResMut<GameClock>,
     mut lighting: ResMut<WowLighting>,
-    mut last_dump: Local<Option<u32>>,
-    mut last_fog_dump: Local<Option<u32>>,
+    (mut last_dump, mut last_fog_dump): (Local<Option<u32>>, Local<Option<u32>>),
+    mut noon: Local<Option<NoonSwatch>>,
 ) {
     // `minute` drives the `Light.dbc` sample, the clock and the log; the fractional `minute_f`
     // drives the celestial positions and curves, which would otherwise step once per game minute.
@@ -293,6 +423,7 @@ pub(super) fn update_time_lighting(
         water_ocean: atmo.water_ocean,
         water_river_alpha: atmo.water_river_alpha,
         water_ocean_alpha: atmo.water_ocean_alpha,
+        water_noon: NoonSwatch::rows(&mut noon, sampler.as_ref().map(|s| &s.0), map, wow_pos),
         glow: quantize_glow(atmo.glow),
         sky_warp: daynight::sky_warp(minute_f, atmo.highlight_sky),
         sun_disc_scale: daynight::sun_disc_scale(minute_f),
@@ -489,6 +620,86 @@ mod tests {
         let (c2, s2, e2) = ramp.blend(None, scene.0, scene.1, scene.2, 1100.0, 2.0);
         assert_eq!((c2, s2, e2), scene);
         assert!(ramp.staged.is_none(), "latch releases at t = 0");
+    }
+
+    /// The resolve at `minute` on the manual clock, clear and dry at the spawn point (no camera);
+    /// the resolved light.
+    fn resolve_at(app: &mut App, minute: u32) -> WowLighting {
+        use bevy::ecs::system::RunSystemOnce;
+        {
+            let mut debug = app.world_mut().resource_mut::<DebugState>();
+            debug.lighting.follow_server_time = false;
+            debug.lighting.manual_minute = minute;
+        }
+        app.world_mut()
+            .run_system_once(update_time_lighting)
+            .expect("the resolve runs");
+        *app.world().resource::<WowLighting>()
+    }
+
+    /// The noon swatch is the swatch the resolve paints at noon, clear and dry, and it stays the
+    /// noon one at dusk, where the current swatch moves.
+    #[test]
+    fn the_noon_swatch_is_the_swatch_at_noon() {
+        use benilla_formats::LiquidKind;
+        let data = benilla_formats::wow_data_or_skip!();
+        let mut chain = benilla_formats::open_chain(&data).expect("open the install");
+        let catalog = LightCatalog::load(&mut chain).expect("load Light/LightParams/*Band");
+        let mut app = App::new();
+        app.insert_resource(LightSampler(catalog))
+            .init_resource::<super::super::WorldTime>()
+            .insert_resource(DebugState::default())
+            .init_resource::<crate::view::Viewer>()
+            .init_resource::<crate::view::ViewDistance>()
+            .init_resource::<Time>()
+            .init_resource::<crate::wmo_portal::CameraWmoFog>()
+            .init_resource::<WmoCrossfade>()
+            .init_resource::<GameClock>()
+            .init_resource::<WowLighting>();
+        let noon = resolve_at(&mut app, 720);
+        for kind in [LiquidKind::Still, LiquidKind::Ocean] {
+            assert_eq!(
+                noon.water_colors_noon(kind),
+                noon.water_colors(kind),
+                "{kind:?}"
+            );
+        }
+        let dusk = resolve_at(&mut app, 1180);
+        let moved = [LiquidKind::Still, LiquidKind::Ocean]
+            .iter()
+            .any(|&k| dusk.water_colors(k) != noon.water_colors(k));
+        assert!(
+            moved,
+            "the swatch at 19:40 is the noon one: the control cannot fail"
+        );
+        for kind in [LiquidKind::Still, LiquidKind::Ocean] {
+            assert_eq!(
+                dusk.water_colors_noon(kind),
+                noon.water_colors(kind),
+                "{kind:?}"
+            );
+        }
+    }
+
+    /// The noon sample is reused within a yard of where it was taken on the same map, and taken
+    /// again past it or on another map: a sampler-less call returns the default swatch only when
+    /// it samples.
+    #[test]
+    fn the_noon_swatch_is_resampled_past_a_yard_or_on_another_map() {
+        let data = benilla_formats::wow_data_or_skip!();
+        let mut chain = benilla_formats::open_chain(&data).expect("open the install");
+        let catalog = LightCatalog::load(&mut chain).expect("load Light/LightParams/*Band");
+        let at = [SPAWN_XY.0, SPAWN_XY.1, 83.5];
+        let fallback = water_swatches(&Atmosphere::DEFAULT);
+        let mut cache = None;
+        let sampled = NoonSwatch::rows(&mut cache, Some(&catalog), 0, at);
+        assert_ne!(sampled, fallback, "the control cannot fail");
+        let near = [at[0] + 0.6, at[1] - 0.6, at[2]];
+        assert_eq!(NoonSwatch::rows(&mut cache, None, 0, near), sampled);
+        assert_eq!(NoonSwatch::rows(&mut cache, None, 1, at), fallback);
+        NoonSwatch::rows(&mut cache, Some(&catalog), 0, at);
+        let far = [at[0] + 0.8, at[1] - 0.8, at[2]];
+        assert_eq!(NoonSwatch::rows(&mut cache, None, 0, far), fallback);
     }
 
     /// A record end past the farclip commits the farclip (`0x6cef43` against `[0xce9b94]`), and

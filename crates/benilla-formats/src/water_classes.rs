@@ -1,0 +1,76 @@
+//! Which water the planar mirrors serve, which the cube probes do and which way it runs, per
+//! 4.17-yd liquid cell: the shape the improved water's classification hands the base liquid code,
+//! which bakes it into the surface meshes and the mirror election without knowing how it was
+//! decided.
+
+use crate::LiquidMesh;
+
+/// No probe spot.
+pub const NO_SPOT: u16 = u16::MAX;
+
+/// One cell's answer.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CellWater {
+    /// The mirror plane it votes, NaN where it votes none (probe water, magma).
+    pub plane: f32,
+    /// How far the mirrors serve it, 0 (probe water) to 1.
+    pub weight: f32,
+    /// The probe spots it reads, lower id first, [`NO_SPOT`] where none.
+    pub spots: [u16; 2],
+    /// The second spot's share, 0 to 1.
+    pub mix: f32,
+    /// The current, WoW X and Y in yards a second: downstream, zero on still water.
+    pub flow: [f32; 2],
+}
+
+impl CellWater {
+    /// No water here, or none the classification touches.
+    pub const DRY: CellWater = CellWater {
+        plane: f32::NAN,
+        weight: 1.0,
+        spots: [NO_SPOT, NO_SPOT],
+        mix: 0.0,
+        flow: [0.0, 0.0],
+    };
+}
+
+/// A fixed probe spot: where a probe stands for its region.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ProbeSpot {
+    /// Position on the water, in the batch's coordinates (absolute WoW yards for a map).
+    pub at: [f32; 3],
+}
+
+/// A map's (or a WMO placement's) water classification.
+pub trait WaterClasses: Send + Sync + 'static {
+    /// Per cell of `lq`, its answer; [`CellWater::DRY`] where there is none.
+    fn cells(&self, lq: &LiquidMesh) -> Vec<CellWater>;
+
+    /// The answer for the cell holding WoW `(x, y)`, `None` where the classification holds no
+    /// record for it. A dry cell can answer a wet record: a chunk classified whole gives every
+    /// cell in it that chunk's answer.
+    fn cell(&self, x: f32, y: f32) -> Option<CellWater>;
+
+    /// The mirrors' weight at a lattice corner, 1 with no water there.
+    fn corner(&self, x: f32, y: f32) -> f32;
+
+    /// The probe spots, indexed by the ids cells carry.
+    fn spots(&self) -> &[ProbeSpot];
+
+    /// The second spot's share at WoW `(x, y)` in a cell reading `cell`'s spots: the cell's own
+    /// `mix` unless the classification can say it continuously across the cell.
+    fn mix_at(&self, _x: f32, _y: f32, cell: &CellWater) -> f32 {
+        cell.mix
+    }
+
+    /// The current at WoW `(x, y)`, yards a second, blended between the cells around it; zero
+    /// with no water there.
+    fn flow(&self, _x: f32, _y: f32) -> [f32; 2] {
+        [0.0, 0.0]
+    }
+
+    /// Per cell of `lq`, the mirror plane it votes, NaN where none.
+    fn planes(&self, lq: &LiquidMesh) -> Vec<f32> {
+        self.cells(lq).iter().map(|c| c.plane).collect()
+    }
+}

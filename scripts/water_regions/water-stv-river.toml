@@ -1,0 +1,22 @@
+# wg-stv-river: Stranglethorn's rapids from the bank, looking upstream under a bridge; the channel
+# runs diagonally from the lower middle (y 900) to the upper right (y 300).
+scene = "water-stv-river"
+[box]
+water = [600, 450, 1300, 700]
+# The transmittance and Fresnel cuts leave no deep water at this pose: the deep hue reads n/a.
+[[row]]
+metric = "deep_hue"
+box = "water"
+[[row]]
+metric = "luma_sd"
+box = "water"
+[[row]]
+metric = "lum_vs_ref"
+box = "water"
+# No neon (R26): the in-scatter view keeps the albedo view's chroma per pixel, 0.8-1.2x, under the
+# body's own colour-limited light (R-E3).
+[[row]]
+metric = "chroma_ratio"
+label = "no_neon_chroma"
+box = "water"
+require = { p1 = { min = 0.8 }, p99 = { max = 1.2 } }

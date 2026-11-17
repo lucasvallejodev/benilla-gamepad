@@ -9,7 +9,7 @@ use bevy::mesh::{Indices, MeshTag, PrimitiveTopology};
 use bevy::prelude::*;
 use bevy::render::render_resource::Buffer;
 
-use benilla_assets::materials::{LiquidMaterial, WowModelMaterial};
+use benilla_assets::materials::{LiquidKey, LiquidMaterial, WowModelMaterial};
 use benilla_world::clouds::CloudMaterial;
 use benilla_world::model_render::{
     far_twin_of, model_material, zfill_material, MaterialCache, ShadeSel,
@@ -35,6 +35,8 @@ pub(super) struct WarmLanes<'w> {
     clouds: ResMut<'w, Assets<CloudMaterial>>,
     sky: ResMut<'w, Assets<SkyMaterial>>,
     liquid: ResMut<'w, Assets<LiquidMaterial>>,
+    /// The liquid variants a water plugin asks for, which pick the shipped liquid keys.
+    liquid_caps: Res<'w, benilla_world::liquid::WaterPipelineCaps>,
     /// For representatives of the on-demand nameplate and raid-mark materials.
     standard: ResMut<'w, Assets<StandardMaterial>>,
     /// The fallback cube: production mesh + materials, drawn while a model streams.
@@ -65,6 +67,7 @@ pub(super) fn spawn_menagerie(
     booth: Option<(Entity, &bevy::camera::visibility::RenderLayers)>,
     warm_booth: &(Entity, bevy::camera::visibility::RenderLayers),
     warm_ortho: &(Entity, bevy::camera::visibility::RenderLayers),
+    warm_mirror: &(Entity, bevy::camera::visibility::RenderLayers),
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<WowModelMaterial>,
     lanes: &mut WarmLanes,
@@ -351,6 +354,19 @@ pub(super) fn spawn_menagerie(
                 mat,
             );
             count += 1;
+            // …and the mirrored view. Until this camera existed the model cross was covered for
+            // that key only because a portrait booth happens to share it; stated here rather than
+            // inherited, so a change to `booth_view_shape()` cannot quietly take it away.
+            spawn_model_rig(
+                commands,
+                warm_mirror.0,
+                Some(warm_mirror.1.clone()),
+                mesh,
+                aabb,
+                *skinned,
+                mat,
+            );
+            count += 1;
         }
         for mat in &mats {
             spawn_model_rig(
@@ -448,14 +464,14 @@ pub(super) fn spawn_menagerie(
     let (plain_mesh, plain_aabb, _) = layouts[0].clone();
     let (colours_mesh, colours_aabb, _) = layouts[2].clone();
     let posuv = meshes.add(warm_pos_uv_mesh());
-    let liquid_mesh = meshes.add(warm_liquid_mesh(false));
-    let liquid_color_mesh = meshes.add(warm_liquid_mesh(true));
+    let liquid_mesh = meshes.add(benilla_world::liquid::warm_liquid_mesh(false));
+    let liquid_color_mesh = meshes.add(benilla_world::liquid::warm_liquid_mesh(true));
     // Celestial discs and glares (`sun::setup` quads: position, normal, UV).
     for mat in lane_handles(&mut lanes.celestial) {
-        spawn_lane_rig(
+        spawn_lane_rig_both(
             commands,
             cam,
-            None,
+            warm_mirror,
             &plain_mesh,
             plain_aabb.as_ref(),
             mat,
@@ -464,11 +480,19 @@ pub(super) fn spawn_menagerie(
     }
     // Stars: `Stars.m2` patches carry position and UV; the assetless fallback adds normals.
     for mat in lane_handles(&mut lanes.stars) {
-        spawn_lane_rig(commands, cam, None, &posuv, None, mat.clone(), &mut count);
-        spawn_lane_rig(
+        spawn_lane_rig_both(
             commands,
             cam,
+            warm_mirror,
+            &posuv,
             None,
+            mat.clone(),
+            &mut count,
+        );
+        spawn_lane_rig_both(
+            commands,
+            cam,
+            warm_mirror,
             &plain_mesh,
             plain_aabb.as_ref(),
             mat,
@@ -477,10 +501,10 @@ pub(super) fn spawn_menagerie(
     }
     // The cloud dome (position, normal, UV, colour) and the gradient dome (without colour).
     for mat in lane_handles(&mut lanes.clouds) {
-        spawn_lane_rig(
+        spawn_lane_rig_both(
             commands,
             cam,
-            None,
+            warm_mirror,
             &colours_mesh,
             colours_aabb.as_ref(),
             mat,
@@ -488,38 +512,29 @@ pub(super) fn spawn_menagerie(
         );
     }
     for mat in lane_handles(&mut lanes.sky) {
-        spawn_lane_rig(
+        spawn_lane_rig_both(
             commands,
             cam,
-            None,
+            warm_mirror,
             &plain_mesh,
             plain_aabb.as_ref(),
             mat,
             &mut count,
         );
     }
-    // Liquid: every material on both grid layouts. An interior WMO pool bakes `MOMT.diffColor`
-    // into `ATTRIBUTE_COLOR`, read behind `#ifdef VERTEX_COLORS` (`liquid.wgsl:275`), a separate
-    // pipeline.
-    for mat in lane_handles(&mut lanes.liquid) {
-        spawn_lane_rig(
-            commands,
-            cam,
-            None,
-            &liquid_mesh,
-            None,
-            mat.clone(),
-            &mut count,
-        );
-        spawn_lane_rig(
-            commands,
-            cam,
-            None,
-            &liquid_color_mesh,
-            None,
-            mat,
-            &mut count,
-        );
+    // Liquid: every material under each shipped key it can take, on the production layout with
+    // and without an interior WMO pool's `MOMT.diffColor` in `ATTRIBUTE_COLOR` (read behind
+    // `#ifdef VERTEX_COLORS`, a separate pipeline). World camera only: liquid sits on
+    // `WATER_RENDER_LAYER`, which the mirror excludes.
+    let shipped = LiquidKey::shipped(
+        lanes.liquid_caps.glow,
+        lanes.liquid_caps.dual_source,
+        lanes.liquid_caps.painted,
+    );
+    for mat in liquid_variants(&mut lanes.liquid, shipped) {
+        for mesh in [&liquid_mesh, &liquid_color_mesh] {
+            spawn_lane_rig(commands, cam, None, mesh, None, mat.clone(), &mut count);
+        }
     }
     // The plain-`StandardMaterial` lanes. The fallback cube, drawn while a model streams, goes on
     // the world camera and the booths but not the tile camera, as `ui_models` has no cube. The
@@ -634,12 +649,77 @@ fn far_twins_of(
     twins.into_iter().map(|m| materials.add(m)).collect()
 }
 
+/// A sky/water lane rig on the world camera and on the warm mirror, which disagree on
+/// `MULTISAMPLED` with MSAA on and so need a pipeline each; with MSAA off their keys are one.
+fn spawn_lane_rig_both<M: Material>(
+    commands: &mut Commands,
+    cam: Entity,
+    mirror: &(Entity, bevy::camera::visibility::RenderLayers),
+    mesh: &Handle<Mesh>,
+    aabb: Option<&bevy::camera::primitives::Aabb>,
+    mat: Handle<M>,
+    count: &mut usize,
+) {
+    spawn_lane_rig(commands, cam, None, mesh, aabb, mat.clone(), count);
+    spawn_lane_rig(
+        commands,
+        mirror.0,
+        Some(mirror.1.clone()),
+        mesh,
+        aabb,
+        mat,
+        count,
+    );
+}
+
 /// Strong handles to every material in a lane's store.
 fn lane_handles<M: Material>(assets: &mut Assets<M>) -> Vec<Handle<M>> {
     let ids: Vec<AssetId<M>> = assets.iter().map(|(id, _)| id).collect();
     ids.into_iter()
         .filter_map(|id| assets.get_strong_handle(id))
         .collect()
+}
+
+/// The warm mirror: a camera with the stylised water's mirrored view key
+/// (`benilla_world::liquid::mirror_view_shape`, never multisampled), so the mirror's pipelines
+/// compile under the entry cover. The target size keys no pipeline; its format does.
+pub(super) fn spawn_warm_mirror(
+    commands: &mut Commands,
+    images: &mut Assets<Image>,
+) -> (Entity, bevy::camera::visibility::RenderLayers) {
+    use bevy::camera::{ClearColorConfig, RenderTarget};
+    let layer = bevy::camera::visibility::RenderLayers::layer(crate::portrait::WARM_MIRROR_LAYER);
+    let mut image = Image::new_fill(
+        bevy::render::render_resource::Extent3d {
+            width: 64,
+            height: 64,
+            depth_or_array_layers: 1,
+        },
+        bevy::render::render_resource::TextureDimension::D2,
+        &[0; 8],
+        // The mirror's own target format — `reflect::reflection_image`'s, because the colour
+        // target format is part of the pipeline too.
+        bevy::render::render_resource::TextureFormat::Rgba16Float,
+        RenderAssetUsages::default(),
+    );
+    image.texture_descriptor.usage = bevy::render::render_resource::TextureUsages::TEXTURE_BINDING
+        | bevy::render::render_resource::TextureUsages::COPY_DST
+        | bevy::render::render_resource::TextureUsages::RENDER_ATTACHMENT;
+    let cam = commands
+        .spawn((
+            Name::new("pipe_warm mirror twin"),
+            benilla_world::liquid::mirror_view_shape(),
+            Camera {
+                // Behind every real camera, and behind the twin booth.
+                order: -200,
+                clear_color: ClearColorConfig::Custom(Color::NONE),
+                ..default()
+            },
+            RenderTarget::Image(images.add(image).into()),
+            layer.clone(),
+        ))
+        .id();
+    (cam, layer)
 }
 
 /// One model-lane rig, 1 cm in front of `cam`; `layers` puts it on a booth camera's layer.
@@ -722,33 +802,32 @@ fn warm_pos_uv_mesh() -> Mesh {
     m
 }
 
-/// A tiny quad in the liquid grid's layout: POSITION + NORMAL + UV_0 + UV_1, plus
-/// `ATTRIBUTE_COLOR` when `body_color` is set, as `liquid_bevy_mesh` does for a non-fullbright
-/// interior WMO pool.
-fn warm_liquid_mesh(body_color: bool) -> Mesh {
-    let mut m = Mesh::new(
-        PrimitiveTopology::TriangleList,
-        RenderAssetUsages::default(),
-    );
-    let uvs = vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
-    m.insert_attribute(
-        Mesh::ATTRIBUTE_POSITION,
-        vec![
-            [0.0, 0.0, 0.0],
-            [1.0, 0.0, 0.0],
-            [1.0, 1.0, 0.0],
-            [0.0, 1.0, 0.0],
-        ],
-    );
-    m.insert_attribute(Mesh::ATTRIBUTE_NORMAL, vec![[0.0, 1.0, 0.0]; 4]);
-    m.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs.clone());
-    m.insert_attribute(Mesh::ATTRIBUTE_UV_1, uvs);
-    if body_color {
-        // As `liquid_bevy_mesh` inserts it: one RGBA per vertex, alpha 1.
-        m.insert_attribute(Mesh::ATTRIBUTE_COLOR, vec![[1.0, 1.0, 1.0, 1.0]; 4]);
+/// Every liquid material once per key in `shipped` it can take. Magma and slime are
+/// fullbright on either look, so each keeps its own key; a water material becomes one clone per
+/// non-fullbright key, carrying that key's `path.y` and `path.w`, so a look toggle or a tier
+/// change finds its pipelines compiled.
+fn liquid_variants(
+    store: &mut Assets<LiquidMaterial>,
+    shipped: impl Iterator<Item = LiquidKey>,
+) -> Vec<Handle<LiquidMaterial>> {
+    let water_keys: Vec<LiquidKey> = shipped.filter(|k| !k.has(LiquidKey::FULLBRIGHT)).collect();
+    let mut out = Vec::new();
+    for handle in lane_handles(store) {
+        let Some(material) = store.get(&handle) else {
+            continue;
+        };
+        if LiquidKey::from(&material.extension).has(LiquidKey::FULLBRIGHT) {
+            out.push(handle);
+            continue;
+        }
+        let material = material.clone();
+        for key in &water_keys {
+            let mut variant = material.clone();
+            (variant.extension.path.y, variant.extension.path.w) = key.path_lanes();
+            out.push(store.add(variant));
+        }
     }
-    m.insert_indices(Indices::U32(vec![0, 1, 2, 0, 2, 3]));
-    m
+    out
 }
 
 /// A unit quad in each attribute combination the model lane ships. Every `RenderSubmesh` field is
@@ -916,6 +995,9 @@ mod tests {
         // Lanes that never need the menagerie:
         // - TerrainMaterial / WdlMaterial: always drawn under the entry cover, no variant axis.
         // - AddUiMaterial: glue screens only, and every pre-world frame counts as covered.
+        //   With MSAA on, the mirror's terrain and horizon twins (not `MULTISAMPLED`) are not
+        //   warmed: that needs a real terrain mesh and splat material, not a stand-in on another
+        //   layout.
         let families: [(&str, &[&str]); 3] = [
             ("MaterialPlugin::<", &["TerrainMaterial", "WdlMaterial"]),
             ("Material2dPlugin::<", &[]),

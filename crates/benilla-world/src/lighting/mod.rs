@@ -13,13 +13,15 @@ mod prop_probes; // the interior-prop SH probe table
 mod resolve; // the per-frame time-of-day resolve and the interior-fog crossfade
 mod sh; // the model SH probe fold
 pub use blob::LightBlob;
+pub use daynight::{celestial_sun_direction, sun_direction};
 pub use global_light::{new_shared_light_buffer, LightRooms, SharedLightBuffer, WorldPointLight};
 pub use prop_probes::{PropProbeSlot, PropProbes, MAX_PROP_PROBES};
 // The std430 layout stays in the crate: off-world producers state values through `LightBlob`,
 // never a row index.
 pub(crate) use prop_probes::prop_probe_region_offset;
+pub use resolve::DrySky;
 pub use resolve::WmoCrossfade;
-use resolve::{apply_sky_backdrop, setup_lighting, update_time_lighting};
+use resolve::{apply_sky_backdrop, setup_lighting, update_dry_sky, update_time_lighting};
 pub(crate) use sh::prop_probe_coeffs;
 
 /// Scene lighting sampled from `Light.dbc` for the time of day. Colours are sRGB 0..1; `sun_dir` is
@@ -32,7 +34,7 @@ pub struct WowLighting {
     pub spec: [f32; 3],
     pub sun_dir: Vec3,
     /// The visible sun, camera to sun in Bevy space; unlike the lighting sun it rises and sets.
-    pub(crate) celestial_dir: Vec3,
+    pub celestial_dir: Vec3,
     /// Distance fog colour, `Light.dbc` IntBand row 7 raw, applied `GL_LINEAR` in-shader in gamma
     /// space; Bevy's `DistanceFog` blends in linear and would break the gamma invariant.
     pub fog_color: [f32; 3],
@@ -48,7 +50,7 @@ pub struct WowLighting {
     pub(crate) wmo_fog_start: f32,
     pub(crate) wmo_fog_end: f32,
     /// The five sky-dome stops, zenith to horizon (`Atmosphere.sky`, IntBand rows 2-6).
-    pub(crate) sky: [[f32; 3]; 5],
+    pub sky: [[f32; 3]; 5],
     /// Per-kind water tint `[shallow, deep]`: IntBand rows 16/17 (river, lake) and 14/15 (ocean),
     /// raw and area-blended like every band (`0x6d30e0` merges all 18 colour rows per light).
     pub(crate) water_river: [[f32; 3]; 2],
@@ -56,6 +58,10 @@ pub struct WowLighting {
     /// Per-kind water alphas `[shallow, deep]`, `LightParams` fields 5-8, blended like the tint.
     pub(crate) water_river_alpha: [f32; 2],
     pub(crate) water_ocean_alpha: [f32; 2],
+    /// The water swatch of [`Self::water_colors`] at noon, clear and dry, river then ocean: the
+    /// same area blend at half-minute 1440, resampled only when the map changes or the eye moves
+    /// a yard, so what derives from it does not follow the clock.
+    pub(crate) water_noon: [([f32; 3], [f32; 3], f32, f32); 2],
     /// The FFXGlow composite weight, `LightParams.glow` quantised as the reference packs it.
     pub(crate) glow: f32,
     /// The dawn/dusk sky warp strength `curve(dayfrac) × highlightSky` for `sky.wgsl`'s warp
@@ -66,7 +72,7 @@ pub struct WowLighting {
     /// The sun lens-flare day envelope (`0xce9818`): 1 from 07:30 to 19:30, 0 at night.
     pub(crate) sun_flare_dn: f32,
     /// The white moon, camera to moon in Bevy space: up at night, below the horizon by day.
-    pub(crate) moon_dir_white: Vec3,
+    pub moon_dir_white: Vec3,
     /// The moon disc size multiplier (`0xce8c8c`): 1 overhead, 1.5 at moonrise and moonset.
     pub(crate) moon_disc_scale: f32,
     /// The moon lens-flare night envelope (`0xce9768`): 0 from 03:15 to 22:45, full after midnight.
@@ -106,7 +112,7 @@ impl WowLighting {
     /// WMO liquid's opacity is the 256-entry `shallow + d·(deep − shallow)/256` (`0x6b6b60`). One
     /// depth `V` indexes colour and alpha: `clamp(byte/42)` for river and lake (`0x68d790`, opaque
     /// by about 5 yd), `clamp(byte/255)` for ocean (`0x68d690`), both built in `0x68c4c0`.
-    pub(crate) fn water_colors(&self, kind: LiquidKind) -> ([f32; 3], [f32; 3], f32, f32) {
+    pub fn water_colors(&self, kind: LiquidKind) -> ([f32; 3], [f32; 3], f32, f32) {
         let (shallow_rgb, deep_rgb, alpha) = if kind == LiquidKind::Ocean {
             (
                 self.water_ocean[0],
@@ -121,6 +127,11 @@ impl WowLighting {
             )
         };
         (shallow_rgb, deep_rgb, alpha[0], alpha[1])
+    }
+
+    /// [`Self::water_colors`] as the clear, dry noon (half-minute 1440) paints it at this place.
+    pub fn water_colors_noon(&self, kind: LiquidKind) -> ([f32; 3], [f32; 3], f32, f32) {
+        self.water_noon[usize::from(kind == LiquidKind::Ocean)]
     }
 }
 
@@ -210,6 +221,7 @@ impl Plugin for LightingPlugin {
         // Readers of the resolve run after it.
         configure_lighting_sets(app);
         app.init_resource::<WowLighting>()
+            .init_resource::<DrySky>()
             .init_resource::<PropProbes>()
             .init_resource::<GameClock>()
             .init_resource::<WorldTime>()
@@ -218,7 +230,7 @@ impl Plugin for LightingPlugin {
             .add_systems(Startup, setup_lighting.after(AssetSet::Open))
             .add_systems(
                 Update,
-                (update_time_lighting, apply_sky_backdrop)
+                (update_time_lighting, apply_sky_backdrop, update_dry_sky)
                     .chain()
                     .in_set(LightingResolveSet)
                     // The storm blend reads this frame's weather densities.
@@ -298,6 +310,10 @@ mod ordering_tests {
                 "the celestial follows: PostUpdate, BillboardPlace",
             ),
             ("weather/precip/mod.rs", "push_precip: PostUpdate"),
+            (
+                "liquid/reflect.rs",
+                "drive_reflection: PostUpdate, before TransformSystems::Propagate",
+            ),
         ];
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut offenders = Vec::new();

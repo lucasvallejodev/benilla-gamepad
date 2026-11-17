@@ -1,0 +1,35 @@
+# wg-darkshore-pier-noon: the Darkshore sea under a dock, the dock's foot standing in the water
+# (x 620-720, waterline y 575), the horizon at y 415. Flake: the Reference twin's x0-939 y173-436
+# moves by up to 37 codes run to run, and the shot's own x0-939 y173-675, sky and water to the
+# left of the dock, by up to 33.
+scene = "water-darkshore-pier-noon"
+[box]
+foot = [630, 510, 710, 560]          # the dock's foot above the water
+sky = [1100, 250, 1300, 300]
+foot_refl = [630, 590, 710, 640]     # its reflection under the waterline
+sky_refl = [1100, 590, 1300, 640]    # open water at the same depth
+foot_waterline = [600, 555, 740, 595]
+water = [0, 650, 1600, 900]
+# P1-30's objective (R-E4): softer than the baseline's mirror, never washed out.
+[[row]]
+metric = "refl_contrast"
+object = "foot"
+sky = "sky"
+object_refl = "foot_refl"
+sky_refl = "sky_refl"
+within = [0.6, 1.0]
+[[row]]
+metric = "contact_cov"
+label = "foot_contact"
+box = "foot_waterline"
+[[row]]
+metric = "luma_sd"
+box = "water"
+[[row]]
+metric = "lum_vs_ref"
+box = "water"
+# P1-32: no refracted read pulls the dock's legs into the water (the refraction views).
+# Views from Medium or High: Low does not refract, and the row reads n/a there.
+[[row]]
+metric = "refract_leak"
+box = [0, 0, 1600, 900]

@@ -14,7 +14,7 @@
 //! reference also lays foam at the MCLQ height, with only a depth bias (`0x68fd0f`):
 //! `0.125 × [0x810390]`, D3D `DEPTHBIAS` −1/8192.
 
-mod params;
+pub mod params;
 
 use bevy::asset::RenderAssetUsages;
 use bevy::ecs::entity::EntityHashMap;
@@ -34,7 +34,7 @@ use crate::view::WorldCamera;
 use crate::world_unit::{ViewerUnit, WorldUnit};
 use benilla_assets::{AssetSet, LooseOpen, WorldAssets};
 
-use params::{foam_params, foam_uv, rand01, record_alpha, record_size, WadeState};
+use params::{foam_params, foam_uv, rand01, record_alpha, record_size, wave_push, WadeState};
 use params::{wake_cooldown, RING_INTERVAL};
 
 /// The ring and wake stencils, loaded raw: the alpha is the shape and the near-black RGB the
@@ -257,6 +257,8 @@ fn drive_unit(
     water: &Query<(Entity, &WaterChunkInfo, &FoamPatch)>,
     index: &WaterIndex,
     now: f32,
+    // True on the stylised lane, whose wave field draws a moving unit's wake where it pushes.
+    wave_field: bool,
 ) {
     let gate = (GATE_DEPTH_FRAC * h).max(1.0);
     foam_state.active = true;
@@ -280,6 +282,14 @@ fn drive_unit(
     foam_state.wading = wading_now;
 
     if !oneshot && now < foam_state.ready {
+        return;
+    }
+    // A moving unit deep enough for the stylised lane's wave field: the wake is the field's.
+    if wave_field
+        && !oneshot
+        && matches!(state, WadeState::Translating { .. })
+        && wave_push(h, depth).is_some()
+    {
         return;
     }
     let Some(p) = foam_params(state, oneshot, scale, gate, depth, &mut foam_state.rng) else {
@@ -333,6 +343,10 @@ fn drive_unit(
 /// Runs the driver for the avatar on its movement flags, and for streamed units on the proxies.
 fn emit_water_foam(
     time: Res<Time>,
+    // Optional: this module's own tests drive the emitter without the liquid plugin, and the
+    // absent resource means the same as its default — the reference look, where these decals ARE
+    // the wake.
+    style: Option<Res<crate::liquid::WaterStyle>>,
     materials: Option<Res<FoamAssets>>,
     mut foam: ResMut<WaterFoam>,
     viewer: Res<crate::view::Viewer>,
@@ -347,6 +361,10 @@ fn emit_water_foam(
     }
     // `0x68bda3`: the emitter makes no record while `waterRipples` is 0.
     let emits = ripples.is_none_or(|r| r.0 != 0);
+    // The stylised lane's wave field (`benilla_water`'s `ripple_sim`) draws a moving unit's wake
+    // from ankle depth to the gate (`params::wave_push`), so there the decal wake stays off; the
+    // rings, the step-in splash and the wake in shallower water are the reference's on both lanes.
+    let wave_field = style.is_some_and(|s| s.is_stylised());
     let now = time.elapsed_secs();
     let dt = time.delta_secs().max(1.0e-4);
 
@@ -389,7 +407,9 @@ fn emit_water_foam(
                     pool[alloc_slot(self_cursor, 0, SELF_SLOTS)] = Some(rec);
                 }
             };
-            drive_unit(uf, &mut alloc, body, state, scale, h, &water, &index, now);
+            drive_unit(
+                uf, &mut alloc, body, state, scale, h, &water, &index, now, wave_field,
+            );
         }
 
         // Streamed units; `Without<ViewerUnit>` excludes the avatar's own wire ghost.
@@ -443,7 +463,7 @@ fn emit_water_foam(
                 }
             };
             drive_unit(
-                uf, &mut alloc, pos, state, unit.scale, h, &water, &index, now,
+                uf, &mut alloc, pos, state, unit.scale, h, &water, &index, now, wave_field,
             );
         }
     }
@@ -651,6 +671,114 @@ mod tests {
             "a streamed unit allocates from the other partition"
         );
         live
+    }
+
+    /// The stylised look keeps the reference's rings and step-in splash, and leaves a moving unit's
+    /// wake to its wave field (`benilla_water`'s `ripple_sim`) wherever that pushes
+    /// (`params::wave_push`); in water under its ankle-deep floor the decal wake stays. The fence
+    /// matters because every failure is invisible from the code: silenced decals leave idle and
+    /// shallow water glassy, and a painted wake over the simulated one is two wakes.
+    #[test]
+    fn the_stylised_look_leaves_the_wake_to_the_wave_field_where_it_pushes() {
+        use crate::liquid::WaterStyle::{self, Reference, Stylised};
+        // (rings, wakes) from a unit (h = 2) whose feet visit `path` (WoW xyz) 0.5 s apart.
+        let records = |style: Option<WaterStyle>, path: &[[f32; 3]]| {
+            let mut app = App::new();
+            app.init_resource::<Time>()
+                .init_resource::<WaterIndex>()
+                .init_resource::<WaterFoam>()
+                .init_resource::<crate::view::Viewer>()
+                .insert_resource(FoamAssets {
+                    ring: Handle::default(),
+                    wake: Handle::default(),
+                })
+                .add_systems(
+                    Update,
+                    (crate::liquid::maintain_water_index, emit_water_foam).chain(),
+                );
+            if let Some(style) = style {
+                app.insert_resource(style);
+            }
+            let mut positions = Vec::new();
+            for j in 0..3 {
+                for i in 0..3 {
+                    positions.push([i as f32 * 5.0, j as f32 * 5.0, 5.0]);
+                }
+            }
+            app.world_mut().spawn((
+                WaterChunkInfo::new(
+                    crate::liquid::LiquidSource::AdtChunk,
+                    benilla_formats::LiquidKind::Still,
+                    [3, 3],
+                    positions,
+                    vec![true; 4],
+                ),
+                FoamPatch,
+            ));
+            let unit = app
+                .world_mut()
+                .spawn((
+                    Transform::from_translation(wow_to_bevy(path[0])),
+                    WorldUnit {
+                        wades: true,
+                        scale: 1.0,
+                        height: 2.0,
+                        bound: None,
+                    },
+                ))
+                .id();
+            app.update();
+            for &at in &path[1..] {
+                app.world_mut()
+                    .resource_mut::<Time>()
+                    .advance_by(std::time::Duration::from_millis(500));
+                app.world_mut()
+                    .get_mut::<Transform>(unit)
+                    .expect("spawned above")
+                    .translation = wow_to_bevy(at);
+                app.update();
+            }
+            let foam = app.world().resource::<WaterFoam>();
+            let rings = foam.pool.iter().flatten().filter(|r| r.ring).count();
+            (rings, foam.pool.iter().flatten().count() - rings)
+        };
+        // Arrives `depth` under the z = 5 surface, stands 0.5 s, then walks 2 yd in 0.5 s. Past the
+        // 0.8-yd step-in line the first ring is the one-shot.
+        let wade = |style: Option<WaterStyle>, depth: f32| {
+            let z = 5.0 - depth;
+            records(style, &[[2.0, 2.0, z], [2.0, 2.0, z], [4.0, 2.0, z]])
+        };
+        // Drops from a yard above the surface to 1.5 yd under while moving 2 yd: it arrives
+        // translating past the step-in line.
+        let jump = |style: Option<WaterStyle>| records(style, &[[2.0, 2.0, 6.0], [4.0, 2.0, 3.5]]);
+        for style in [Some(Reference), None] {
+            for depth in [0.33, 0.37, 1.5] {
+                assert_eq!(
+                    wade(style, depth),
+                    (2, 1),
+                    "the reference look is what these decals ARE (no resource is its default), \
+                     {depth} yd"
+                );
+            }
+            assert_eq!(jump(style), (1, 0), "the reference step-in one-shot");
+        }
+        assert_eq!(
+            wade(Some(Stylised), 0.33),
+            (2, 1),
+            "under the wave field's 0.35-yd floor the stylised look keeps the decal wake"
+        );
+        for depth in [0.37, 0.5, 1.5] {
+            assert_eq!(
+                wade(Some(Stylised), depth),
+                (2, 0),
+                "the rings stay and the wake is the wave field's, {depth} yd"
+            );
+        }
+        assert_eq!(
+            jump(Some(Stylised)),
+            (1, 0),
+            "a unit arriving translating in deep water still gets its step-in one-shot"
+        );
     }
 
     #[test]

@@ -249,6 +249,25 @@ pub(super) const OVERLOOK_LOOK: [f32; 3] = [-8912.9, -125.4, 87.7];
 pub(super) const WATER_EYE: [f32; 3] = [-9527.0, -310.6, 70.8];
 pub(super) const WATER_LOOK: [f32; 3] = [-9499.4, -351.3, 61.4];
 
+/// Golden water cameras a pan, weather or time variant shares: Loch Modan, the Elwynn Falls pool,
+/// the Falfarren River, Lake Al'Ameth.
+const LOCH_EYE: [f32; 3] = [-5240.3, -3119.5, 300.8];
+const LOCH_LOOK: [f32; 3] = [-5240.2, -3169.5, 300.8];
+const FALLS_EYE: [f32; 3] = [-8322.0, -340.0, 147.2];
+const FALLS_LOOK: [f32; 3] = [-8272.0, -340.0, 147.2];
+const FALFARREN_EYE: [f32; 3] = [2666.2, -2545.9, 175.2];
+const FALFARREN_LOOK: [f32; 3] = [2681.0, -2498.1, 175.2];
+const ALAMETH_EYE: [f32; 3] = [9356.42, 1191.51, 1254.81];
+const ALAMETH_LOOK: [f32; 3] = [9456.13, 1183.84, 1254.81];
+/// `water-savage-coast`'s camera, shared by its sunset.
+const SAVAGE_EYE: [f32; 3] = [-12619.3, -41.0, 29.9];
+const SAVAGE_LOOK: [f32; 3] = [-12606.2, 7.3, 29.9];
+/// `.tele BaradinBay`'s eye, shared by its noon and sunset.
+const BARADIN_EYE: [f32; 3] = [-2537.88, -1692.24, 6.3];
+/// Blackrock Stronghold's magma camera, shared by the day and night shots.
+const LAVA_EYE: [f32; 3] = [-7716.7, -1350.0, 152.0];
+const LAVA_LOOK: [f32; 3] = [-7640.1, -1350.0, 87.72];
+
 /// The Lion's Pride Inn common room at Goldshire: the hearth's MOCV-alpha self-illumination, a
 /// daylight window, the chandelier, props; it exercises portal culling, the interior bake, MOLT
 /// point lights and WMO props.
@@ -968,7 +987,491 @@ pub(super) const ON_DEMAND: &[Scenario] = &[
         minute: 720,
         ui: Some(UiFixture::Trainer(TrainerList::Blacksmith)),
     },
+    // ---- The golden water scenes (`scripts/water-shots.sh`, [`water_scene_names`]) ----
+    // One per kind of water, first person. Most cameras are `/shot` records
+    // (`benilla-config/shots.txt`) taken level at a teleport spot, facing its `.gps` heading; a
+    // glint or moon scene faces the sun's and moon's 45° bearing instead. The canal, the night
+    // beach and the underwater eye are a vista's feet + 2 yd, heading and pitch. They stream in
+    // slowly, so each settles on 300 still frames, not 30 (`capture`'s `WATER_STABLE_FRAMES`).
+    // Boxes below are 1600x900 frame pixels; a diff inside a flake box is run variance. Every
+    // scene's flake boxes are in the first comment of its region file,
+    // `scripts/water_regions/<scene>.toml`; some rows below repeat theirs.
+    //
+    // A big lake: Loch Modan from the shore by (-5240.0, -3117.0, 299.6), facing 270 across it.
+    // Flake: a lake-bed patch at x815-837 y701-720 lands in one of two states, on both lanes.
+    Scenario {
+        name: "water-loch-modan",
+        map: Some(MAP_AZEROTH),
+        eye: LOCH_EYE,
+        look: LOCH_LOOK,
+        minute: 720,
+        ui: None,
+    },
+    // A falls pool: `.tele ElwynnFalls` (-8322.0, -340.0, 145.35, orientation 0), a boat moored in
+    // front of the falls.
+    Scenario {
+        name: "water-elwynn-falls",
+        map: Some(MAP_AZEROTH),
+        eye: FALLS_EYE,
+        look: FALLS_LOOK,
+        minute: 720,
+        ui: None,
+    },
+    // A flowing river: `.tele FalfarrenRiver`, Ashenvale (2666.18, -2545.89, 173.4, orientation
+    // 1.269). Flake: the near-left water at x0-571 y611-899 lands in two or three states, up to
+    // 125k px and MAE 0.35.
+    Scenario {
+        name: "water-falfarren-river",
+        map: Some(MAP_KALIMDOR),
+        eye: FALFARREN_EYE,
+        look: FALFARREN_LOOK,
+        minute: 720,
+        ui: None,
+    },
+    // The sea at a coast: `.tele TheSavageCoast`, Stranglethorn (-12619.3, -40.97, 28.07,
+    // orientation 1.305). Flake: the sea-bed plants at x360-639 y680-839 appear in some runs and
+    // not others, on both lanes.
+    Scenario {
+        name: "water-savage-coast",
+        map: Some(MAP_AZEROTH),
+        eye: SAVAGE_EYE,
+        look: SAVAGE_LOOK,
+        minute: 720,
+        ui: None,
+    },
+    // A bay at sunset: `.tele MenethilBay` (-3977.14, -898.95, 8.84) at 19:40, facing the visible
+    // sun's 45° bearing, so its glint lies on the bay ahead.
+    Scenario {
+        name: "water-menethil-sunset",
+        map: Some(MAP_AZEROTH),
+        eye: [-3977.1, -899.0, 10.6],
+        look: [-3941.7, -863.6, 10.6],
+        minute: 1180,
+        ui: None,
+    },
+    // A city canal (WMO liquid): Stormwind's canals from feet (-8748.7, 526.2, 96.4), facing 18,
+    // 10° down onto the moored boats, the bridge and the quay wall.
+    Scenario {
+        name: "water-stormwind-canal",
+        map: Some(MAP_AZEROTH),
+        eye: [-8748.7, 526.2, 98.4],
+        look: [-8655.04, 556.63, 81.04],
+        minute: 720,
+        ui: None,
+    },
+    // The sea at night: the Savage Coast beach at (-12727.1, -2.1, 0.4), 115 yd from the teleport
+    // spot, whose 45° bearing runs out over open sea, at 22:44, facing the white moon at +14.9° on
+    // that bearing (`daynight::moon_direction`; the capture log prints it). Flake: sea-bed plants
+    // at x505-769 y520-635, above the moon's path (y650 on), appear in some runs only.
+    Scenario {
+        name: "water-savage-night",
+        map: Some(MAP_AZEROTH),
+        eye: [-12727.1, -2.1, 2.4],
+        look: [-12691.7, 33.3, 2.4],
+        minute: 1364,
+        ui: None,
+    },
+    // Under water: 3 yd below Loch Modan's surface (297.6), facing 270, 15° up at the surface
+    // from below, the lake bed along the bottom edge.
+    Scenario {
+        name: "water-loch-modan-under",
+        map: Some(MAP_AZEROTH),
+        eye: [-5240.0, -3165.0, 294.6],
+        look: [-5240.0, -3261.59, 320.48],
+        minute: 720,
+        ui: None,
+    },
+    // Under a lake: 3 yd below Lake Everstill's surface, Redridge, 22 yd south of its north
+    // shore by Lakeshire (9 yd deep), facing 0 at the shore, 15° up at the surface from below.
+    // The eye stands on the loaded surface ([`scene_dive`]); the z here only seats it until then.
+    Scenario {
+        name: "water-redridge-under",
+        map: Some(MAP_AZEROTH),
+        eye: [-9318.8, -2185.4, 53.2],
+        look: [-9222.21, -2185.4, 79.08],
+        minute: 720,
+        ui: None,
+    },
+    // Through the surface: the Savage Coast sea 75 yd out along `water-savage-coast`'s view
+    // (15 yd deep), facing on along it, level; a burst dives the eye from 2 yd over the loaded
+    // surface to 3 yd under it ([`scene_dive`]).
+    Scenario {
+        name: "water-savage-dive",
+        map: Some(MAP_AZEROTH),
+        eye: [-12599.7, 31.4, 2.0],
+        look: [-12573.52, 127.91, 2.0],
+        minute: 720,
+        ui: None,
+    },
+    // The reflection's repeat cameras, as `vista` seats them (the eye 2 yd over the feet, looking
+    // 500 yd out): the Stranglethorn coast at sunset from feet (-12395.0, -318.7, 12.5), facing
+    // 165, 4° down, grazing; and Lake Nazferiti from its south end at the water, feet (-12090,
+    // -370, 10.1), facing 0 along it, 3° down.
+    Scenario {
+        name: "water-stv-sunset-repeat",
+        map: Some(MAP_AZEROTH),
+        eye: [-12395.0, -318.7, 14.5],
+        look: [-12876.79, -189.61, -20.38],
+        minute: 1180,
+        ui: None,
+    },
+    Scenario {
+        name: "water-nazferiti-repeat",
+        map: Some(MAP_AZEROTH),
+        eye: [-12090.0, -370.0, 12.1],
+        look: [-11590.69, -370.0, -14.07],
+        minute: 720,
+        ui: None,
+    },
+    //
+    // The cameras below stand where the water assessment's live stills stood: a `.tele` spot's feet
+    // as its `.gps` answer gives them, or a shore spot computed from the planar map, the eye 2 yd
+    // above as `vista` seats it, level unless said, looking 100 yd out.
+    //
+    // A lake bank: `.tele LakeAlAmeth`, Teldrassil (9356.42, 1191.51, 1252.81, orientation 355.6°).
+    Scenario {
+        name: "water-alameth-bank-noon",
+        map: Some(MAP_KALIMDOR),
+        eye: ALAMETH_EYE,
+        look: ALAMETH_LOOK,
+        minute: 720,
+        ui: None,
+    },
+    // The Darkshore sea by a pier, from the shore at (6450.0, 526.0, 8.48), facing 90.
+    Scenario {
+        name: "water-darkshore-pier-noon",
+        map: Some(MAP_KALIMDOR),
+        eye: [6450.0, 526.0, 10.48],
+        look: [6450.0, 626.0, 10.48],
+        minute: 720,
+        ui: None,
+    },
+    // A wreck in a bay: `.tele MenethilBay` (-3977.14, -898.95, 8.84), facing 0 at noon.
+    Scenario {
+        name: "water-menethil-wreck-noon",
+        map: Some(MAP_AZEROTH),
+        eye: [-3977.14, -898.95, 10.84],
+        look: [-3877.14, -898.95, 10.84],
+        minute: 720,
+        ui: None,
+    },
+    // A murky lake: `.tele JademirLake`, Feralas (-3057.92, 1837.42, 29.45, orientation 3.5°).
+    // Flake: lake-bed plants at x1237-1599 y483-608 land in three or more states.
+    Scenario {
+        name: "water-felwood-jademir",
+        map: Some(MAP_KALIMDOR),
+        eye: [-3057.92, 1837.42, 31.45],
+        look: [-2958.11, 1843.52, 31.45],
+        minute: 720,
+        ui: None,
+    },
+    // Swamp water: the Swamp of Sorrows from the shore at (-10323.0, -4045.0, 19.6), facing 90.
+    Scenario {
+        name: "water-swamp-sorrows",
+        map: Some(MAP_AZEROTH),
+        eye: [-10323.0, -4045.0, 21.6],
+        look: [-10323.0, -3945.0, 21.6],
+        minute: 720,
+        ui: None,
+    },
+    // Darrowmere Lake from the shore at (1293.0, -2428.0, 55.2), facing 90. Flake: a speck of
+    // terrain at x463-488 y797-822 lands in one of two states.
+    Scenario {
+        name: "water-darrowmere",
+        map: Some(MAP_AZEROTH),
+        eye: [1293.0, -2428.0, 57.2],
+        look: [1293.0, -2328.0, 57.2],
+        minute: 720,
+        ui: None,
+    },
+    // A murky coast: `.tele TheForgottenCoast`, Feralas (-4347.46, 2415.11, 8.01, orientation
+    // 87.4°).
+    Scenario {
+        name: "water-forgotten-coast",
+        map: Some(MAP_KALIMDOR),
+        eye: [-4347.46, 2415.11, 10.01],
+        look: [-4342.92, 2515.01, 10.01],
+        minute: 720,
+        ui: None,
+    },
+    // Lordamere Lake with rocks standing in it, from the shore at (982.0, 537.0, 34.5), facing 270.
+    Scenario {
+        name: "water-lordamere-rock",
+        map: Some(MAP_AZEROTH),
+        eye: [982.0, 537.0, 36.5],
+        look: [982.0, 437.0, 36.5],
+        minute: 720,
+        ui: None,
+    },
+    // `water-loch-modan` under half a storm sky ([`scene_weather`]: rain at grade 0.125, below the
+    // 0.25 where drops start, blends the storm light half-way): clouds overhead, no rain.
+    Scenario {
+        name: "water-cloudy-noon",
+        map: Some(MAP_AZEROTH),
+        eye: LOCH_EYE,
+        look: LOCH_LOOK,
+        minute: 720,
+        ui: None,
+    },
+    // `water-loch-modan` in heavy rain ([`scene_weather`]).
+    Scenario {
+        name: "water-loch-rain",
+        map: Some(MAP_AZEROTH),
+        eye: LOCH_EYE,
+        look: LOCH_LOOK,
+        minute: 720,
+        ui: None,
+    },
+    // A lake under a low moon: Loch Modan from its south-east shore (-5444.4, -3504.4, 299.29) at
+    // 02:30, facing the white moon at +14.9° on its 45° bearing (`daynight::moon_direction`), the
+    // lake 286 yd deep ahead.
+    Scenario {
+        name: "water-low-moon",
+        map: Some(MAP_AZEROTH),
+        eye: [-5444.4, -3504.4, 301.29],
+        look: [-5373.69, -3433.69, 301.29],
+        minute: 150,
+        ui: None,
+    },
+    // Pans, each a scene's camera whose burst sweeps its view ([`scene_pan`]): `water-loch-modan`,
+    // `water-elwynn-stream`, `water-alameth-bank-noon`, `water-falfarren-river` and
+    // `water-elwynn-falls`.
+    Scenario {
+        name: "water-pan-burst",
+        map: Some(MAP_AZEROTH),
+        eye: LOCH_EYE,
+        look: LOCH_LOOK,
+        minute: 720,
+        ui: None,
+    },
+    Scenario {
+        name: "water-elwynn-stream-pan",
+        map: Some(MAP_AZEROTH),
+        eye: WATER_EYE,
+        look: WATER_LOOK,
+        minute: 720,
+        ui: None,
+    },
+    Scenario {
+        name: "water-alameth-bank-pan",
+        map: Some(MAP_KALIMDOR),
+        eye: ALAMETH_EYE,
+        look: ALAMETH_LOOK,
+        minute: 720,
+        ui: None,
+    },
+    Scenario {
+        name: "water-falfarren-pan",
+        map: Some(MAP_KALIMDOR),
+        eye: FALFARREN_EYE,
+        look: FALFARREN_LOOK,
+        minute: 720,
+        ui: None,
+    },
+    Scenario {
+        name: "water-elwynn-falls-pan",
+        map: Some(MAP_AZEROTH),
+        eye: FALLS_EYE,
+        look: FALLS_LOOK,
+        minute: 720,
+        ui: None,
+    },
+    // Shaded water along a canopy's edge, for the static and pan bursts: `water-noon`'s camera, the
+    // Elwynn water under the trees with a murloc camp across it.
+    Scenario {
+        name: "water-elwynn-stream",
+        map: Some(MAP_AZEROTH),
+        eye: WATER_EYE,
+        look: WATER_LOOK,
+        minute: 720,
+        ui: None,
+    },
+    // A calm lake from a third-person camera: `.tele CrystalLake` (-9528.41, -359.94, 61.07,
+    // orientation 341.1°), the eye 7 yd behind and 5.5 yd above the feet, looking 20 yd ahead.
+    Scenario {
+        name: "water-crystal-3p-noon",
+        map: Some(MAP_AZEROTH),
+        eye: [-9535.03, -357.67, 66.57],
+        look: [-9509.49, -366.42, 61.07],
+        minute: 720,
+        ui: None,
+    },
+    // An open bay: `.tele BaradinBay`, Wetlands (-2537.88, -1692.24, 4.3, orientation 5.1°).
+    Scenario {
+        name: "water-baradin-noon",
+        map: Some(MAP_AZEROTH),
+        eye: BARADIN_EYE,
+        look: [-2438.28, -1683.35, 6.3],
+        minute: 720,
+        ui: None,
+    },
+    // The bay at 19:40, facing the visible sun's 45° bearing.
+    Scenario {
+        name: "water-baradin-sunset-45",
+        map: Some(MAP_AZEROTH),
+        eye: BARADIN_EYE,
+        look: [-2467.17, -1621.53, 6.3],
+        minute: 1180,
+        ui: None,
+    },
+    // `water-savage-coast` at 19:40.
+    Scenario {
+        name: "water-savage-sunset",
+        map: Some(MAP_AZEROTH),
+        eye: SAVAGE_EYE,
+        look: SAVAGE_LOOK,
+        minute: 1180,
+        ui: None,
+    },
+    // The open sea: the Westfall coast from the beach at (-10589.6, 2100.2, 1.8), facing 90.
+    Scenario {
+        name: "water-westfall-noon",
+        map: Some(MAP_AZEROTH),
+        eye: [-10589.6, 2100.2, 3.8],
+        look: [-10589.6, 2200.2, 3.8],
+        minute: 720,
+        ui: None,
+    },
+    // Below a dam: the Stonewrought Dam's foot from (-4550.9, -3318.7, 180.0), facing 180, 6° up.
+    Scenario {
+        name: "water-dam-foot",
+        map: Some(MAP_AZEROTH),
+        eye: [-4550.9, -3318.7, 182.0],
+        look: [-4650.35, -3318.7, 192.45],
+        minute: 720,
+        ui: None,
+    },
+    // Water under decks: Booty Bay's harbour from under a dock at (-14380.0, 409.0, 1.86), the water
+    // at 0.0, facing 90.
+    Scenario {
+        name: "water-booty-underdeck",
+        map: Some(MAP_AZEROTH),
+        eye: [-14380.0, 409.0, 3.86],
+        look: [-14380.0, 509.0, 3.86],
+        minute: 720,
+        ui: None,
+    },
+    // The harbour from a dock: `.tele BootyBay` (-14297.2, 530.99, 8.78, orientation 228.5°).
+    Scenario {
+        name: "water-booty-harbour",
+        map: Some(MAP_AZEROTH),
+        eye: [-14297.2, 530.99, 10.78],
+        look: [-14363.46, 456.09, 10.78],
+        minute: 720,
+        ui: None,
+    },
+    // Rapids: Stranglethorn's falls river from its bank (-13647.2, 482.3, 24.92), the water 1 yd
+    // below, facing 230, upstream (the flow runs to 20 at 5.2 yd/s).
+    Scenario {
+        name: "water-stv-river",
+        map: Some(MAP_AZEROTH),
+        eye: [-13647.2, 482.3, 26.92],
+        look: [-13711.48, 405.7, 26.92],
+        minute: 720,
+        ui: None,
+    },
+    // A river mouth: Stranglethorn's river at the coast from (-12757.0, 269.4, 9.1), facing 300.
+    Scenario {
+        name: "water-stv-mouth",
+        map: Some(MAP_AZEROTH),
+        eye: [-12757.0, 269.4, 11.1],
+        look: [-12707.0, 182.8, 11.1],
+        minute: 720,
+        ui: None,
+    },
+    // Magma, noon: Blackrock Stronghold's lava from (-7716.7, -1350.0, 150.0), facing 0, 40° down.
+    Scenario {
+        name: "water-lava-day",
+        map: Some(MAP_AZEROTH),
+        eye: LAVA_EYE,
+        look: LAVA_LOOK,
+        minute: 720,
+        ui: None,
+    },
+    // The same magma at midnight.
+    Scenario {
+        name: "water-lava-night",
+        map: Some(MAP_AZEROTH),
+        eye: LAVA_EYE,
+        look: LAVA_LOOK,
+        minute: 0,
+        ui: None,
+    },
+    // Water-free controls, where Improved Water must draw exactly the Reference lane. The
+    // `stormwind` street:
+    Scenario {
+        name: "water-free-stormwind",
+        map: Some(MAP_AZEROTH),
+        eye: [-8833.38, 628.63, 96.0],
+        look: [-8809.1, 672.3, 94.0],
+        minute: 720,
+        ui: None,
+    },
+    // Ironforge's bank hall, a WMO interior: the banker's spot (-4895.64, -1004.66, 504.02), facing
+    // 111.
+    Scenario {
+        name: "water-free-ironforge",
+        map: Some(MAP_AZEROTH),
+        eye: [-4895.64, -1004.66, 506.02],
+        look: [-4931.48, -911.3, 506.02],
+        minute: 720,
+        ui: None,
+    },
+    // The `northshire-sun-flare` sky: the sun glare and the glow's additive combine.
+    Scenario {
+        name: "water-free-additive",
+        map: Some(MAP_AZEROTH),
+        eye: SKY_EYE,
+        look: [-8797.0, 23.0, 264.0],
+        minute: 1050,
+        ui: None,
+    },
 ];
+
+/// The golden water scenes, the [`ON_DEMAND`] rows named `water-*`, for `scripts/water-shots.sh`.
+/// The baseline's `water-noon` and `water-night` are in [`SCENARIOS`] and not among them. The name
+/// is the membership: a row without the prefix gets neither the scenes' settle and age nor a place
+/// in the sweep.
+pub(super) fn water_scene_names() -> impl Iterator<Item = &'static str> {
+    ON_DEMAND
+        .iter()
+        .map(|s| s.name)
+        .filter(|n| n.starts_with("water-"))
+}
+
+/// A golden water scene's forced weather, as a `$WOW_WEATHER` script (`weather::parse_env_script`:
+/// type 1 is rain, then its grade), seeded when the variable is unset.
+pub(super) fn scene_weather(name: &str) -> Option<&'static str> {
+    match name {
+        "water-cloudy-noon" => Some("1,0.125"),
+        "water-loch-rain" => Some("1,0.8"),
+        _ => None,
+    }
+}
+
+/// A golden water scene's own pan across its burst, `[yaw, pitch]` degrees either side of its view
+/// (`capture::pan_pose`); `$WOW_CAPTURE_PAN` pans any scene.
+pub(super) fn scene_pan(name: &str) -> Option<[f32; 2]> {
+    match name {
+        "water-pan-burst" | "water-elwynn-stream-pan" | "water-alameth-bank-pan" => {
+            Some([20.0, 0.0])
+        }
+        "water-falfarren-pan" | "water-elwynn-falls-pan" => Some([20.0, 10.0]),
+        _ => None,
+    }
+}
+
+/// A golden water scene whose eye stands on the water surface under it, found at run time in the
+/// loaded liquid (`capture::shot_pose`): `[first, last]` yd over the surface, below it when
+/// negative, swept linearly over a burst; a still stands at `first`. The scene's own eye z only
+/// seats the camera until the surface loads, and the shot fails if it never does.
+pub(super) fn scene_dive(name: &str) -> Option<[f32; 2]> {
+    match name {
+        "water-redridge-under" => Some([-3.0, -3.0]),
+        "water-savage-dive" => Some([2.0, -3.0]),
+        _ => None,
+    }
+}
 
 /// The `name-close` subject: the `name-water` wolf's name, orbited at any distance. World text is
 /// the only consumer that draws the glyph sheet at other than 1:1, so a glyph-cell sampling defect
@@ -1073,5 +1576,100 @@ mod ui_opt_in_tests {
                 s.name
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod water_scene_tests {
+    use super::*;
+
+    /// The golden water scenes are capturable by name and stay out of the baseline sweep: each is
+    /// one `ON_DEMAND` row with a map, and no `SCENARIOS` row is listed with them.
+    #[test]
+    fn the_water_scenes_are_on_demand_and_pin_their_map() {
+        let names: Vec<&str> = water_scene_names().collect();
+        assert!(!names.is_empty(), "no golden water scene");
+        for (i, name) in names.iter().enumerate() {
+            assert!(!names[..i].contains(name), "`{name}` is listed twice");
+            assert!(
+                !SCENARIOS.iter().any(|s| s.name == *name),
+                "`{name}` is in the baseline sweep"
+            );
+            let s = by_name(name).expect("a listed scene resolves by name");
+            assert!(s.map.is_some(), "`{name}` must pin its map");
+            assert!(s.ui.is_none(), "`{name}` is a world capture");
+        }
+    }
+
+    /// The glint and moon scenes face the 45° bearing the visible sun and moon keep all day
+    /// (`daynight`'s constant azimuth), so the body and its path on the water are ahead of the view.
+    #[test]
+    fn the_glint_and_moon_scenes_face_the_celestial_bearing() {
+        for name in [
+            "water-menethil-sunset",
+            "water-savage-night",
+            "water-baradin-sunset-45",
+            "water-low-moon",
+        ] {
+            let s = by_name(name).expect("a water scene");
+            let heading = (s.look[1] - s.eye[1])
+                .atan2(s.look[0] - s.eye[0])
+                .to_degrees();
+            assert!(
+                (heading - 45.0).abs() < 0.1,
+                "`{name}` faces {heading:.2}°, not the 45° bearing"
+            );
+        }
+    }
+
+    /// The forced weather and the pans belong to golden water scenes, so the sweep captures them.
+    #[test]
+    fn the_scene_weather_and_pans_name_golden_scenes() {
+        let names: Vec<&str> = water_scene_names().collect();
+        for name in ["water-cloudy-noon", "water-loch-rain"] {
+            assert!(
+                names.contains(&name),
+                "`{name}` is not a golden water scene"
+            );
+            assert!(scene_weather(name).is_some(), "`{name}` forces no weather");
+        }
+        let pans = [
+            "water-pan-burst",
+            "water-elwynn-stream-pan",
+            "water-alameth-bank-pan",
+            "water-falfarren-pan",
+            "water-elwynn-falls-pan",
+        ];
+        for name in pans {
+            assert!(
+                names.contains(&name),
+                "`{name}` is not a golden water scene"
+            );
+            assert!(scene_pan(name).is_some(), "`{name}` does not pan");
+        }
+        let unmoved = names
+            .iter()
+            .filter(|n| scene_weather(n).is_none() && scene_pan(n).is_none())
+            .count();
+        assert_eq!(
+            unmoved,
+            names.len() - 7,
+            "only those seven scenes carry either"
+        );
+    }
+
+    /// The dives are golden water scenes, and only they stand on the surface; the under-lake still
+    /// stays under it, and the dive starts over it and ends under it.
+    #[test]
+    fn the_dives_name_golden_scenes_and_cross_or_stay_under_the_surface() {
+        let names: Vec<&str> = water_scene_names().collect();
+        let dives: Vec<&str> = names
+            .iter()
+            .copied()
+            .filter(|n| scene_dive(n).is_some())
+            .collect();
+        assert_eq!(dives, ["water-redridge-under", "water-savage-dive"]);
+        assert!(scene_dive("water-redridge-under").is_some_and(|[a, b]| a < 0.0 && b < 0.0));
+        assert!(scene_dive("water-savage-dive").is_some_and(|[a, b]| a > 0.0 && b < 0.0));
     }
 }

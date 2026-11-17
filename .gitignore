@@ -45,3 +45,6 @@ __pycache__/
 
 # Temp files
 temp/
+
+# The run log.
+/benilla.log

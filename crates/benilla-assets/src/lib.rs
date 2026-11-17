@@ -15,8 +15,13 @@ use bevy::prelude::*;
 
 pub mod column_grid;
 pub mod coords;
+pub mod dev_shaders;
+/// The Improved Water composite's blend algebra, mirrored on the CPU for its tests.
+#[cfg(test)]
+mod liquid_composite;
 pub mod materials;
 pub mod minimap_grid;
+pub mod preview;
 mod spatial_cache;
 pub mod trace;
 
@@ -35,6 +40,8 @@ pub use model::{
     ATTRIBUTE_WOW_JOINT_WEIGHT, ATTRIBUTE_WOW_MERGED_SLOT,
 };
 mod adt;
+mod water_hook;
+pub use water_hook::{classify_liquids, set_water_classifier, WaterClassifier};
 mod terrain;
 mod wdt;
 pub use adt::{chunk_to_mesh, chunks_to_mesh, AdtLoader, AdtTile, ChunkShading};
@@ -384,6 +391,7 @@ pub fn register_mpq_source(app: &mut App, data_dir: &Path) -> Result<()> {
         mpq: reader.clone(),
         loose: LooseFiles::install(),
     };
+    water_hook::set_chain(reader.chain.clone());
     app.register_asset_source(
         MPQ_SOURCE,
         AssetSourceBuilder::new(move || -> Box<dyn ErasedAssetReader> { Box::new(reader.clone()) }),

@@ -360,6 +360,9 @@ fn launch(build: BuildId, extend: Option<Extension<'_>>) -> AppExit {
         );
     }
 
+    // `$WOW_DEV_SHADERS`: the water's shaders off the working tree, also before `AssetPlugin`.
+    benilla_assets::dev_shaders::register_dev_shader_sources(&mut app);
+
     // No `game://` source: the five UI shaders are compiled in by `crate::shaders`
     // (`embedded://benilla_app/shaders/…`), so no build-machine path reaches the binary.
 
@@ -455,6 +458,12 @@ fn launch(build: BuildId, extend: Option<Extension<'_>>) -> AppExit {
     .add_plugins(game_plugins::GamePlugins {
         connect: !capturing,
         start: run_mode::start_state(),
+    });
+    // The Improved Water option's passes; its map classification caches under the state folder,
+    // none in a capture.
+    #[cfg(feature = "improved-water")]
+    app.add_plugins(benilla_water::ImprovedWaterPlugin {
+        cache_dir: crate::local_state::home(),
     });
 
     // benilla-assets' loaders go into the live `AssetServer`, so they register after `AssetPlugin`.

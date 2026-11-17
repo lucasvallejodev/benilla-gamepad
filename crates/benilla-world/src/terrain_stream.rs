@@ -1065,6 +1065,8 @@ fn spawn_streamed_tiles(
         spawn_liquids(
             &mut commands,
             adt.chunks.iter().flat_map(|c| c.liquids.iter()),
+            &adt.chunks,
+            adt.planar.as_ref(),
             liquid_assets.as_deref(),
             &mut meshes,
             &mut liquid_ents,
@@ -1814,6 +1816,7 @@ mod inner_hold_tests {
             shadow_array: Handle::default(),
             doodads: Vec::new(),
             wmos: Vec::new(),
+            planar: None,
             chunks,
         }
     }

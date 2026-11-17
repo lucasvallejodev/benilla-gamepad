@@ -163,6 +163,9 @@ pub struct WaterChunkInfo {
     source: LiquidSource,
     kind: LiquidKind,
     grid: LiquidGrid,
+    /// Per cell, the mirror plane it votes for, its section's height (`liquid::planar`), NaN on
+    /// probe water; empty when every cell votes its own surface.
+    planes: Vec<f32>,
 }
 
 /// A surface's vertex grid in world WoW space and its lattice basis. A MODF placement is affine, so
@@ -242,7 +245,7 @@ impl LiquidGrid {
 impl WaterChunkInfo {
     /// The grid's highest wet vertex, which `super::real_data` shows is not the surface.
     #[cfg(test)]
-    pub(super) fn chunk_max_z(&self) -> f32 {
+    pub fn chunk_max_z(&self) -> f32 {
         self.grid.fallback_z
     }
 
@@ -280,6 +283,7 @@ impl WaterChunkInfo {
                     inv_det: None,
                     fallback_z: f32::MIN,
                 },
+                planes: Vec::new(),
             };
         }
         let (mut min_x, mut max_x) = (f32::MAX, f32::MIN);
@@ -325,12 +329,52 @@ impl WaterChunkInfo {
                 inv_det: (det.abs() > 1e-9).then(|| 1.0 / det),
                 fallback_z,
             },
+            planes: Vec::new(),
         }
+    }
+
+    /// The mirror plane each cell votes for, NaN where it does not; `None` lets every cell vote
+    /// its own surface.
+    pub fn with_planes(mut self, planes: Option<Vec<f32>>) -> Self {
+        if let Some(p) = planes.filter(|p| p.len() == self.grid.wet.len()) {
+            self.planes = p;
+        }
+        self
+    }
+
+    /// Does any wet cell of this surface vote for a mirror plane?
+    pub fn votes_any(&self) -> bool {
+        self.planes.is_empty()
+            || self
+                .planes
+                .iter()
+                .zip(&self.grid.wet)
+                .any(|(p, w)| !p.is_nan() && *w)
+    }
+
+    /// Do some wet cells vote for a mirror plane and others not?
+    pub fn votes_partly(&self) -> bool {
+        let mut wet = self.planes.iter().zip(&self.grid.wet).filter(|(_, w)| **w);
+        wet.clone().any(|(p, _)| !p.is_nan()) && wet.any(|(p, _)| p.is_nan())
+    }
+
+    /// The mirror plane the cell under WoW `(x, y)` votes for — its section's height — or `None`
+    /// over probe water or dry ground; the surface itself where no planes were given.
+    pub fn planar_z_at(&self, x: f32, y: f32) -> Option<f32> {
+        if self.planes.is_empty() {
+            return self.surface_z_at(x, y);
+        }
+        if !self.contains(x, y) {
+            return None;
+        }
+        let (i, j, _, _) = self.grid.wet_cell_at(x, y)?;
+        let z = self.planes[j * (self.grid.cols - 1) + i];
+        (!z.is_nan()).then_some(z)
     }
 
     /// The surface height (WoW Z) at a WoW-space XY, `None` where dry: the one wet-or-dry question,
     /// answered by the containing cell's bilinear, never by the grid's highest vertex.
-    pub(crate) fn surface_z_at(&self, x: f32, y: f32) -> Option<f32> {
+    pub fn surface_z_at(&self, x: f32, y: f32) -> Option<f32> {
         if !self.contains(x, y) {
             return None; // the bounding box is the cheap reject
         }
@@ -344,13 +388,13 @@ impl WaterChunkInfo {
     }
 
     /// Is this WoW-space XY inside the wet footprint's box?
-    pub(crate) fn contains(&self, x: f32, y: f32) -> bool {
+    pub fn contains(&self, x: f32, y: f32) -> bool {
         x >= self.min_x && x <= self.max_x && y >= self.min_y && y <= self.max_y
     }
 
     /// The wet footprint's XY box, `None` for an empty grid: what [`super::spatial::WaterIndex`]
     /// buckets by.
-    pub(super) fn xy_bounds(&self) -> Option<[[f32; 2]; 2]> {
+    pub fn xy_bounds(&self) -> Option<[[f32; 2]; 2]> {
         (self.min_x <= self.max_x && self.min_y <= self.max_y)
             .then_some([[self.min_x, self.min_y], [self.max_x, self.max_y]])
     }
@@ -379,12 +423,12 @@ impl WaterChunkInfo {
     }
 
     /// Does this WoW-space XY box overlap the wet footprint's box?
-    pub(crate) fn overlaps(&self, lo_x: f32, hi_x: f32, lo_y: f32, hi_y: f32) -> bool {
+    pub fn overlaps(&self, lo_x: f32, hi_x: f32, lo_y: f32, hi_y: f32) -> bool {
         hi_x >= self.min_x && lo_x <= self.max_x && hi_y >= self.min_y && lo_y <= self.max_y
     }
 
     /// Call `f` with every wet cell's four world WoW corners `[tl, tr, bl, br]`, for the foam clip.
-    pub(crate) fn for_each_wet_cell(&self, mut f: impl FnMut([[f32; 3]; 4])) {
+    pub fn for_each_wet_cell(&self, mut f: impl FnMut([[f32; 3]; 4])) {
         let g = &self.grid;
         let Some(cells_x) = g.cols.checked_sub(1) else {
             return;
@@ -399,7 +443,7 @@ impl WaterChunkInfo {
     /// The ambient loop's emitter target: the XY clamped into the footprint's box, at the surface's
     /// height there, or the highest wet vertex over a hole. The reference uses the nearest liquid
     /// cell; this clamp approximates it.
-    pub(crate) fn nearest_point_wow(&self, x: f32, y: f32) -> [f32; 3] {
+    pub fn nearest_point_wow(&self, x: f32, y: f32) -> [f32; 3] {
         let cx = x.clamp(self.min_x, self.max_x);
         let cy = y.clamp(self.min_y, self.max_y);
         [
@@ -430,6 +474,40 @@ pub(super) fn wet_footprint(
         positions,
         lq.wet.clone(),
     )
+}
+
+/// A placement's per-cell mirror planes, voted in model space (a WMO pool's MLIQ), as world heights
+/// under `transform`: each plane taken at its cell's centre, the frame [`wet_footprint`] gives the
+/// cells, so the election compares them with ADT planes and the surface. NaN (no plane) stays NaN.
+pub(super) fn world_planes(lq: &LiquidMesh, transform: &Transform, planes: Vec<f32>) -> Vec<f32> {
+    let cols = lq.grid[0] as usize;
+    let xt = cols.saturating_sub(1);
+    planes
+        .into_iter()
+        .enumerate()
+        .map(|(k, h)| {
+            if h.is_nan() || xt == 0 {
+                return h;
+            }
+            let (i, j) = (k % xt, k / xt);
+            let corners = [
+                j * cols + i,
+                j * cols + i + 1,
+                (j + 1) * cols + i,
+                (j + 1) * cols + i + 1,
+            ];
+            let Some(ps) = corners
+                .iter()
+                .map(|&v| lq.positions.get(v))
+                .collect::<Option<Vec<_>>>()
+            else {
+                return h;
+            };
+            let cx = ps.iter().map(|p| p[0]).sum::<f32>() / 4.0;
+            let cy = ps.iter().map(|p| p[1]).sum::<f32>() / 4.0;
+            world_wow(transform, [cx, cy, h])[2]
+        })
+        .collect()
 }
 
 fn world_wow(transform: &Transform, local: [f32; 3]) -> [f32; 3] {
@@ -649,6 +727,11 @@ impl EyeLiquid<'_> {
     pub fn depth(&self) -> f32 {
         self.eye.as_ref().map_or(0.0, |e| e.depth)
     }
+
+    /// The liquid surface's world Z over the probe; `0.0` when dry.
+    pub fn surface_z(&self) -> f32 {
+        self.eye.as_ref().map_or(0.0, |e| e.surface_z)
+    }
 }
 
 /// The submerged camera's two scalars, published beside [`Underwater`].
@@ -660,6 +743,9 @@ pub struct SubmergedEye {
     /// The eye's absolute world Z. The ocean ramp clamps it raw, `clamp(eye.z, −30, 0)`, since
     /// ocean surfaces are pinned to z = 0 by a branch (`0x69ba85`), not by data.
     pub eye_z: f32,
+    /// The world Z of the liquid surface over the probe, `0.0` when dry: the Improved Water
+    /// preview's view from below reads it.
+    pub surface_z: f32,
 }
 
 /// How far the near rectangle's lowest corner sits below the eye, `≤ 0` yd: `eye_z + drop` is the
@@ -710,6 +796,7 @@ pub(super) fn detect_submersion(
     // Depth from the probe, not the eye, so the fade agrees with the verdict.
     submerged_eye.depth = verdict.map_or(0.0, |(_, z)| (z - probe_z).max(0.0));
     submerged_eye.eye_z = eye[2];
+    submerged_eye.surface_z = verdict.map_or(0.0, |(_, z)| z);
     // `WOW_FOG_DUMP`: once a second, the eye, the verdict and every surface over the eye's XY.
     static FOG_DUMP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *FOG_DUMP.get_or_init(|| std::env::var_os("WOW_FOG_DUMP").is_some()) {
@@ -973,6 +1060,40 @@ mod tests {
                 "yaw {deg}°: surface not level (got {z})"
             );
         }
+    }
+
+    /// A WMO pool's planes are voted in model space; under a lifted, yawed placement each lands at
+    /// its model height plus the lift, where the placed surface is, and a cell with no plane stays
+    /// without one. Stormwind's canals elected a mirror at -6.48 against water at ~95.5 without it.
+    #[test]
+    fn a_placements_planes_are_world_heights() {
+        let lift = 102.0_f32;
+        for deg in [0.0_f32, 30.0, 90.0, 200.0] {
+            let transform = Transform {
+                translation: Vec3::new(-400.0, lift, 250.0),
+                rotation: Quat::from_rotation_y(deg.to_radians()),
+                scale: Vec3::ONE,
+            };
+            let lq = flat_quad(-6.5);
+            let planes = world_planes(&lq, &transform, vec![-6.5]);
+            assert!(
+                (planes[0] - (lift - 6.5)).abs() < 1e-3,
+                "yaw {deg}°: plane {}",
+                planes[0]
+            );
+            let info = wet_footprint(&lq, &transform, LiquidSource::WmoGroup(orphan_pool()))
+                .with_planes(Some(planes));
+            let centre = bevy_to_wow(transform.transform_point(wow_to_bevy([5.0, 5.0, -6.5])));
+            let (plane, surface) = (
+                info.planar_z_at(centre[0], centre[1]),
+                info.surface_z_at(centre[0], centre[1]),
+            );
+            assert!(
+                matches!((plane, surface), (Some(p), Some(s)) if (p - s).abs() < 1e-3),
+                "yaw {deg}°: plane {plane:?} against surface {surface:?}"
+            );
+        }
+        assert!(world_planes(&flat_quad(1.0), &Transform::IDENTITY, vec![f32::NAN])[0].is_nan());
     }
 
     /// The surface at an XY is the bilinear of its cell's corners, never the grid's highest vertex.

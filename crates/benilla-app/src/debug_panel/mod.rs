@@ -338,6 +338,7 @@ fn debug_panel_ui(
                         lighting: l,
                         sound: s,
                         weather: w,
+                        water: wa,
                         ..
                     } = &mut *debug;
                     egui::CollapsingHeader::new("World")
@@ -615,6 +616,105 @@ fn debug_panel_ui(
                                 .show(ui, |ui| {
                                     for line in report {
                                         ui.label(egui::RichText::new(line).small().monospace());
+                                    }
+                                });
+                        });
+                    // The water tier's own instruments. Both draw the cubemap reflection probes,
+                    // which are otherwise invisible: they are placed on a world-anchored lattice,
+                    // captured one at a time and retired as the player moves, with nothing on screen
+                    // saying so — which made "is there a probe near me?" and "did walking here throw
+                    // half of them away?" questions only a trace log could answer.
+                    egui::CollapsingHeader::new("Water")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new(
+                                    "reflection probes — green: the water is reading it; \
+                                     grey: placed, no cube yet",
+                                )
+                                .small()
+                                .color(OVERLAY_TEXT_DIM),
+                            );
+                            ui.checkbox(&mut wa.probe_minimap, "probes on the minimap");
+                            ui.checkbox(&mut wa.probe_world, "probes in the world");
+                            ui.checkbox(&mut wa.probe_off, "probe off");
+                            ui.checkbox(&mut wa.surface2, "dispersive wave surface (off: old ripples)");
+                            ui.checkbox(&mut wa.soft_shore, "soft shoreline").on_hover_text(
+                                "the water fades in over its first third of a yard of depth, \
+                                 the wet bed and wet line with it (off: the hard cut)",
+                            );
+                            ui.checkbox(&mut wa.lively, "lively reflection").on_hover_text(
+                                "the reflection's strength per wave, toward the eye or away, \
+                                 averaged smoothly at distance (off: one level under the gloss)",
+                            );
+                            ui.checkbox(&mut wa.surface_height, "surface height").on_hover_text(
+                                "the surface rises and falls with the long waves and the wake \
+                                 near the eye, on a finer grid there (off: a flat sheet)",
+                            );
+                            ui.checkbox(&mut wa.reflect_waves, "waves in the reflection")
+                                .on_hover_text(
+                                    "the reflected picture follows the resolved waves, near \
+                                     water breaks it into moving patches (off: the long waves only)",
+                                );
+                            ui.checkbox(&mut wa.sky_waves, "sky across the waves").on_hover_text(
+                                "each wave reflects the sky along its own ray: tilted to the \
+                                 horizon brighter, tilted up deeper (off: one flat sky)",
+                            );
+                            ui.checkbox(&mut wa.crest_shade, "crest shading").on_hover_text(
+                                "crests a little lighter, troughs a little darker, under the \
+                                 light the water is lit by (off: none)",
+                            );
+                            ui.add(
+                                egui::Slider::new(&mut wa.transparency, 0.0..=2.0)
+                                    .fixed_decimals(2)
+                                    .text("water transparency"),
+                            )
+                            .on_hover_text(
+                                "0 the first Improved body, 1 the default, 2 the clearest: \
+                                 the clarity and the authored bed floor together",
+                            );
+                            ui.add(
+                                egui::Slider::new(&mut wa.depth_falloff, 0.25..=4.0)
+                                    .logarithmic(true)
+                                    .fixed_decimals(2)
+                                    .text("depth falloff"),
+                            )
+                            .on_hover_text(
+                                "how fast the water closes with depth: 1 the default, \
+                                 below 1 the bed stays visible deeper",
+                            );
+                            ui.add(
+                                egui::Slider::new(&mut wa.saturation, 0.0..=2.0)
+                                    .fixed_decimals(2)
+                                    .text("water saturation"),
+                            )
+                            .on_hover_text("the body colour: 0 grey, 1 the default, 2 rich");
+                            ui.add(
+                                egui::Slider::new(&mut wa.brightness, 0.5..=1.5)
+                                    .fixed_decimals(2)
+                                    .text("water brightness"),
+                            )
+                            .on_hover_text("the body colour's brightness, hue kept");
+                            ui.add(
+                                egui::Slider::new(&mut wa.caustics, 0.0..=3.0)
+                                    .fixed_decimals(2)
+                                    .text("caustics intensity"),
+                            )
+                            .on_hover_text(
+                                "the caustic net above and below water: 0 off, 1 the default",
+                            );
+                            // The debug views: a pipeline variant, compiled on first use.
+                            use benilla_world::dev_state::WATER_VIEWS;
+                            egui::ComboBox::from_label("debug view")
+                                .selected_text(
+                                    WATER_VIEWS
+                                        .get(usize::from(wa.view))
+                                        .copied()
+                                        .unwrap_or("?"),
+                                )
+                                .show_ui(ui, |ui| {
+                                    for (id, name) in (0u8..).zip(WATER_VIEWS) {
+                                        ui.selectable_value(&mut wa.view, id, name);
                                     }
                                 });
                         });

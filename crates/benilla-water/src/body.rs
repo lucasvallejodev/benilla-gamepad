@@ -1,0 +1,1365 @@
+//! **The body's optics and light** for the stylised lane, from the zone's own `Light.dbc` water
+//! swatch: how fast each channel is absorbed and how murky the water is ([`kind_optics`], from the
+//! clear-noon swatch, so absorption does not follow the clock), and the light the body scatters
+//! back ([`body_light`]: the dome's irradiance and the lighting sun, at the terrain's own open-sky
+//! luminance). Pure functions; [`body_lanes`] lays them out as the look block's body rows, which
+//! `look` writes.
+
+use benilla_formats::LiquidKind;
+use benilla_world::lighting::WowLighting;
+use bevy::math::{Vec3, Vec4};
+
+/// The body rows' floats: ten `vec4`s, `liquid.wgsl`'s `WaterBody`.
+pub const BODY_FLOATS: usize = 40;
+
+/// Yards per unit of the authored depth coordinate `V`, river then ocean, `liquid.wgsl`'s
+/// `REF_RIVER_V_YD` and `REF_OCEAN_V_YD`: the river LUT's span (`0x810380`), and 255 over the
+/// ocean's 1.72 bytes per yard.
+pub const AUTHORED_YD_PER_V: [f32; 2] = [4.6667, 148.26];
+
+/// The cosine of the critical angle, `liquid.wgsl`'s `MU_D_MIN`: a ray refracted into water lies
+/// within it.
+pub const MU_REFRACTED_MIN: f32 = 0.6612;
+
+/// The water's display gamma, `liquid.wgsl`'s `WATER_GAMMA`: a pure power law.
+const WATER_GAMMA: f32 = 2.2;
+
+/// Rec. 709 luminance weights.
+const LUMA_709: [f32; 3] = [0.2126, 0.7152, 0.0722];
+
+/// Hemispherical mean Fresnel reflectance of water (n = 1.333) for Lambertian sky light.
+pub const F_DIFFUSE: f32 = 0.0664;
+
+/// Pure water's absorption per yard: Pope and Fry (1997), the band means over 600-680, 500-570
+/// and 440-490 nm, (0.34, 0.049, 0.0105) per metre.
+pub const SIGMA_PURE_WATER: [f32; 3] = [0.311, 0.0448, 0.0096];
+
+/// A clear lake's extinction per yard, (0.45, 0.085, 0.065) per metre: pure water plus clear-water
+/// scattering. Only its shape is used.
+pub const SIGMA_CLEAR_LAKE: [f32; 3] = [0.4115, 0.0777, 0.0594];
+
+/// The steepest spectrum water has, Pope and Fry's red over blue (0.34/0.0105 = 32.4).
+pub const SHAPE_RATIO_MAX: f32 = 32.0;
+
+/// The clear lake's grey scattering per yard, 0.26 per metre: the turbidity of the modal swatch.
+pub const TURB_REF: f32 = 0.2377;
+
+/// The shallow alpha nearly every `LightParams` row carries (199 of 204 on maps 0 and 1), river
+/// then ocean; the deep alpha is 1 everywhere.
+pub const MODAL_SHALLOW_ALPHA: [f32; 2] = [0.5, 0.75];
+
+/// The clarity at which the turbidity the image loses is the swatch's whole turbidity: the look
+/// before the clarity pass. The default clarity of 1 quarters it twice ([`turb_keep`]): the first
+/// clarity pass set this at 0.5 (a quarter of the swatch's), and the owner wanted the clear water
+/// clearer still, the bed readable to mid depth, so the default is now what its lever gave at 2.
+pub const CLARITY_SWATCH: f32 = 0.25;
+
+/// The owner's water transparency at its default (the debug panel's slider, 0 to 2,
+/// `dev_state::WaterDebug::transparency`): one value that moves every source of the clear water's
+/// transparency together, the clarity ([`transparency_clarity`]) and the authored bed floor
+/// ([`transparency_floor`]). 0 is the first Improved body (the swatch's whole turbidity, no
+/// floor), 2 the very clear look of c9977864 and b47a12e5 (clarity 1, the whole floor), and the
+/// default 1 sits between, which the owner found too transparent at 2: the clarity of 53983599
+/// (the image loses a quarter of the swatch's turbidity) and [`TRANSPARENCY_FLOOR_MID`] of the
+/// floor.
+pub const TRANSPARENCY_DEFAULT: f32 = 1.0;
+
+/// The share of the authored bed floor ([`authored_pass`]) at transparency 1.
+pub const TRANSPARENCY_FLOOR_MID: f32 = 0.6;
+
+/// The clarity at transparency `t`: [`CLARITY_SWATCH`] doubled per unit, so 0 is the swatch's
+/// whole turbidity, 1 a quarter of it and 2 a sixteenth ([`turb_keep`]); the inverse of
+/// [`clarity_transparency`].
+pub fn transparency_clarity(t: f32) -> f32 {
+    CLARITY_SWATCH * t.max(0.0).exp2()
+}
+
+/// The transparency whose clarity is `clarity` ([`transparency_clarity`]), so `$WOW_WATER_CLARITY`
+/// still sets the slider's boot value: `log2(clarity / CLARITY_SWATCH)`.
+pub fn clarity_transparency(clarity: f32) -> f32 {
+    (clarity.max(CLARITY_SWATCH) / CLARITY_SWATCH).log2()
+}
+
+/// The share of the authored bed floor a known bed keeps at transparency `t`: none at 0,
+/// [`TRANSPARENCY_FLOOR_MID`] at 1, the whole floor from 2, linear between.
+pub fn transparency_floor(t: f32) -> f32 {
+    let t = t.clamp(0.0, 2.0);
+    if t <= 1.0 {
+        TRANSPARENCY_FLOOR_MID * t
+    } else {
+        TRANSPARENCY_FLOOR_MID + (1.0 - TRANSPARENCY_FLOOR_MID) * (t - 1.0)
+    }
+}
+
+/// The murk (a kind's turbidity over [`TURB_REF`]) between which the clarity's reach fades from
+/// whole to none: a lake, a harbour or a coast at the modal alpha (murk 1 to 1.6: Loch Modan's,
+/// Booty Bay's, Westfall's, Darkshore's rows) takes it whole; a yellow-green hollow (Felwood's
+/// 2.4, Teldrassil's 2.6) a third of it; a swamp (4) none.
+pub const CLEAR_MURK: [f32; 2] = [1.5, 3.0];
+
+/// The dome law's stops weighed by their share of a horizontal surface's irradiance (the cosine
+/// integral over the rings at 90, 16.8, 9.8, 3.7, 1.8 and 0 degrees): sky0 to sky4, then fog.
+pub const DOME_IRRADIANCE_W: [f32; 6] =
+    [0.391711, 0.554255, 0.039301, 0.012340, 0.002064, 0.000329];
+
+/// `terrainp_s.bls`' shadow factor in gamma, `0.3·S + 0.7` at S = 0: what MCSH shadow leaves of
+/// the terrain's light.
+const TERRAIN_SHADOW_G: f32 = 0.7;
+
+/// `ocean0_s.bls`' lift, the reference's `(secondary + 0.25)·detail.a`.
+pub const SHEEN_LIFT: f32 = 0.25;
+
+/// The owner's knobs for the body: the defaults the look ships with.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BodyLook {
+    /// How far the absorption's shape leans from the swatch's toward the clear lake's (0 to 1).
+    pub k_phys: f32,
+    /// The turbidity's scale, river then ocean.
+    pub turb_scale: [f32; 2],
+    /// How clear the clear kinds are: the share of the swatch's turbidity the image loses is
+    /// `(CLARITY_SWATCH / clarity)²` ([`turb_keep`]), so 0.25 is the swatch's whole turbidity, 0.5
+    /// (the default, transparency 1) a quarter of it, 1 a sixteenth and 2 a
+    /// 64th (absorption alone from there). The swatch's turbidity still paces the
+    /// colour ramp, and a swamp's keeps the image whatever the clarity. Set each frame from the
+    /// transparency ([`transparency_clarity`]).
+    pub clarity: f32,
+    /// The share of the authored bed floor ([`authored_pass`]) a known bed on ADT water passes at
+    /// least, 0 to 1 (`look.body.spare.w`); set each frame from the transparency
+    /// ([`transparency_floor`]).
+    pub auth_floor: f32,
+    /// How fast the water closes with depth, 1 the default (the debug panel's "depth falloff",
+    /// 0.25 to 4): the absorption along the path and the colour ramp's pace both scale by it
+    /// ([`body_lanes`]), and on ADT water the authored depth the ramp's cap and the bed floor read
+    /// (`liquid.wgsl`'s `look.grade.w`), as if the water were this many times as deep; the
+    /// turbidity stays the transparency's.
+    pub depth_falloff: f32,
+    /// The swatch ramp's rate against the turbidity.
+    pub ramp_rate: f32,
+    /// The three bands' push and edge.
+    pub band_push: f32,
+    pub band_edge: f32,
+    /// The share of the illuminant's chroma the body keeps by day.
+    pub illum_chroma: f32,
+    /// The lift's gain against the reference's [`SHEEN_LIFT`].
+    pub lift_k: f32,
+    /// The refraction's strength (1 the physical deflection) and its largest offset, as a share
+    /// of the view height.
+    pub refract: f32,
+    pub refract_max_frac: f32,
+    /// Whether the probe's baked fog, and the floor occluder's (the frame's at the hit), are
+    /// re-based to the fog the mirror would lay on them, at the eye Z of the image beyond the
+    /// surface.
+    pub probe_refog: bool,
+    pub floor_refog: bool,
+    /// Where the deep stop sits on the zone's line from swatch row 0 to row 63 (the mid stop at
+    /// half of it).
+    ///
+    /// Under 1 on purpose. The 1.12 water palettes were authored for a surface with no reflection
+    /// and no glitter on it, and several zones' deep row is nearly black (Stranglethorn's, at Booty
+    /// Bay). Lit and fogged, that row reads as tar rather than as deep water. Capping the ramp keeps
+    /// deep water inside the zone's own pair of colours, one step back up its own ramp, and never a
+    /// wash of grey from outside the palette.
+    pub deep_ceiling: f32,
+}
+
+impl Default for BodyLook {
+    fn default() -> Self {
+        Self {
+            k_phys: 0.25,
+            turb_scale: [1.0; 2],
+            clarity: transparency_clarity(TRANSPARENCY_DEFAULT),
+            auth_floor: transparency_floor(TRANSPARENCY_DEFAULT),
+            depth_falloff: 1.0,
+            ramp_rate: 0.615,
+            band_push: 0.5,
+            band_edge: 0.22,
+            illum_chroma: 0.25,
+            lift_k: 1.0,
+            refract: 1.0,
+            refract_max_frac: 0.01,
+            probe_refog: true,
+            floor_refog: true,
+            deep_ceiling: 0.72,
+        }
+    }
+}
+
+/// A kind's optics: absorption per yard per channel, the grey turbidity per yard the image loses
+/// (what weighs the in-scatter and scatters the bed away) and the swatch's own turbidity per yard,
+/// which paces the colour ramp alone.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct KindOptics {
+    pub sigma_abs: [f32; 3],
+    pub sigma_turb: f32,
+    pub sigma_ramp: f32,
+}
+
+/// The body's illuminant, linear: the sky's and the sun's parts with the body's chroma (`e_*`),
+/// with the dome's and the sun's own (`e_*_raw`), and with the terrain light's (`e_*_foam`, for
+/// foam and the underside), each at the terrain's open-sky luminance.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BodyLight {
+    pub e_sky: [f32; 3],
+    pub e_sun: [f32; 3],
+    pub e_sky_raw: [f32; 3],
+    pub e_sun_raw: [f32; 3],
+    /// The sky's and the sun's luminance in the terrain light's colour: they add up to the
+    /// terrain's open-sky light, tint included, as `FOAM_COLOR·lit` lit foam in 1.12.
+    pub e_sky_foam: [f32; 3],
+    pub e_sun_foam: [f32; 3],
+    /// The sun's share kept in MCSH shadow, so shadowed water darkens as the terrain beside it.
+    pub s0: f32,
+    /// The scale from the dome-and-sun irradiance to the terrain's luminance.
+    pub k_e: f32,
+    /// The sun's share of the luminance.
+    pub sun_share: f32,
+    /// 1 with the celestial sun below the horizon, 0 with it up.
+    pub night: f32,
+}
+
+/// The water's decode, `liquid.wgsl`'s `water_dec`.
+pub fn dec(g: f32) -> f32 {
+    g.max(0.0).powf(WATER_GAMMA)
+}
+
+fn dec3(c: [f32; 3]) -> [f32; 3] {
+    c.map(dec)
+}
+
+/// Rec. 709 luminance.
+pub fn luma(c: [f32; 3]) -> f32 {
+    c[0] * LUMA_709[0] + c[1] * LUMA_709[1] + c[2] * LUMA_709[2]
+}
+
+fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
+    let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// `exp(mix(ln a, ln b, t))` per channel.
+fn geometric_mix(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
+    std::array::from_fn(|c| (a[c].ln() * (1.0 - t) + b[c].ln() * t).exp())
+}
+
+/// The reference's swatch row `i` in bytes/255, `liquid.wgsl`'s `swatch_row`: the integer ramp
+/// `c0 + floor(i·(c1 − c0)/64)`, and on the ocean the last row's value × 0.9.
+pub fn swatch_row(shallow: [f32; 3], deep: [f32; 3], i: u32, ocean: bool) -> [f32; 3] {
+    std::array::from_fn(|c| {
+        let (c0, c1) = ((shallow[c] * 255.0).round(), (deep[c] * 255.0).round());
+        let row = c0 + (i as f32 * (c1 - c0) / 64.0).floor();
+        if ocean && i >= 63 {
+            (row * 0.9).floor() / 255.0
+        } else {
+            row / 255.0
+        }
+    })
+}
+
+/// The deep albedo stop in gamma: `ceiling` of the way from the swatch's first row to its last
+/// (without the ocean's ×0.9 tail), on the zone's own line.
+pub fn deep_stop(shallow: [f32; 3], deep: [f32; 3], ocean: bool, ceiling: f32) -> [f32; 3] {
+    let (r0, r63) = (
+        swatch_row(shallow, deep, 0, ocean),
+        swatch_row(shallow, deep, 63, false),
+    );
+    std::array::from_fn(|c| r0[c] + (r63[c] - r0[c]) * ceiling)
+}
+
+/// The absorption's shape from the deepest row `d` (linear): its single-scattering inversion
+/// `1/d̂`, `d̂` the row over its peak channel floored at `1/`[`SHAPE_RATIO_MAX`], blended toward
+/// the clear lake's as the row fades to black between bytes 1 and 6 (an unkeyed sphere leaves a
+/// black row).
+fn swatch_shape(d: [f32; 3]) -> [f32; 3] {
+    let peak = d[0].max(d[1]).max(d[2]);
+    let floor = dec(1.0 / 255.0);
+    let m = peak.max(floor);
+    let shape = d.map(|x| 1.0 / (x / m).max(1.0 / SHAPE_RATIO_MAX));
+    geometric_mix(
+        SIGMA_CLEAR_LAKE,
+        shape,
+        smoothstep(floor, dec(6.0 / 255.0), peak),
+    )
+}
+
+/// `shape` scaled so no channel absorbs less than pure water and one absorbs exactly that.
+fn anchored(shape: [f32; 3]) -> [f32; 3] {
+    let s = (0..3)
+        .map(|c| SIGMA_PURE_WATER[c] / shape[c])
+        .fold(0.0, f32::max);
+    shape.map(|x| x * s)
+}
+
+/// The absorption per yard of water whose deepest row is `d` (linear), its shape leaning
+/// `k_phys` toward the clear lake's.
+fn absorption(d: [f32; 3], k_phys: f32) -> [f32; 3] {
+    anchored(geometric_mix(swatch_shape(d), SIGMA_CLEAR_LAKE, k_phys))
+}
+
+/// How yellow water whose absorption is `sigma` is: its blue absorption over its green, which
+/// dissolved and suspended matter raise and a blue row lowers. Scale-free, so the anchor on pure
+/// water does not move it.
+pub fn yellowness(sigma: [f32; 3]) -> f32 {
+    sigma[2] / sigma[1].max(1e-6)
+}
+
+/// A kind's optics from its swatch (`WowLighting::water_colors_noon`): the absorption from the
+/// deepest row the reference draws, and the turbidity from the clear lake's, scaled by how much
+/// less transparent the shallow alpha is than its kind's modal one and by how much yellower the
+/// swatch's absorption is than the clear lake's: a blue row comes out clearer than the clear lake,
+/// a green, brown or yellow one murkier.
+pub fn kind_optics(
+    shallow: [f32; 3],
+    deep: [f32; 3],
+    shallow_alpha: f32,
+    ocean: bool,
+    look: &BodyLook,
+) -> KindOptics {
+    let sigma_abs = absorption(dec3(swatch_row(shallow, deep, 63, ocean)), look.k_phys);
+    let kind = usize::from(ocean);
+    let f_alpha = (1.0 - shallow_alpha.clamp(0.0, 254.0 / 255.0)).ln()
+        / (1.0 - MODAL_SHALLOW_ALPHA[kind]).ln();
+    let f_hue = yellowness(sigma_abs) / yellowness(SIGMA_CLEAR_LAKE);
+    let murk = look.turb_scale[kind] * f_alpha * f_hue;
+    let sigma_ramp = TURB_REF * murk;
+    KindOptics {
+        sigma_abs,
+        sigma_turb: sigma_ramp * turb_keep(murk, look.clarity),
+        sigma_ramp,
+    }
+}
+
+/// The share of a kind's turbidity the image loses, by its `murk` (its turbidity over
+/// [`TURB_REF`]) at `clarity`: the swatch's turbidity is a scattering coefficient, and most of
+/// what clear water scatters goes forward within the pixel and takes nothing from the bed's image,
+/// so a clear kind loses only `(CLARITY_SWATCH / clarity)²` of it (a sixteenth at the default
+/// clarity of 1: a Jerlov coastal water loses about a quarter of its scattering to the backward
+/// half, and the image loses a quarter of that again, since what scatters back within the bed's
+/// own pixel is the bed's light still), and a kind as murky as a swamp, whose suspension scatters
+/// wide, all of it;
+/// between [`CLEAR_MURK`]'s ends the share fades from the one to the other. 1 at
+/// [`CLARITY_SWATCH`] or below, whatever the murk.
+pub fn turb_keep(murk: f32, clarity: f32) -> f32 {
+    let r = CLARITY_SWATCH / clarity.max(CLARITY_SWATCH);
+    let clear = 1.0 - smoothstep(CLEAR_MURK[0], CLEAR_MURK[1], murk);
+    1.0 - clear * (1.0 - r * r)
+}
+
+/// The optical path in yards to a bed `z_bed` yards under the surface, `liquid.wgsl`'s `l_opt`:
+/// down the view ray refracted to `mu_v` and down the sun refracted to `mu_d`. On ADT water
+/// (`adt`) the column is at most `z_auth`, the authored depth (`V` × [`AUTHORED_YD_PER_V`]), as
+/// 1.12 draws a bed through as much water as its depth byte says; a WMO's byte is an opacity.
+pub fn optical_path(z_bed: f32, z_auth: f32, mu_v: f32, mu_d: f32, adt: bool) -> f32 {
+    let z = z_bed.max(0.0);
+    let z = if adt { z.min(z_auth) } else { z };
+    (z / mu_v + z / mu_d).min(4096.0)
+}
+
+/// The share of a bed's light per channel that crosses `path` yards of water with `optics`,
+/// `liquid.wgsl`'s `t_bed`.
+pub fn bed_transmittance(optics: &KindOptics, path: f32) -> [f32; 3] {
+    let t_turb = (-optics.sigma_turb * path).exp();
+    optics.sigma_abs.map(|s| (-s * path).exp() * t_turb)
+}
+
+/// What 1.12 leaves of the pixel to a bed at authored depth `v` (the `V` its swatch is indexed
+/// by) on ADT water, in linear light, `liquid.wgsl`'s `BodyIn::auth_t`: its alpha blend runs in
+/// gamma, so the water's colour holds `alpha(V)^2.2` of the pixel and the bed the rest, the alpha
+/// the swatch's own ramp from the shallow alpha `alpha_shallow` to the deep `alpha_deep` (row
+/// `V·64`, linear between rows; the ocean's last row forced opaque). Owner rule 2A: the
+/// clarity follows the authored byte, so a known bed passes at least this share
+/// ([`authored_bed`]).
+pub fn authored_pass(v: f32, alpha_shallow: f32, alpha_deep: f32, ocean: bool) -> f32 {
+    let row = |i: f32| {
+        let (c0, c1) = (
+            (alpha_shallow * 255.0).floor(),
+            (alpha_deep * 255.0).floor(),
+        );
+        if ocean && i >= 63.0 {
+            1.0
+        } else {
+            (c0 + (i * (c1 - c0) / 64.0).floor()) / 255.0
+        }
+    };
+    let t = (v * 64.0 - 0.5).clamp(0.0, 63.0);
+    let i0 = t.floor();
+    let a = row(i0) + (row((i0 + 1.0).min(63.0)) - row(i0)) * (t - i0);
+    1.0 - a.powf(WATER_GAMMA)
+}
+
+/// A known bed's transmittance and in-scatter weight under the authored clarity,
+/// `liquid.wgsl`'s `water_body_optics`: the bed passes at least `auth_t` ([`authored_pass`]) in
+/// every channel, so it keeps its own colours, and the in-scatter gives up what the bed takes back.
+pub fn authored_bed(t_bed: [f32; 3], w_in: f32, auth_t: f32) -> ([f32; 3], f32) {
+    let t = t_bed.map(|c| c.max(auth_t));
+    (t, w_in.min(1.0 - t[0].max(t[1]).max(t[2])))
+}
+
+/// The deepest ramp coordinate 1.12 colours authored depth `v` with on ADT water,
+/// `liquid.wgsl`'s `BodyIn::auth_x`: the reference reads swatch row `V·64`, `V` of the way along
+/// the zone's line, and the stylised ramp's deepest stop lies `ceiling` along it.
+pub fn authored_ramp(v: f32, ceiling: f32) -> f32 {
+    (v / ceiling.max(1e-3)).clamp(0.0, 1.0)
+}
+
+/// The dome's irradiance on a level surface over π, linear: the cosine-weighted mean of its stops
+/// (`dome` as `benilla_world::sky::dome_uniforms` lays it out). The dawn and dusk warp only moves
+/// light between the mid rings, so it is left out.
+pub fn sky_irradiance(dome: &[Vec4; 7]) -> [f32; 3] {
+    let mut e = [0.0; 3];
+    for (row, w) in dome.iter().zip(DOME_IRRADIANCE_W) {
+        for (c, v) in e.iter_mut().zip(row.to_array()) {
+            *c += w * dec(v);
+        }
+    }
+    e
+}
+
+/// `e` with its luminance kept and `chroma` of its chroma.
+fn bound_chroma(e: [f32; 3], chroma: f32) -> [f32; 3] {
+    let y = luma(e);
+    e.map(|x| y * (1.0 + chroma * (x / y.max(1e-4) - 1.0)))
+}
+
+/// The body's illuminant: the dome's irradiance and the lighting sun's, each through the
+/// surface's Fresnel, scaled to the luminance of the terrain's own open-sky light
+/// (`clamp(ambient + diffuse·μ_s)`, decoded); the body keeps `illum_chroma` of their chroma by day
+/// and all of it with the celestial sun below the horizon. Foam's parts carry each part's
+/// luminance in that terrain light's colour, so open foam is `FOAM_COLOR·lit` and shadowed foam
+/// darkens without changing hue, as the bank beside it.
+pub fn body_light(
+    ambient: [f32; 3],
+    diffuse: [f32; 3],
+    sun_dir: Vec3,
+    celestial_dir: Vec3,
+    dome: &[Vec4; 7],
+    look: &BodyLook,
+) -> BodyLight {
+    let mu_s = (-sun_dir.normalize_or_zero().y).max(0.0);
+    let f_in = 0.02 + 0.98 * (1.0 - mu_s).powi(5);
+    let e_sky = sky_irradiance(dome).map(|x| x * (1.0 - F_DIFFUSE));
+    let e_sun = dec3(diffuse).map(|x| x * mu_s * (1.0 - f_in));
+    let lit_open: [f32; 3] =
+        std::array::from_fn(|c| (ambient[c] + diffuse[c] * mu_s).clamp(0.0, 1.0));
+    let total: [f32; 3] = std::array::from_fn(|c| e_sky[c] + e_sun[c]);
+    let k_e = (luma(dec3(lit_open)) / luma(total).max(1e-4)).clamp(0.25, 16.0);
+    let night = 1.0 - smoothstep(-0.10, 0.05, celestial_dir.normalize_or_zero().y);
+    let chroma = look.illum_chroma + (1.0 - look.illum_chroma) * night;
+    let (e_sky_raw, e_sun_raw) = (e_sky.map(|x| x * k_e), e_sun.map(|x| x * k_e));
+    let (e_sky, e_sun) = (
+        bound_chroma(e_sky_raw, chroma),
+        bound_chroma(e_sun_raw, chroma),
+    );
+    let sun_share = luma(e_sun) / (luma(e_sky) + luma(e_sun)).max(1e-4);
+    let s0 = ((dec(TERRAIN_SHADOW_G) - (1.0 - sun_share)) / sun_share.max(1e-4)).max(0.0);
+    let lit_lin = dec3(lit_open);
+    let y_lit = luma(lit_lin);
+    let tint = if y_lit > 1e-4 {
+        lit_lin.map(|x| x / y_lit)
+    } else {
+        [1.0; 3]
+    };
+    let foam = |part: [f32; 3]| tint.map(|t| t * luma(part));
+    BodyLight {
+        e_sky,
+        e_sun,
+        e_sky_raw,
+        e_sun_raw,
+        e_sky_foam: foam(e_sky),
+        e_sun_foam: foam(e_sun),
+        s0,
+        k_e,
+        sun_share,
+        night,
+    }
+}
+
+/// The light on the body and on foam at a surface point, `liquid.wgsl`'s `body_irradiance`: the
+/// sky's part through the open share `v_hemi` of the hemisphere, the sun's through `sun` (its
+/// terrain shadow times its open share, 1 lit), never below the shadow floor `s0`. The body takes
+/// the chroma-bounded rows, foam the rows in the terrain light's colour.
+pub fn irradiance(e: &BodyLight, v_hemi: f32, sun: f32) -> ([f32; 3], [f32; 3]) {
+    let s_eff = e.s0 + (1.0 - e.s0) * sun;
+    let part = |sky: [f32; 3], sun: [f32; 3]| -> [f32; 3] {
+        std::array::from_fn(|c| sky[c] * v_hemi + sun[c] * s_eff)
+    };
+    (part(e.e_sky, e.e_sun), part(e.e_sky_foam, e.e_sun_foam))
+}
+
+/// The lift `liquid.wgsl`'s `body_lift` adds to an albedo `a_g` (gamma): `lift` scaled by the
+/// albedo's hue, its peak channel never above `lift`.
+pub fn body_lift(a_g: [f32; 3], lift: f32) -> [f32; 3] {
+    let peak = a_g[0].max(a_g[1]).max(a_g[2]);
+    a_g.map(|x| lift * x / peak.max(lift.max(1e-4)))
+}
+
+/// The body rows (`WaterBody`): each kind's optics from the clear-noon swatch (the ramp turbidity
+/// in the foam rows' spare lanes), the illuminant, the look's knobs and the terrain shadow's window
+/// `shadow` (centre x, z, half extent, valid).
+pub fn body_lanes(
+    light: &WowLighting,
+    dome: &[Vec4; 7],
+    look: &BodyLook,
+    shadow: [f32; 4],
+) -> [f32; BODY_FLOATS] {
+    let optics = |kind: LiquidKind| {
+        let (shallow, deep, alpha, _) = light.water_colors_noon(kind);
+        kind_optics(shallow, deep, alpha, kind == LiquidKind::Ocean, look)
+    };
+    // The depth falloff scales the absorption and the ramp's pace, not the turbidity.
+    let falloff = |o: KindOptics| KindOptics {
+        sigma_abs: o.sigma_abs.map(|s| s * look.depth_falloff),
+        sigma_ramp: o.sigma_ramp * look.depth_falloff,
+        ..o
+    };
+    let (still, ocean) = (
+        falloff(optics(LiquidKind::Still)),
+        falloff(optics(LiquidKind::Ocean)),
+    );
+    let sig = |o: KindOptics| {
+        let [r, g, b] = o.sigma_abs;
+        [r, g, b, o.sigma_turb]
+    };
+    let e = body_light(
+        light.ambient,
+        light.diffuse,
+        light.sun_dir,
+        light.celestial_dir,
+        dome,
+        look,
+    );
+    let rgb = |c: [f32; 3], w: f32| [c[0], c[1], c[2], w];
+    let rows: [[f32; 4]; 10] = [
+        sig(still),
+        sig(ocean),
+        rgb(e.e_sky, e.s0),
+        rgb(e.e_sun, e.k_e),
+        [
+            look.ramp_rate,
+            look.band_push,
+            look.band_edge,
+            look.lift_k * SHEEN_LIFT,
+        ],
+        [
+            look.refract,
+            look.refract_max_frac,
+            f32::from(u8::from(look.probe_refog)),
+            f32::from(u8::from(look.floor_refog)),
+        ],
+        shadow,
+        [e.sun_share, look.deep_ceiling, e.night, look.auth_floor],
+        // The foam rows' spare lanes carry each kind's ramp turbidity, river then ocean.
+        rgb(e.e_sky_foam, still.sigma_ramp),
+        rgb(e.e_sun_foam, ocean.sigma_ramp),
+    ];
+    let mut lanes = [0.0; BODY_FLOATS];
+    lanes.copy_from_slice(rows.as_flattened());
+    lanes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A noon-like day: a blue dome, a warm sun 30° up, the celestial sun near the zenith.
+    fn day() -> ([f32; 3], [f32; 3], Vec3, [Vec4; 7]) {
+        let g = |r: f32, g: f32, b: f32| Vec4::new(r / 255.0, g / 255.0, b / 255.0, 0.0);
+        let dome = [
+            g(42.0, 101.0, 172.0),
+            g(94.0, 147.0, 203.0),
+            g(130.0, 174.0, 219.0),
+            g(160.0, 196.0, 225.0),
+            g(178.0, 207.0, 229.0),
+            g(186.0, 211.0, 230.0),
+            Vec4::ZERO,
+        ];
+        let el = 30f32.to_radians();
+        (
+            [0.40, 0.40, 0.42],
+            [0.80, 0.70, 0.55],
+            Vec3::new(el.cos(), -el.sin(), 0.0),
+            dome,
+        )
+    }
+
+    /// The day's light with the celestial sun along `celestial`.
+    fn light_toward(celestial: Vec3, look: &BodyLook) -> BodyLight {
+        let (ambient, diffuse, sun, dome) = day();
+        body_light(ambient, diffuse, sun, celestial, &dome, look)
+    }
+
+    fn noon_light() -> BodyLight {
+        light_toward(Vec3::new(0.0, 1.0, 0.1), &BodyLook::default())
+    }
+
+    /// HSV hue in degrees.
+    fn hue(c: [f32; 3]) -> f32 {
+        let (max, min) = (c[0].max(c[1]).max(c[2]), c[0].min(c[1]).min(c[2]));
+        let d = max - min;
+        let h = if max == c[0] {
+            ((c[1] - c[2]) / d).rem_euclid(6.0)
+        } else if max == c[1] {
+            (c[2] - c[0]) / d + 2.0
+        } else {
+            (c[0] - c[1]) / d + 4.0
+        };
+        60.0 * h
+    }
+
+    fn chroma(c: [f32; 3]) -> f32 {
+        c[0].max(c[1]).max(c[2]) - c[0].min(c[1]).min(c[2])
+    }
+
+    /// The weights are the cosine integral of the dome law's rings, piecewise linear in
+    /// elevation, and they sum to 1; the rings are `dome_color`'s.
+    #[test]
+    fn the_dome_weights_are_the_dome_laws_irradiance() {
+        let sum: f32 = DOME_IRRADIANCE_W.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-5, "{sum}");
+        // fog, sky4, sky3, sky2, sky1, sky0 at their elevations in degrees.
+        let rings = [0.0f64, 1.8, 3.7, 9.8, 16.8, 90.0];
+        let mut w = [0.0f64; 6];
+        const N: usize = 20_000;
+        for i in 0..5 {
+            let (a, b) = (rings[i], rings[i + 1]);
+            for k in 0..N {
+                let e0 = a + (b - a) * k as f64 / N as f64;
+                let e1 = a + (b - a) * (k + 1) as f64 / N as f64;
+                let u = (0.5 * (e0 + e1) - a) / (b - a);
+                let dw = e1.to_radians().sin().powi(2) - e0.to_radians().sin().powi(2);
+                w[i] += (1.0 - u) * dw;
+                w[i + 1] += u * dw;
+            }
+        }
+        // The constant runs sky0 to sky4, then fog: the rings reversed.
+        for (stop, want) in w.iter().rev().enumerate() {
+            let got = DOME_IRRADIANCE_W[stop];
+            assert!(
+                (got - *want as f32).abs() < 1e-5,
+                "stop {stop}: {got} against {want}"
+            );
+        }
+        let law = include_str!("../../benilla-assets/src/shaders/liquid.wgsl");
+        let law = &law[law.find("fn dome_color(").expect("the dome law")..];
+        for ring in [
+            "elev <= 0.0",
+            "elev < 1.8",
+            "elev < 3.7",
+            "elev < 9.8",
+            "elev < 16.8",
+            "(90.0 - 16.8)",
+        ] {
+            assert!(law.contains(ring), "the dome law lost `{ring}`");
+        }
+    }
+
+    /// A row's absorption is anchored on pure water: no channel absorbs less, one exactly as much.
+    #[test]
+    fn the_absorption_is_anchored_on_pure_water() {
+        let look = BodyLook::default();
+        // Bytes from a fixed LCG, black and grey rows besides.
+        let mut seed = 0x2545_f491_u32;
+        let mut byte = || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 24) as f32 / 255.0
+        };
+        let mut rows = vec![[0.0; 3], [0.02; 3], [0.10, 0.25, 0.30], [0.35, 0.33, 0.10]];
+        rows.extend((0..200).map(|_| [byte(), byte(), byte()]));
+        for deep in rows {
+            for ocean in [false, true] {
+                let o = kind_optics([0.3, 0.4, 0.35], deep, 0.5, ocean, &look);
+                let ratio = (0..3)
+                    .map(|c| o.sigma_abs[c] / SIGMA_PURE_WATER[c])
+                    .fold(f32::MAX, f32::min);
+                assert!((ratio - 1.0).abs() < 1e-5, "{deep:?}: {:?}", o.sigma_abs);
+            }
+        }
+    }
+
+    /// A blue deep row absorbs red most; a yellow one, blue.
+    #[test]
+    fn blue_rows_absorb_red_and_yellow_rows_blue() {
+        let look = BodyLook::default();
+        let blue = kind_optics([0.3, 0.4, 0.4], [0.08, 0.22, 0.30], 0.5, false, &look).sigma_abs;
+        assert!(blue[0] > blue[1] && blue[0] > blue[2], "{blue:?}");
+        let yellow = kind_optics([0.4, 0.4, 0.2], [0.30, 0.28, 0.05], 0.5, false, &look).sigma_abs;
+        assert!(yellow[2] > yellow[0] && yellow[2] > yellow[1], "{yellow:?}");
+    }
+
+    /// A black deep row takes the clear lake's shape.
+    #[test]
+    fn a_black_row_takes_the_clear_lakes_shape() {
+        let o = kind_optics([0.2, 0.3, 0.3], [0.0; 3], 0.5, false, &BodyLook::default());
+        let want = anchored(SIGMA_CLEAR_LAKE);
+        for (got, want) in o.sigma_abs.iter().zip(want) {
+            assert!((got / want - 1.0).abs() < 1e-5, "{:?}", o.sigma_abs);
+        }
+    }
+
+    /// The modal alpha leaves the turbidity at the reference times the hue factor, on both kinds.
+    #[test]
+    fn the_modal_alpha_scales_the_turbidity_by_one() {
+        let look = BodyLook::default();
+        for (ocean, alpha) in [(false, 0.5), (true, 0.75)] {
+            let o = kind_optics([0.3, 0.4, 0.4], [0.1, 0.2, 0.25], alpha, ocean, &look);
+            let want = TURB_REF * yellowness(o.sigma_abs) / yellowness(SIGMA_CLEAR_LAKE);
+            assert!((o.sigma_ramp / want - 1.0).abs() < 1e-5, "{o:?}");
+        }
+        // A 0.85 river is murkier: ln(0.15)/ln(0.5) = 2.74.
+        let modal = kind_optics([0.3, 0.4, 0.4], [0.1, 0.2, 0.25], 0.5, false, &look);
+        let murky = kind_optics([0.3, 0.4, 0.4], [0.1, 0.2, 0.25], 0.85, false, &look);
+        assert!((murky.sigma_ramp / modal.sigma_ramp - 2.737).abs() < 1e-3);
+    }
+
+    /// The clear lake's blue over green absorption, the turbidity's hue reference, and a black row
+    /// (the clear lake's shape) at the modal alpha has the reference turbidity.
+    #[test]
+    fn the_clear_lake_has_the_reference_turbidity() {
+        assert!((yellowness(SIGMA_CLEAR_LAKE) - 0.7645).abs() < 1e-3);
+        assert!((yellowness(anchored(SIGMA_CLEAR_LAKE)) - 0.7645).abs() < 1e-3);
+        let o = kind_optics([0.2, 0.3, 0.3], [0.0; 3], 0.5, false, &BodyLook::default());
+        assert!((o.sigma_ramp / TURB_REF - 1.0).abs() < 1e-4, "{o:?}");
+    }
+
+    /// A blue deep row is clearer than the clear lake, however dull its blue; a teal one about as
+    /// clear; a green or yellow-brown one murkier, the yellower the murkier (Loch Modan's, Elwynn's,
+    /// Felwood's and the Swamp of Sorrows' noon rows).
+    #[test]
+    fn blue_water_is_clear_and_yellow_water_murky() {
+        let look = BodyLook::default();
+        let turb = |s: [f32; 3], d: [f32; 3]| {
+            let b = |c: [f32; 3]| c.map(|x| x / 255.0);
+            kind_optics(b(s), b(d), 0.5, false, &look).sigma_ramp / TURB_REF
+        };
+        let blue = turb([95.0, 80.0, 56.0], [64.0, 78.0, 110.0]);
+        let teal = turb([79.0, 93.0, 20.0], [51.0, 82.0, 85.0]);
+        let green = turb([94.0, 91.0, 25.0], [96.0, 101.0, 50.0]);
+        let yellow = turb([160.0, 125.0, 18.0], [84.0, 68.0, 18.0]);
+        assert!(blue < 0.8, "{blue}");
+        assert!((0.9..1.4).contains(&teal), "{teal}");
+        assert!(green > 2.0 && yellow > green, "{green} {yellow}");
+    }
+
+    /// The clarity: at the swatch's clarity the image loses the swatch's whole turbidity; at the
+    /// default a clear kind loses a sixteenth of it and a swamp all of it, and the ramp's
+    /// turbidity is the swatch's at every clarity; at 0.5 a clear kind loses a quarter (the first
+    /// clarity pass's default), at 2 a 64th; below the swatch's clarity nothing murkier happens.
+    #[test]
+    fn the_clarity_clears_the_clear_kinds_and_leaves_the_swamp() {
+        assert_eq!(turb_keep(1.0, CLARITY_SWATCH), 1.0);
+        assert_eq!(turb_keep(4.0, CLARITY_SWATCH), 1.0);
+        assert_eq!(turb_keep(1.0, 0.1), 1.0);
+        assert!((turb_keep(0.7, 1.0) - 0.0625).abs() < 1e-6);
+        assert!((turb_keep(1.0, 1.0) - 0.0625).abs() < 1e-6);
+        assert!((turb_keep(1.0, 0.5) - 0.25).abs() < 1e-6);
+        assert!((turb_keep(1.0, 2.0) - 1.0 / 64.0).abs() < 1e-6);
+        assert_eq!(turb_keep(4.1, 1.0), 1.0);
+        assert_eq!(turb_keep(4.1, 2.0), 1.0);
+        assert!((turb_keep(1.6, 1.0) - 0.0625).abs() < 0.02);
+        let mid = turb_keep(2.25, 1.0);
+        assert!((0.5..0.6).contains(&mid), "{mid}");
+        let b = |c: [f32; 3]| c.map(|x| x / 255.0);
+        for clarity in [0.25, 0.5, 1.0, 2.0] {
+            let look = BodyLook {
+                clarity,
+                ..BodyLook::default()
+            };
+            // Loch Modan's noon row (murk 1.36): a lake.
+            let loch = kind_optics(
+                b([95.0, 80.0, 56.0]),
+                b([64.0, 78.0, 110.0]),
+                0.5,
+                false,
+                &look,
+            );
+            let swatch = kind_optics(
+                b([95.0, 80.0, 56.0]),
+                b([64.0, 78.0, 110.0]),
+                0.5,
+                false,
+                &BodyLook {
+                    clarity: CLARITY_SWATCH,
+                    ..BodyLook::default()
+                },
+            );
+            assert_eq!(loch.sigma_ramp, swatch.sigma_ramp);
+            assert_eq!(swatch.sigma_turb, swatch.sigma_ramp);
+            let murk = loch.sigma_ramp / TURB_REF;
+            let want = loch.sigma_ramp * turb_keep(murk, clarity);
+            assert!((loch.sigma_turb - want).abs() < 1e-6, "{clarity}: {loch:?}");
+            // The Swamp of Sorrows' yellow row (murk 4): the image loses it all.
+            let swamp = kind_optics(
+                b([160.0, 125.0, 18.0]),
+                b([84.0, 68.0, 18.0]),
+                0.5,
+                false,
+                &look,
+            );
+            assert_eq!(swamp.sigma_turb, swamp.sigma_ramp, "{clarity}");
+        }
+    }
+
+    /// The body's light has the terrain's open-sky luminance, whatever its chroma.
+    #[test]
+    fn the_body_light_has_the_terrains_luminance() {
+        let (ambient, diffuse, sun, _) = day();
+        let mu = -sun.normalize().y;
+        let lit: [f32; 3] = std::array::from_fn(|c| (ambient[c] + diffuse[c] * mu).clamp(0.0, 1.0));
+        let e = noon_light();
+        assert!(e.k_e > 0.25 && e.k_e < 16.0, "k_E clamped: {}", e.k_e);
+        let open: [f32; 3] = std::array::from_fn(|c| e.e_sky[c] + e.e_sun[c]);
+        assert!(
+            (luma(open) - luma(dec3(lit))).abs() < 1e-5,
+            "{open:?} against {lit:?}"
+        );
+    }
+
+    /// The raw rows keep the dome's and the sun's full chroma at the body's luminance; foam's rows
+    /// hold that luminance in the terrain light's colour and add up, in the open, to the terrain's
+    /// light itself, tint included: open foam is `FOAM_COLOR·lit`, as 1.12 draws it.
+    #[test]
+    fn the_foam_rows_are_the_terrain_light_at_the_bodys_luminance() {
+        let e = noon_light();
+        for (body, raw, foam) in [
+            (e.e_sky, e.e_sky_raw, e.e_sky_foam),
+            (e.e_sun, e.e_sun_raw, e.e_sun_foam),
+        ] {
+            assert!((luma(body) - luma(raw)).abs() < 1e-5, "{body:?} {raw:?}");
+            assert!((luma(body) - luma(foam)).abs() < 1e-5, "{body:?} {foam:?}");
+            assert!(chroma(raw) > chroma(body), "{body:?} {raw:?}");
+        }
+        // The raw rows are the light itself, rescaled.
+        let (ambient, diffuse, sun, dome) = day();
+        let unscaled = body_light(ambient, diffuse, sun, Vec3::Y, &dome, &BodyLook::default());
+        let sky = sky_irradiance(&dome);
+        for (got, sky) in unscaled.e_sky_raw.iter().zip(sky) {
+            assert!((got - sky * (1.0 - F_DIFFUSE) * unscaled.k_e).abs() < 1e-6);
+        }
+        let mu = -sun.normalize().y;
+        let lit = dec3(std::array::from_fn(|c| {
+            (ambient[c] + diffuse[c] * mu).clamp(0.0, 1.0)
+        }));
+        for (c, lit) in lit.iter().enumerate() {
+            let open = e.e_sky_foam[c] + e.e_sun_foam[c];
+            assert!((open - lit).abs() < 1e-5, "{e:?} against {lit}");
+        }
+    }
+
+    /// With the celestial sun below the horizon the body keeps the light's whole chroma; at noon,
+    /// a quarter.
+    #[test]
+    fn night_light_keeps_its_blue() {
+        let look = BodyLook::default();
+        let night = light_toward(Vec3::new(0.95, -0.3, 0.0), &look);
+        assert_eq!(night.night, 1.0);
+        for c in 0..3 {
+            assert!(
+                (night.e_sky[c] - night.e_sky_raw[c]).abs() < 1e-6,
+                "{night:?}"
+            );
+            assert!(
+                (night.e_sun[c] - night.e_sun_raw[c]).abs() < 1e-6,
+                "{night:?}"
+            );
+        }
+        let noon = noon_light();
+        assert_eq!(noon.night, 0.0);
+        let y = luma(noon.e_sky_raw);
+        for c in 0..3 {
+            let want = y + 0.25 * (noon.e_sky_raw[c] - y);
+            assert!((noon.e_sky[c] - want).abs() < 1e-6, "{noon:?}");
+        }
+    }
+
+    /// No chroma kept, the body's light is grey.
+    #[test]
+    fn no_chroma_is_neutral() {
+        let look = BodyLook {
+            illum_chroma: 0.0,
+            ..BodyLook::default()
+        };
+        let e = light_toward(Vec3::Y, &look);
+        for c in [e.e_sky, e.e_sun] {
+            assert!(chroma(c) < 1e-6, "{c:?}");
+        }
+    }
+
+    /// In MCSH shadow the body keeps what the terrain keeps, 0.7 in gamma: the sun's floor `s0`
+    /// makes `Y(e_sky + s0·e_sun)` 0.456 of the open light, or 0 where the sky alone is more.
+    #[test]
+    fn shadowed_water_darkens_as_the_terrain_beside_it() {
+        let law = dec(0.7);
+        assert!((law - 0.456).abs() < 1e-3, "{law}");
+        let (ambient, _, sun, dome) = day();
+        // A night-like dim dome under a bright sun, the day, and a sky-lit dusk.
+        let dim = dome.map(|r| r * 0.15);
+        let mut branches = [0; 2];
+        for (diffuse, dome) in [
+            ([1.0, 1.0, 1.0], &dim),
+            ([0.80, 0.70, 0.55], &dome),
+            ([0.2, 0.2, 0.25], &dome),
+        ] {
+            let e = body_light(ambient, diffuse, sun, Vec3::Y, dome, &BodyLook::default());
+            let open = luma(e.e_sky) + luma(e.e_sun);
+            let shade = luma(e.e_sky) + e.s0 * luma(e.e_sun);
+            if 1.0 - e.sun_share < law {
+                assert!((shade / open - law).abs() < 1e-4, "{e:?}");
+                branches[0] += 1;
+            } else {
+                assert_eq!(e.s0, 0.0, "{e:?}");
+                branches[1] += 1;
+            }
+            assert!((0.0..=1.0).contains(&e.s0), "{e:?}");
+        }
+        assert!(
+            branches.iter().all(|&n| n > 0),
+            "both sides of the law: {branches:?}"
+        );
+    }
+
+    /// **One light, two chroma treatments.** At a surface point the body and foam are lit by the
+    /// same open shares: in the open at the terrain's open-sky luminance, in MCSH shadow at 0.456
+    /// of it (as the bank beside it), under a closed sky by the sun alone; foam's light has the
+    /// body's luminance everywhere, only its chroma differs, and it keeps the terrain light's hue
+    /// at every open share, so shaded foam darkens and does not turn blue. The shader's
+    /// `body_irradiance` is this function's text.
+    #[test]
+    fn the_body_and_foam_take_one_light() {
+        let (ambient, diffuse, sun, dome) = day();
+        let e = body_light(ambient, diffuse, sun, Vec3::Y, &dome, &BodyLook::default());
+        let lit_open = luma(dec3(std::array::from_fn(|c| {
+            (ambient[c] + diffuse[c] * (-sun.normalize().y)).clamp(0.0, 1.0)
+        })));
+        let (open, open_foam) = irradiance(&e, 1.0, 1.0);
+        assert!((luma(open) - lit_open).abs() < 1e-4 * lit_open.max(1.0));
+        let (shade, _) = irradiance(&e, 1.0, 0.0);
+        // The terrain's law, or the sky's share alone where that is more (`s0` 0).
+        let law = dec(0.7).max(1.0 - e.sun_share);
+        assert!((luma(shade) / luma(open) - law).abs() < 1e-3, "{e:?}");
+        let (closed, _) = irradiance(&e, 0.0, 1.0);
+        assert!((luma(closed) - luma(e.e_sun)).abs() < 1e-6);
+        assert_ne!(open, open_foam, "foam keeps the light's chroma");
+        for (v, s) in [(1.0, 1.0), (0.3, 1.0), (1.0, 0.0), (0.0, 0.25), (0.6, 0.5)] {
+            let (body, foam) = irradiance(&e, v, s);
+            assert!(
+                (luma(body) - luma(foam)).abs() < 1e-5,
+                "v {v}, s {s}: {body:?} against {foam:?}"
+            );
+            for c in 0..3 {
+                let tint = foam[c] / luma(foam);
+                assert!(
+                    (tint - open_foam[c] / luma(open_foam)).abs() < 1e-4,
+                    "v {v}, s {s}: {foam:?} against {open_foam:?}"
+                );
+            }
+        }
+        let wgsl = include_str!("../../benilla-assets/src/shaders/liquid.wgsl");
+        for line in [
+            "let s = select(1.0, lighting_sun_mcsh(world_pos, column), adt) * vis.b;",
+            "let s_eff = mix(b.e_sky.w, 1.0, s);",
+            "b.e_sky.rgb * vis.g + b.e_sun.rgb * s_eff,",
+            "b.e_sky_foam.rgb * vis.g + b.e_sun_foam.rgb * s_eff,",
+        ] {
+            assert!(wgsl.contains(line), "liquid.wgsl lost `{line}`");
+        }
+    }
+
+    /// A zeroed light, a dark sky with no sun and a sunless dome are all finite: every division
+    /// is guarded.
+    #[test]
+    fn a_zeroed_light_is_finite() {
+        let look = BodyLook::default();
+        let cases = [
+            body_light(
+                [0.0; 3],
+                [0.0; 3],
+                Vec3::ZERO,
+                Vec3::ZERO,
+                &[Vec4::ZERO; 7],
+                &look,
+            ),
+            body_light(
+                [0.0; 3],
+                [0.0; 3],
+                Vec3::NEG_Y,
+                Vec3::Y,
+                &[Vec4::ZERO; 7],
+                &look,
+            ),
+            body_light([0.1; 3], [0.0; 3], Vec3::X, Vec3::Y, &day().3, &look),
+        ];
+        for e in cases {
+            let all = [
+                e.e_sky,
+                e.e_sun,
+                e.e_sky_raw,
+                e.e_sun_raw,
+                e.e_sky_foam,
+                e.e_sun_foam,
+            ]
+            .concat();
+            assert!(
+                all.iter()
+                    .chain(&[e.s0, e.k_e, e.sun_share])
+                    .all(|x| x.is_finite()),
+                "{e:?}"
+            );
+        }
+        assert_eq!(cases[2].sun_share, 0.0);
+        let mut light = WowLighting::default();
+        light.sun_dir = Vec3::ZERO;
+        let lanes = body_lanes(&light, &[Vec4::ZERO; 7], &look, [0.0; 4]);
+        assert!(lanes.iter().all(|x| x.is_finite()), "{lanes:?}");
+    }
+
+    /// The black-row branch is a blend: sweeping the deepest row's peak from black to byte 8 in
+    /// 2000 steps moves no absorption channel by more than 1% a step.
+    #[test]
+    fn a_black_deep_row_fades_to_the_clear_lake_shape_without_a_step() {
+        let top = dec(8.0 / 255.0);
+        for tint in [[1.0, 0.5, 0.2], [0.1, 0.4, 1.0], [0.3, 1.0, 0.6]] {
+            let at = |i: usize| {
+                let m = top * i as f32 / 2000.0;
+                absorption(tint.map(|t| t * m), 0.25)
+            };
+            let mut last = at(0);
+            for i in 1..=2000 {
+                let s = at(i);
+                for c in 0..3 {
+                    let step = (s[c] / last[c] - 1.0).abs();
+                    assert!(step <= 0.01, "{tint:?} at step {i}, channel {c}: {step}");
+                }
+                last = s;
+            }
+        }
+    }
+
+    /// The lift adds at most `lift` to any channel and keeps the row's hue.
+    #[test]
+    fn the_lift_never_adds_more_than_lift_to_a_channel() {
+        let mut rows = vec![[0.05, 0.15, 0.30], [0.0; 3], [1.0, 1.0, 1.0]];
+        for r in 0..6 {
+            for g in 0..6 {
+                for b in 0..6 {
+                    rows.push([r as f32 / 5.0, g as f32 / 5.0, b as f32 / 5.0]);
+                }
+            }
+        }
+        for row in rows {
+            for k in 0..=25 {
+                let lift = k as f32 / 100.0;
+                let l = body_lift(row, lift);
+                let peak = l[0].max(l[1]).max(l[2]);
+                assert!(peak <= lift + 1e-6, "{row:?} at {lift}: {l:?}");
+                if chroma(row) > 0.02 && lift > 0.0 {
+                    assert!((hue(l) - hue(row)).abs() < 1e-3, "{row:?} at {lift}: {l:?}");
+                }
+            }
+        }
+    }
+
+    /// The shader keeps these lines of the body: `body_lift`'s return as [`body_lift`] has it, the
+    /// stops read from rows 0 and 63 (no ocean tail, as [`deep_stop`]) at the ceiling lane and half
+    /// of it, `t_bed` and `w_in` from one `t_turb`, and the optical path as [`optical_path`] has it:
+    /// along the refracted rays to the bed's depth, on ADT water at most the authored column. A
+    /// text pin: `x`, the bands, the ramp and the stops' argument order are not checked here.
+    #[test]
+    fn the_shader_keeps_the_body_lift_stop_and_transport_lines() {
+        let wgsl = include_str!("../../benilla-assets/src/shaders/liquid.wgsl");
+        for line in [
+            "return lift * a_g / max(max(a_g.r, max(a_g.g, a_g.b)), max(lift, 1e-4));",
+            "let r0 = swatch_row(body_shallow, body_deep, 0.0, ocean).rgb;",
+            "let r63 = swatch_row(body_shallow, body_deep, 63.0, false).rgb;",
+            "let dc = water_reflect.look.body.spare.y;",
+            "mix(r0, r63, 0.5 * dc),",
+            "mix(r0, r63, dc),",
+            "o.t_bed = select(vec3<f32>(0.0), exp(-bi.sig_abs * o.l_opt) * t_turb, o.known);",
+            "o.w_in = select(1.0, 1.0 - t_turb, o.known);",
+            "let z_path = select(o.z, min(o.z, bi.fallback_z), bi.adt);",
+            "o.l_view = z_path / mu_v;",
+            "o.l_opt = min(o.l_view + z_path / mu_d, 4096.0);",
+            "let tau_t = bi.sig_turb * o.l_opt;",
+            "let tau_ramp = bi.sig_ramp * o.l_opt;",
+            "o.t_bed = select(o.t_bed, max(o.t_bed, vec3<f32>(bi.auth_t)), o.known);",
+            "o.w_in = min(o.w_in, 1.0 - max(o.t_bed.r, max(o.t_bed.g, o.t_bed.b)));",
+            "let x0 = select(min(1.0 - exp(-look.x * tau_ramp), bi.auth_x), 1.0, below);",
+            "select(1.0, saturate(depth_f / max(dc, 1e-3)), w.path.x < 0.5),",
+            "select(0.0, auth_floor * (1.0 - pow(swatch_at(shallow, deep, depth_f, ocean).w, 2.2)), w.path.x < 0.5),",
+            "let depth_f = saturate(depth * (1.0 + water_reflect.look.grade.w));",
+            "let auth_floor = water_reflect.look.body.spare.w;",
+            "depth * select(REF_RIVER_V_YD, REF_OCEAN_V_YD, ocean),",
+            "w.path.x < 0.5,",
+        ] {
+            assert!(wgsl.contains(line), "liquid.wgsl lost `{line}`");
+        }
+    }
+
+    /// The refraction bends the bed's lookup by the ripple's tilt alone, the horizontal part of the
+    /// resolved low band's normal the mirrors slide by: the normal is built about world up, so its
+    /// part off the heightfield's normal holds a sloping stream's grade, which would move the whole
+    /// bed downhill, and the octaves finer than the low band would tear a submerged edge row to row.
+    #[test]
+    fn the_refraction_bends_by_the_ripple_alone() {
+        let wgsl = include_str!("../../benilla-assets/src/shaders/liquid.wgsl");
+        for line in [
+            "let tau = vec3<f32>(n_lo.x, 0.0, n_lo.z);",
+            "water_body_optics(world_pos, frag_coord, sb, n_slide, flat_n, to_view, bi, wake_push);",
+        ] {
+            assert!(wgsl.contains(line), "liquid.wgsl lost `{line}`");
+        }
+        assert!(
+            !wgsl.contains("n - flat_n * dot(n, flat_n)"),
+            "the refraction's tilt takes no part of the heightfield's grade"
+        );
+    }
+
+    /// The refracted lookup is rejected where it lands on a surface standing above the pixel's own
+    /// bed by more than a 45° slope over the offset (a reed, a rock's submerged face): that
+    /// surface lies on another surface point's ray, and reading it duplicates and tears the
+    /// submerged edge frame to frame.
+    #[test]
+    fn the_refracted_read_keeps_off_what_stands_above_the_bed() {
+        let wgsl = include_str!("../../benilla-assets/src/shaders/liquid.wgsl");
+        for line in [
+            "let rise = distance(p_r, sb.bed);",
+            "let a_bed = 1.0 - smoothstep(rise, rise + 0.15, p_rr.y - sb.bed.y);",
+            "o.accept = select(0.0, a_front * a_below * a_bed, o.known && d_r > 0.0 && snap_fits);",
+        ] {
+            assert!(wgsl.contains(line), "liquid.wgsl lost `{line}`");
+        }
+    }
+
+    /// The authored column caps a deep lake's path: a bed 45 yd down under a river column authored
+    /// at byte 6 (V 6/42, 0.67 yd) shows through as the 1.12 lake does, where the true column passes
+    /// almost nothing (Loch Modan's noon row, a grazing view, the sun 60° up). A column authored at
+    /// V = 1 is the river LUT's 4.67 yd, which still passes a little at the swatch's clarity and
+    /// more at the default.
+    #[test]
+    fn a_deep_lake_bed_shows_through_its_authored_column() {
+        let b = |c: [f32; 3]| c.map(|x| x / 255.0);
+        let look = BodyLook {
+            clarity: CLARITY_SWATCH,
+            ..BodyLook::default()
+        };
+        let loch = kind_optics(
+            b([95.0, 80.0, 56.0]),
+            b([64.0, 78.0, 110.0]),
+            0.5,
+            false,
+            &look,
+        );
+        let mu_d = 0.85;
+        let t = |path: f32| luma(bed_transmittance(&loch, path));
+        let z_auth = 6.0 / 42.0 * AUTHORED_YD_PER_V[0];
+        let capped = optical_path(45.0, z_auth, MU_REFRACTED_MIN, mu_d, true);
+        let uncapped = optical_path(45.0, z_auth, MU_REFRACTED_MIN, mu_d, false);
+        assert!((capped - z_auth * (1.0 / MU_REFRACTED_MIN + 1.0 / mu_d)).abs() < 1e-4);
+        assert!(t(capped) > 0.4, "{} {loch:?}", t(capped));
+        assert!(t(uncapped) < 1e-3, "{}", t(uncapped));
+        let full = optical_path(45.0, AUTHORED_YD_PER_V[0], MU_REFRACTED_MIN, mu_d, true);
+        assert!((0.01..0.05).contains(&t(full)), "{}", t(full));
+        let clear = kind_optics(
+            b([95.0, 80.0, 56.0]),
+            b([64.0, 78.0, 110.0]),
+            0.5,
+            false,
+            &BodyLook::default(),
+        );
+        let t_clear = luma(bed_transmittance(&clear, full));
+        assert!((0.05..0.15).contains(&t_clear), "{t_clear}");
+    }
+
+    /// A bed shallower than its authored column keeps its own path, a deep ocean column authored
+    /// deep keeps its depth, and a WMO's water, whose byte is an opacity, is never capped.
+    #[test]
+    fn the_cap_leaves_shallow_beds_deep_oceans_and_wmo_water_alone() {
+        let (mu_v, mu_d) = (0.8, 0.9);
+        let free = |z: f32| z / mu_v + z / mu_d;
+        // A 1.5 yd bed under a river byte of 21 (V 0.5, 2.33 yd).
+        let river = 0.5 * AUTHORED_YD_PER_V[0];
+        assert_eq!(optical_path(1.5, river, mu_v, mu_d, true), free(1.5));
+        // A 40 yd sea bed under an ocean byte of 69 (40.1 yd).
+        let ocean = 69.0 / 255.0 * AUTHORED_YD_PER_V[1];
+        assert!((ocean - 40.12).abs() < 0.01, "{ocean}");
+        assert_eq!(optical_path(40.0, ocean, mu_v, mu_d, true), free(40.0));
+        // A deeper sea bed is held at the authored 40.1 yd, still opaque at the clear lake's rate.
+        let held = optical_path(90.0, ocean, mu_v, mu_d, true);
+        assert!((held - free(ocean)).abs() < 1e-3, "{held}");
+        let clear = KindOptics {
+            sigma_abs: anchored(SIGMA_CLEAR_LAKE),
+            sigma_turb: TURB_REF,
+            sigma_ramp: TURB_REF,
+        };
+        assert!(luma(bed_transmittance(&clear, held)) < 1e-4);
+        // WMO water: the byte is no depth.
+        assert_eq!(optical_path(9.0, 0.3, mu_v, mu_d, false), free(9.0));
+        // A bed above the surface and a zero column cross no water.
+        assert_eq!(optical_path(-1.0, river, mu_v, mu_d, true), 0.0);
+        assert_eq!(optical_path(3.0, 0.0, mu_v, mu_d, true), 0.0);
+    }
+
+    /// The CPU's authored yards per `V` and critical cosine are the shader's.
+    #[test]
+    fn the_authored_column_constants_are_the_shaders() {
+        let wgsl = include_str!("../../benilla-assets/src/shaders/liquid.wgsl");
+        let [river, ocean] = AUTHORED_YD_PER_V;
+        for line in [
+            format!("const REF_RIVER_V_YD: f32 = {river};"),
+            format!("const REF_OCEAN_V_YD: f32 = {ocean};"),
+            format!("const MU_D_MIN: f32 = {MU_REFRACTED_MIN};"),
+        ] {
+            assert!(wgsl.contains(&line), "liquid.wgsl lost `{line}`");
+        }
+    }
+
+    /// The deep stop at the ceiling, 0.72, is `mix(shallow, deep, 0.72)` of the swatch pair within
+    /// one row step of the byte ramp, `ceil(|c1 − c0|/64)`.
+    #[test]
+    fn the_deep_stop_is_the_ceilings_share_of_the_swatch_pair() {
+        let ceiling = BodyLook::default().deep_ceiling;
+        assert_eq!(ceiling, 0.72);
+        let swatches = [
+            ([90, 140, 140], [45, 35, 36]),
+            ([60, 88, 89], [10, 25, 40]),
+            ([255, 0, 128], [0, 255, 3]),
+            ([30, 30, 30], [31, 29, 30]),
+        ];
+        for (s, d) in swatches {
+            let (s, d) = (
+                s.map(|b: i32| b as f32 / 255.0),
+                d.map(|b: i32| b as f32 / 255.0),
+            );
+            for ocean in [false, true] {
+                let stop = deep_stop(s, d, ocean, ceiling);
+                for c in 0..3 {
+                    let today = s[c] + (d[c] - s[c]) * ceiling;
+                    let step = ((d[c] - s[c]).abs() * 255.0 / 64.0).ceil() / 255.0;
+                    assert!((stop[c] - today).abs() <= step + 1e-6, "{s:?} {d:?} {c}");
+                }
+            }
+        }
+    }
+
+    /// The rows sit where `WaterBody` declares them.
+    #[test]
+    fn the_body_rows_are_the_shaders() {
+        let wgsl = include_str!("../../benilla-assets/src/shaders/liquid.wgsl");
+        let body = &wgsl[wgsl.find("struct WaterBody {").expect("WaterBody")..];
+        let body = &body[..body.find("};").expect("its end")];
+        let members: Vec<&str> = body
+            .lines()
+            .map(str::trim)
+            .filter_map(|l| l.strip_suffix(": vec4<f32>,"))
+            .collect();
+        assert_eq!(
+            members,
+            [
+                "sig_river",
+                "sig_ocean",
+                "e_sky",
+                "e_sun",
+                "look",
+                "refr",
+                "shadow",
+                "spare",
+                "e_sky_foam",
+                "e_sun_foam"
+            ]
+        );
+        assert_eq!(members.len() * 4, BODY_FLOATS);
+        let (ambient, diffuse, sun, dome) = day();
+        let mut light = WowLighting::default();
+        light.ambient = ambient;
+        light.diffuse = diffuse;
+        light.sun_dir = sun;
+        light.celestial_dir = Vec3::new(0.0, 1.0, 0.1);
+        let lanes = body_lanes(&light, &dome, &BodyLook::default(), [1.0, 2.0, 500.0, 1.0]);
+        let row = |i: usize| -> [f32; 4] { lanes[4 * i..4 * i + 4].try_into().unwrap() };
+        assert_eq!(row(4), [0.615, 0.5, 0.22, 0.25]);
+        assert_eq!(row(5), [1.0, 0.01, 1.0, 1.0]);
+        // Each re-fog's lane alone: the probe's is refr.z, the floor's refr.w.
+        for (probe_refog, floor_refog, want) in [
+            (false, true, [0.0, 1.0]),
+            (true, false, [1.0, 0.0]),
+            (false, false, [0.0, 0.0]),
+        ] {
+            let look = BodyLook {
+                probe_refog,
+                floor_refog,
+                ..BodyLook::default()
+            };
+            let toggled = body_lanes(&light, &dome, &look, [1.0, 2.0, 500.0, 1.0]);
+            assert_eq!(
+                toggled[22..24],
+                want,
+                "probe {probe_refog}, floor {floor_refog}: the re-fogs' lanes are refr.z and refr.w"
+            );
+        }
+        assert_eq!(row(6), [1.0, 2.0, 500.0, 1.0]);
+        assert_eq!(row(7)[1], 0.72);
+        let e = noon_light();
+        assert_eq!(row(2), [e.e_sky[0], e.e_sky[1], e.e_sky[2], e.s0]);
+        assert_eq!(row(8)[..3], e.e_sky_foam);
+        assert_eq!(row(9)[..3], e.e_sun_foam);
+        // The foam rows' spare lanes: each kind's ramp turbidity.
+        let (shallow, deep, alpha, _) = light.water_colors_noon(LiquidKind::Still);
+        let still = kind_optics(shallow, deep, alpha, false, &BodyLook::default());
+        assert_eq!(row(8)[3], still.sigma_ramp);
+        assert_eq!(row(0)[3], still.sigma_turb);
+        let (shallow, deep, alpha, _) = light.water_colors_noon(LiquidKind::Ocean);
+        let ocean = kind_optics(shallow, deep, alpha, true, &BodyLook::default());
+        assert_eq!(row(9)[3], ocean.sigma_ramp);
+        assert_eq!(row(1)[3], ocean.sigma_turb);
+    }
+
+    /// A coral bank under a tropical sea (Stranglethorn's swatch, 15 yd down, authored at byte
+    /// 25 of the ocean's 255): the clear water's absorption alone leaves the bed under a twentieth
+    /// of itself and the ramp at its deep stop, where 1.12's blend leaves it about two fifths of
+    /// the pixel in linear light, under its shallow rows. The authored clarity keeps both, in the bed's own colours; the open sea
+    /// (byte 255) and a deep river pass nothing and keep the deep stop.
+    /// The transparency's ends and its default: 0 the swatch's whole turbidity and no floor, 1 a
+    /// quarter of it and [`TRANSPARENCY_FLOOR_MID`] of the floor, 2 the clarity of 1 and the whole
+    /// floor; continuous between, and `$WOW_WATER_CLARITY`'s mapping its inverse.
+    #[test]
+    fn the_transparency_moves_the_clarity_and_the_floor_together() {
+        assert_eq!(transparency_clarity(0.0), CLARITY_SWATCH);
+        assert_eq!(transparency_clarity(1.0), 0.5);
+        assert_eq!(transparency_clarity(2.0), 1.0);
+        assert_eq!(
+            [0.0, 1.0, 2.0].map(transparency_floor),
+            [0.0, TRANSPARENCY_FLOOR_MID, 1.0]
+        );
+        for c in [0.25, 0.5, 0.7, 1.0] {
+            assert!((transparency_clarity(clarity_transparency(c)) - c).abs() < 1e-6);
+        }
+        let d = BodyLook::default();
+        assert_eq!(d.clarity, transparency_clarity(TRANSPARENCY_DEFAULT));
+        assert_eq!(d.auth_floor, transparency_floor(TRANSPARENCY_DEFAULT));
+        assert_eq!(turb_keep(1.0, d.clarity), 0.25);
+    }
+
+    #[test]
+    fn the_authored_clarity_keeps_a_bank_the_sea_draws_through() {
+        let (shallow, deep) = (
+            [90.0 / 255.0, 171.0 / 255.0, 140.0 / 255.0],
+            [28.0 / 255.0, 44.0 / 255.0, 44.0 / 255.0],
+        );
+        let look = BodyLook::default();
+        let sea = kind_optics(shallow, deep, 0.75, true, &look);
+        let v = 25.0 / 255.0;
+        let z_auth = v * AUTHORED_YD_PER_V[1];
+        let path = optical_path(15.0, z_auth, 0.8, 0.9, true);
+        let t = bed_transmittance(&sea, path);
+        assert!(luma(t) < 0.05, "{t:?}");
+        let pass = authored_pass(v, 0.75, 1.0, true);
+        assert!((0.38..0.45).contains(&pass), "{pass}");
+        let w_in = 1.0 - (-sea.sigma_turb * path).exp();
+        let (t2, w2) = authored_bed(t, w_in, pass);
+        assert!(t2.iter().all(|c| *c >= pass) && w2 + t2[0].max(t2[1]).max(t2[2]) <= 1.0 + 1e-6);
+        assert!(authored_ramp(v, look.deep_ceiling) < 0.15);
+        assert_eq!(authored_pass(1.0, 0.75, 1.0, true), 0.0);
+        assert_eq!(authored_ramp(1.0, look.deep_ceiling), 1.0);
+        assert!(authored_pass(1.0, 0.5, 1.0, false) < 0.02);
+        let (t3, w3) = authored_bed([0.3, 0.6, 0.7], 0.2, 0.0);
+        assert_eq!((t3, w3), ([0.3, 0.6, 0.7], 0.2));
+    }
+}
