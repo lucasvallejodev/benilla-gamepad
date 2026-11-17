@@ -5,6 +5,7 @@
 use bevy::prelude::*;
 
 use super::{LookLanes, LookModel};
+use crate::lighting::WowLighting;
 
 /// The `autoExposure` CVar: the Modern look's exposure follows the light (the default), or holds
 /// at 1. A Classic frame has no exposure and ignores it.
@@ -56,10 +57,10 @@ impl Look {
         toe: 1.0,
     };
 
-    /// The combine's two lanes.
-    pub fn lanes(&self) -> [f32; 8] {
+    /// The combine's two lanes at the auto-exposure's `lift`.
+    pub fn lanes(&self, lift: f32) -> [f32; 8] {
         [
-            self.exposure,
+            self.exposure * lift,
             self.bloom,
             self.bloom_threshold,
             0.0,
@@ -76,7 +77,8 @@ impl Look {
 pub struct ActiveLook(pub Look);
 
 /// `$WOW_LOOK_TUNE="bloom=0.5,threshold=0.6"` overrides the look's constants for the session (keys
-/// `exposure`, `bloom`, `threshold`, `contrast`, `saturation`, `vignette`, `toe`), the lever for tuning them by capture.
+/// `exposure`, `bloom`, `threshold`, `contrast`, `saturation`, `vignette`, `toe`), the lever for
+/// tuning them by capture.
 impl Default for ActiveLook {
     fn default() -> Self {
         let mut look = Look::NEUTRAL;
@@ -101,9 +103,72 @@ impl Default for ActiveLook {
     }
 }
 
-/// The lanes this frame asks for: none in a Classic frame.
-fn update_lanes(model: Res<LookModel>, look: Res<ActiveLook>, mut lanes: ResMut<LookLanes>) {
-    let next = LookLanes(model.is_modern().then(|| look.0.lanes()));
+/// **The auto-exposure from the light rows**, the Low tier's meter (and every tier's until a
+/// screen meter exists). It lifts only a very dark light: below a deep dusk
+/// ([`AUTO_EXPOSURE_DARK`]) it makes up a share ([`AUTO_EXPOSURE_STRENGTH`]) of the shortfall,
+/// in stops; at and above it, every day and every dusk, it is exactly 1; and it never passes
+/// [`AUTO_EXPOSURE_MAX`], so a night still reads as night. It meters the authored rows (the
+/// ambient whole, the sun or moon diffuse at a typical incidence), not the screen, so a camera
+/// turn never moves it. Ported from benilla-bourbon's first light auto-exposure.
+const AUTO_EXPOSURE_STRENGTH: f32 = 0.5;
+/// The sRGB light rows (ambient, diffuse) below which the lift begins: a deep dusk.
+const AUTO_EXPOSURE_DARK: ([f32; 3], [f32; 3]) = ([0.25; 3], [0.3; 3]);
+/// The ceiling on the lift, one stop.
+const AUTO_EXPOSURE_MAX: f32 = 2.0;
+/// The time constant the lift eases with, in seconds: an eye adapting, not a meter snapping.
+const AUTO_EXPOSURE_SECONDS: f32 = 1.5;
+
+fn srgb_to_linear(c: f32) -> f32 {
+    if c <= 0.04045 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+/// The linear luminance a pair of sRGB light rows lights a surface with: the ambient whole, the
+/// diffuse at half (a typical N·L).
+fn light_key(ambient: [f32; 3], diffuse: [f32; 3]) -> f32 {
+    let lum = |c: [f32; 3]| {
+        0.2126 * srgb_to_linear(c[0])
+            + 0.7152 * srgb_to_linear(c[1])
+            + 0.0722 * srgb_to_linear(c[2])
+    };
+    lum(ambient) + 0.5 * lum(diffuse)
+}
+
+/// The lift a light asks for: 1 at [`AUTO_EXPOSURE_DARK`] and above, rising toward
+/// [`AUTO_EXPOSURE_MAX`] as the light falls.
+fn auto_exposure(ambient: [f32; 3], diffuse: [f32; 3]) -> f32 {
+    let reference = light_key(AUTO_EXPOSURE_DARK.0, AUTO_EXPOSURE_DARK.1);
+    (reference / light_key(ambient, diffuse).max(1e-4))
+        .powf(AUTO_EXPOSURE_STRENGTH)
+        .clamp(1.0, AUTO_EXPOSURE_MAX)
+}
+
+/// The lanes this frame asks for: none in a Classic frame. The first Modern frame takes the lift
+/// whole, so entering the world at night opens on the adapted picture; after it the lift eases.
+fn update_lanes(
+    model: Res<LookModel>,
+    look: Res<ActiveLook>,
+    auto: Res<AutoExposure>,
+    lighting: Option<Res<WowLighting>>,
+    time: Res<Time>,
+    mut adapted: Local<Option<f32>>,
+    mut lanes: ResMut<LookLanes>,
+) {
+    let next = if model.is_modern() {
+        let lift = match (lighting.as_deref(), auto.0) {
+            (Some(l), true) => auto_exposure(l.ambient, l.diffuse),
+            _ => 1.0,
+        };
+        let eye = adapted.get_or_insert(lift);
+        *eye += (lift - *eye) * (1.0 - (-time.delta_secs() / AUTO_EXPOSURE_SECONDS).exp());
+        LookLanes(Some(look.0.lanes(*eye)))
+    } else {
+        *adapted = None;
+        LookLanes(None)
+    };
     if *lanes != next {
         *lanes = next;
     }
@@ -113,4 +178,35 @@ pub(super) fn plugin(app: &mut App) {
     app.init_resource::<AutoExposure>()
         .init_resource::<ActiveLook>()
         .add_systems(Last, update_lanes);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn day_and_dusk_keep_an_exposure_of_one() {
+        // A forest noon, and the deep dusk itself.
+        assert_eq!(auto_exposure([0.4, 0.45, 0.5], [0.9, 0.8, 0.6]), 1.0);
+        assert_eq!(
+            auto_exposure(AUTO_EXPOSURE_DARK.0, AUTO_EXPOSURE_DARK.1),
+            1.0
+        );
+    }
+
+    #[test]
+    fn a_dark_night_lifts_but_never_past_the_ceiling() {
+        let night = auto_exposure([0.12, 0.14, 0.2], [0.15, 0.17, 0.25]);
+        assert!(night > 1.0 && night < AUTO_EXPOSURE_MAX, "{night}");
+        // Darker light, more lift; a black light sits at the ceiling.
+        assert!(auto_exposure([0.05; 3], [0.05; 3]) > night);
+        assert_eq!(auto_exposure([0.0; 3], [0.0; 3]), AUTO_EXPOSURE_MAX);
+    }
+
+    #[test]
+    fn the_lift_moves_the_exposure_lane_alone() {
+        let (a, b) = (Look::NEUTRAL.lanes(1.0), Look::NEUTRAL.lanes(1.5));
+        assert_eq!(b[0], a[0] * 1.5);
+        assert_eq!(a[1..], b[1..]);
+    }
 }
