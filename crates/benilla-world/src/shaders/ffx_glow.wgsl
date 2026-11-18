@@ -1310,9 +1310,10 @@ struct SunLanes {
     sun: vec4<f32>,
     // rgb the ambient colour (gamma, as the lighting adds it), w the map's texel in yards.
     ambient: vec4<f32>,
-    // rgb the sun's diffuse colour.
+    // rgb the sun's diffuse colour, w the visible sun's true height (its direction's y).
     diffuse: vec4<f32>,
-    // xyz the direction to the lighting sun, whose share of the light a shadow takes.
+    // xyz the direction to the lighting sun, whose share of the light a shadow takes; w the
+    // hour's share of the sun's haze and shafts (0 at night and in a frame without the block).
     light: vec4<f32>,
 };
 @group(0) @binding(11) var sun_map: texture_depth_2d;
@@ -1550,7 +1551,12 @@ const MFX_DOF_YD: vec2<f32> = vec2<f32>(90.0, 420.0);
 const MFX_DOF_PX: f32 = 1.3;
 const MFX_DOF_SKY: f32 = 0.25;
 /// The aerial haze: the most of the picture it takes, and the distance scale in yards.
-const MFX_HAZE: vec2<f32> = vec2<f32>(0.2, 340.0);
+const MFX_HAZE: vec2<f32> = vec2<f32>(0.34, 300.0);
+/// Toward the sun the haze takes this much of the sun's colour and grows by this much.
+const MFX_HAZE_SUN: vec2<f32> = vec2<f32>(0.6, 0.9);
+/// The light shafts: their strength and their taps toward the sun.
+const MFX_SHAFT: f32 = 0.3;
+const MFX_SHAFT_TAPS: i32 = 20;
 
 /// The linear depth at pixel `p` (clamped to the image), 0 where nothing was drawn.
 fn mfx_depth(p: vec2<f32>) -> f32 {
@@ -1792,7 +1798,11 @@ fn mfx_sun_map(pw: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
     let texel = s.ambient.w;
     let graze = 1.0 - saturate(dot(n, s.sun.xyz));
     let q = pw + n * texel * (2.0 + 4.0 * graze) + s.sun.xyz * texel * 2.0;
-    let c = s.clip_from_world * vec4<f32>(q, 1.0);
+    let c4 = s.clip_from_world * vec4<f32>(q, 1.0);
+    if (c4.w <= 0.0) {
+        return vec3<f32>(1.0);
+    }
+    let c = c4.xyz / c4.w;
     let edge = max(abs(c.x), abs(c.y));
     let fade = (1.0 - smoothstep(0.84, 0.98, edge)) * s.sun.w;
     if (fade <= 0.0 || c.z <= 0.0 || c.z >= 1.0) {
@@ -1811,6 +1821,49 @@ fn mfx_sun_map(pw: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
     // Half the hue shift: the whole of it reads as a blue wash under a warm sun.
     keep = mix(keep, vec3<f32>(dot(keep, vec3<f32>(0.299, 0.587, 0.114))), 0.5);
     return mix(vec3<f32>(1.0), keep, shade);
+}
+
+/// The direction to the visible sun, at its true height on the casting sun's bearing. Only while
+/// `sun_lanes.light.w` is set.
+fn mfx_to_sun() -> vec3<f32> {
+    let s = sun_lanes;
+    let level = normalize(s.sun.xz + vec2<f32>(1e-6, 0.0));
+    let y = clamp(s.diffuse.w, -1.0, 1.0);
+    let c = sqrt(max(1.0 - y * y, 0.0));
+    return vec3<f32>(level.x * c, y, level.y * c);
+}
+
+/// The light shafts at `uv` along the view ray `rd` (0 none): how much open sky lies between the
+/// pixel and the sun's place on the screen, twenty depth taps on the line to it, by how near the
+/// ray points to the sun. A tree or a roof between them cuts the light into shafts; with the sun
+/// far off the screen there are none. `frag` is the pixel, for the taps' offset.
+fn mfx_shafts(uv: vec2<f32>, rd: vec3<f32>, frag: vec2<f32>, dd: vec2<f32>) -> f32 {
+    let u = uwb.u;
+    let k = sun_lanes.light.w;
+    if (k <= 0.0) {
+        return 0.0;
+    }
+    let sun = mfx_to_sun();
+    let zc = dot(sun, u.cam_fwd.xyz);
+    let toward = saturate(dot(rd, sun));
+    if (zc <= 0.03 || toward <= 0.0) {
+        return 0.0;
+    }
+    let tan_h2 = dot(u.cam_right.xyz, u.cam_right.xyz);
+    let tan_v2 = dot(u.cam_up.xyz, u.cam_up.xyz);
+    let ndc = vec2<f32>(dot(sun, u.cam_right.xyz) / (zc * tan_h2), dot(sun, u.cam_up.xyz) / (zc * tan_v2));
+    let on = 1.0 - smoothstep(1.0, 1.7, max(abs(ndc.x), abs(ndc.y)));
+    if (on <= 0.0) {
+        return 0.0;
+    }
+    let suv = vec2<f32>(ndc.x, -ndc.y) * 0.5 + vec2<f32>(0.5);
+    let jit = mfx_noise(frag);
+    var open = 0.0;
+    for (var i = 0; i < MFX_SHAFT_TAPS; i = i + 1) {
+        let q = clamp(mix(uv, suv, (f32(i) + jit) / f32(MFX_SHAFT_TAPS)), vec2<f32>(0.0), vec2<f32>(1.0));
+        open = open + select(0.0, 1.0, mfx_depth(q * dd) <= 0.0);
+    }
+    return open / f32(MFX_SHAFT_TAPS) * pow(toward, 5.0) * on * k;
 }
 
 /// The depth effects on the dry scene colour `sg` (gamma) at `uv`, view Z `z` (0 the sky), `t_d`
@@ -1839,8 +1892,19 @@ fn mfx_apply(uv: vec2<f32>, sg: vec3<f32>, z: f32, t_d: f32, rd: vec3<f32>) -> v
         c = c * mfx_sun_map(u.cam_pos.xyz + rd * t_d, mfx_normal(p, z, dd));
     }
     if (z > 0.0) {
-        let haze = MFX_HAZE.x * (1.0 - exp(-t_d / MFX_HAZE.y));
-        c = mix(c, mix(u.fog_dry.rgb, u.sky_horizon.rgb, 0.4), haze);
+        var haze = MFX_HAZE.x * (1.0 - exp(-t_d / MFX_HAZE.y));
+        var haze_c = mix(u.fog_dry.rgb, u.sky_horizon.rgb, 0.4);
+        if (sun_lanes.light.w > 0.0) {
+            // Toward the sun the air glows with its colour, and there is more of it.
+            let toward = pow(saturate(dot(rd, mfx_to_sun())), 4.0) * sun_lanes.light.w;
+            haze_c = mix(haze_c, max(haze_c, u.sun_dry.rgb), MFX_HAZE_SUN.x * toward);
+            haze = haze * (1.0 + MFX_HAZE_SUN.y * toward);
+        }
+        c = mix(c, haze_c, min(haze, 0.8));
+    }
+    let shaft = mfx_shafts(uv, rd, p, dd);
+    if (shaft > 0.0) {
+        c = c + u.sun_dry.rgb * (shaft * MFX_SHAFT);
     }
     return c;
 }

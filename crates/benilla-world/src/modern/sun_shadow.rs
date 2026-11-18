@@ -1,5 +1,5 @@
 //! benilla-gamepad fork: **sun shadows** for the Modern look. A camera at the lighting sun draws
-//! the world round the viewer a second time ([`SunShadowCamera`], orthographic, the water mirror's
+//! the world round the viewer a second time ([`SunShadowCamera`], a long lens, the water mirror's
 //! view shape); its depth is the shadow map. The FFXGlow combine (`ffx_glow`, `mfx_sun_map`)
 //! finds each pixel's world point from the linear depth, asks the map whether the sun reaches it,
 //! and where it does not, takes the sun's share out of the picture: the lit colour is
@@ -12,7 +12,7 @@
 //! No ray is traced and no vendor feature is used: one more depth draw and a 3x3 compare.
 
 use bevy::asset::RenderAssetUsages;
-use bevy::camera::{ClearColorConfig, RenderTarget, ScalingMode};
+use bevy::camera::{ClearColorConfig, RenderTarget};
 use bevy::core_pipeline::core_3d::Transparent3d;
 use bevy::prelude::*;
 use bevy::render::extract_component::{ExtractComponent, ExtractComponentPlugin};
@@ -52,9 +52,11 @@ impl Default for SunShadows {
 #[derive(Component, Clone, Copy, Default, ExtractComponent)]
 pub struct SunShadowCamera;
 
-/// The combine's shadow block this frame (`SunLanes` in `ffx_glow.wgsl`), `None` while off:
-/// the map's clip-from-world matrix, the direction to the sun and the strength, then the
-/// ambient and diffuse colours, the map's texel in yards in `ambient.w`.
+/// The combine's sun block this frame (`SunLanes` in `ffx_glow.wgsl`), `None` in a Classic or
+/// Low frame: the map's clip-from-world matrix, the direction to the casting sun and the shadows'
+/// strength (0 with them off or at night), the ambient and diffuse colours (the map's texel in
+/// yards in `ambient.w`, the visible sun's height in `diffuse.w`), then the direction to the
+/// lighting sun and the hour's share of sun haze and shafts.
 #[derive(Resource, Clone, Copy, PartialEq, Debug, Default, ExtractResource)]
 pub struct SunShadowLanes(pub Option<[f32; 32]>);
 
@@ -95,14 +97,15 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
             is_active: false,
             ..default()
         },
-        Projection::Orthographic(OrthographicProjection {
-            near: 1.0,
+        // A long lens, not an orthographic one: the view's pipelines are then the water mirror's,
+        // which the client compiles before the world shows (`pipe_warm`), and the combine
+        // projects with the camera's own matrix either way.
+        Projection::Perspective(PerspectiveProjection {
+            fov: 2.0 * (HALF_EXTENT / STANDOFF).atan(),
+            aspect_ratio: 1.0,
+            near: 20.0,
             far: FAR,
-            scaling_mode: ScalingMode::Fixed {
-                width: 2.0 * HALF_EXTENT,
-                height: 2.0 * HALF_EXTENT,
-            },
-            ..OrthographicProjection::default_3d()
+            ..default()
         }),
         Transform::default(),
     ));
@@ -132,6 +135,15 @@ fn caster(to_sun: Vec3) -> (Vec3, f32) {
     )
 }
 
+/// How much of the sun's haze and light shafts the hour has, from the visible sun `to_sun`: none
+/// with the sun well under the horizon, all of it as it rises or sets, a third at noon.
+fn sun_air(to_sun: Vec3) -> f32 {
+    let e = to_sun.normalize_or_zero().y.clamp(-1.0, 1.0).asin();
+    let up = ((e + 0.10) / 0.15).clamp(0.0, 1.0);
+    let high = ((e - 0.25) / 0.65).clamp(0.0, 1.0);
+    up * up * (3.0 - 2.0 * up) * (1.0 - 0.65 * high)
+}
+
 /// The camera's pose for a viewer at `eye` heading `fwd` under a sun whose light travels along
 /// `sun_dir`: the square centred ahead of the viewer, snapped to the map's texels so a moving
 /// viewer does not make the shadows' edges swim.
@@ -158,14 +170,33 @@ fn drive(
     viewer: Query<&GlobalTransform, With<WorldCamera>>,
     mut cam: Query<(&mut Camera, &mut Transform, &Projection), With<SunShadowCamera>>,
     mut lanes: ResMut<SunShadowLanes>,
+    claim: Option<Res<crate::wmo_portal::CameraInteriorClaim>>,
+    time: Res<Time>,
+    mut indoors: Local<f32>,
 ) {
     let Ok((mut camera, mut transform, projection)) = cam.single_mut() else {
         return;
     };
-    let wanted = on.0 && model.is_modern() && *quality != LookQuality::Low;
+    // A room is lit by its own baked light, not the sun: the shadows ease out over a second and
+    // a half as the viewer steps inside, and back as it leaves.
+    let inside = claim.is_some_and(|c| c.0.is_some());
+    let step = time.delta_secs() / 1.5;
+    *indoors = if inside {
+        (*indoors + step).min(1.0)
+    } else {
+        (*indoors - step).max(0.0)
+    };
+    let wanted = model.is_modern() && *quality != LookQuality::Low;
+    let mut shadows = false;
     let next = match (wanted, lighting, viewer.iter().next()) {
-        (true, Some(l), Some(v)) if caster(l.celestial_dir).1 > 0.0 => {
+        (true, Some(l), Some(v)) => {
             let (to_sun, strength) = caster(l.celestial_dir);
+            let strength = if on.0 {
+                strength * STRENGTH * (1.0 - *indoors)
+            } else {
+                0.0
+            };
+            shadows = strength > 0.0;
             let sun_dir = -to_sun;
             let tf = pose(v.translation(), Vec3::from(v.forward()), sun_dir);
             if *transform != tf {
@@ -175,18 +206,22 @@ fn drive(
             let mut out = [0.0; 32];
             out[..16].copy_from_slice(&clip_from_world.to_cols_array());
             out[16..19].copy_from_slice(&(-sun_dir).to_array());
-            out[19] = strength * STRENGTH;
+            out[19] = strength;
             out[20..23].copy_from_slice(&l.ambient);
             out[23] = 2.0 * HALF_EXTENT / MAP_SIZE as f32;
             out[24..27].copy_from_slice(&l.diffuse);
+            // The visible sun's true height (the caster's is held off the horizon) and how much
+            // of the sun's haze and shafts the hour has.
+            out[27] = l.celestial_dir.normalize_or_zero().y;
+            out[31] = sun_air(l.celestial_dir);
             // The lighting sun, whose share of the light a shadow takes away.
             out[28..31].copy_from_slice(&(-l.sun_dir.normalize_or_zero()).to_array());
             Some(out)
         }
         _ => None,
     };
-    if camera.is_active != next.is_some() {
-        camera.is_active = next.is_some();
+    if camera.is_active != shadows {
+        camera.is_active = shadows;
     }
     if lanes.0 != next {
         lanes.0 = next;
@@ -213,6 +248,7 @@ fn publish_depth(
 ) {
     depth.0 = lanes
         .0
+        .filter(|l| l[19] > 0.0)
         .and_then(|_| views.iter().next())
         .map(|d| d.view().clone());
 }

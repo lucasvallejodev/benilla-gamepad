@@ -1446,11 +1446,13 @@ fn uw_bind_group(
     let sun_depth = world
         .get_resource::<crate::modern::sun_shadow::SunShadowDepth>()
         .and_then(|d| d.0.as_ref());
-    let sun_lanes = world
+    let mut sun_lanes = world
         .get_resource::<crate::modern::sun_shadow::SunShadowLanes>()
         .and_then(|l| l.0)
-        .filter(|_| sun_depth.is_some())
         .unwrap_or([0.0; 32]);
+    if sun_depth.is_none() {
+        sun_lanes[19] = 0.0;
+    }
     world.resource::<RenderQueue>().write_buffer(
         &textures.sun_buf,
         0,
