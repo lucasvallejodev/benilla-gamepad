@@ -21,7 +21,7 @@ use bevy::render::render_graph::{
 };
 use bevy::render::render_phase::{TrackedRenderPass, ViewSortedRenderPhases};
 use bevy::render::render_resource::binding_types::{
-    sampler, storage_buffer_read_only_sized, texture_2d, uniform_buffer_sized,
+    sampler, storage_buffer_read_only_sized, texture_2d, texture_depth_2d, uniform_buffer_sized,
 };
 use bevy::render::render_resource::*;
 use bevy::render::renderer::{RenderContext, RenderDevice, RenderQueue};
@@ -411,6 +411,9 @@ struct FfxGlowPipelines {
     /// `W/128` cycles, and a clamp would pin all but the first.
     wave_view: TextureView,
     wave_sampler: Sampler,
+    /// benilla-gamepad fork: the sun shadow map's compare sampler and its 1x1 stand-in.
+    sun_sampler: Sampler,
+    sun_blank: TextureView,
     downsample: CachedRenderPipelineId,
     /// Box4 with the water's excess in alpha (`fs_downsample_water`).
     downsample_water: CachedRenderPipelineId,
@@ -581,6 +584,13 @@ fn init_pipelines(
                     10,
                     texture_2d(TextureSampleType::Float { filterable: false }),
                 ),
+                // benilla-gamepad fork: the sun's shadow map, its compare sampler and its block.
+                (11, texture_depth_2d()),
+                (12, sampler(SamplerBindingType::Comparison)),
+                (
+                    13,
+                    uniform_buffer_sized(false, Some(std::num::NonZero::new(128).unwrap())),
+                ),
             ),
         ),
     );
@@ -602,6 +612,32 @@ fn init_pipelines(
         address_mode_v: AddressMode::ClampToEdge,
         ..Default::default()
     });
+    // benilla-gamepad fork: the shadow map's compare (reverse Z: lit where the point is no
+    // farther from the sun than the map's), filtered, and the 1x1 stand-in depth.
+    let sun_sampler = render_device.create_sampler(&SamplerDescriptor {
+        min_filter: FilterMode::Linear,
+        mag_filter: FilterMode::Linear,
+        address_mode_u: AddressMode::ClampToEdge,
+        address_mode_v: AddressMode::ClampToEdge,
+        compare: Some(CompareFunction::GreaterEqual),
+        ..Default::default()
+    });
+    let sun_blank = render_device
+        .create_texture(&TextureDescriptor {
+            label: Some("ffx_sun_blank"),
+            size: Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::Depth32Float,
+            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        })
+        .create_view(&TextureViewDescriptor::default());
     // Linear, so the reference's 128-texel sine samples as a smooth wave; repeat, past 1.0.
     let wave_sampler = render_device.create_sampler(&SamplerDescriptor {
         min_filter: FilterMode::Linear,
@@ -728,6 +764,8 @@ fn init_pipelines(
         sampler,
         wave_view,
         wave_sampler,
+        sun_sampler,
+        sun_blank,
         downsample,
         downsample_water,
         downsample_hdr,
@@ -763,6 +801,8 @@ struct FfxGlowTextures {
     uw_buf: Buffer,
     /// benilla-gamepad fork: the crease shade's half-size image ([`AO_FORMAT`]).
     ao: CachedTexture,
+    /// benilla-gamepad fork: the sun shadow's 128-byte block (`modern::sun_shadow`).
+    sun_buf: Buffer,
 }
 
 /// One view's dry and underwater combine pipelines, Classic and Modern, and the key they were
@@ -992,6 +1032,12 @@ fn prepare_textures(
             usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let sun_buf = render_device.create_buffer(&BufferDescriptor {
+            label: Some("ffx_sun_shadow"),
+            size: 128,
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let uw_buf = render_device.create_buffer(&BufferDescriptor {
             label: Some("ffx_glow_underwater"),
             size: 512,
@@ -1007,6 +1053,7 @@ fn prepare_textures(
             combine,
             uw_buf,
             ao,
+            sun_buf,
         });
     }
 }
@@ -1276,6 +1323,7 @@ impl ViewNode for FfxGlowNode {
                 bytemuck::cast_slice(&uw.lanes),
             );
             let bind = uw_bind_group(
+                world,
                 &render_device,
                 pipeline_cache,
                 pipelines,
@@ -1325,6 +1373,7 @@ impl ViewNode for FfxGlowNode {
                     bytemuck::cast_slice(&uw.lanes),
                 );
                 uw_bind_group(
+                    world,
                     &render_device,
                     pipeline_cache,
                     pipelines,
@@ -1382,6 +1431,7 @@ impl ViewNode for FfxGlowNode {
 /// or the depth standing in for it.
 #[allow(clippy::too_many_arguments)]
 fn uw_bind_group(
+    world: &World,
     render_device: &RenderDevice,
     pipeline_cache: &PipelineCache,
     pipelines: &FfxGlowPipelines,
@@ -1391,6 +1441,21 @@ fn uw_bind_group(
     shadow: Option<&TextureView>,
     ao: &TextureView,
 ) -> BindGroup {
+    // benilla-gamepad fork: the sun's shadow map and its block (`modern::sun_shadow`); a 1x1
+    // depth and a zero block (strength 0) while it does not run.
+    let sun_depth = world
+        .get_resource::<crate::modern::sun_shadow::SunShadowDepth>()
+        .and_then(|d| d.0.as_ref());
+    let sun_lanes = world
+        .get_resource::<crate::modern::sun_shadow::SunShadowLanes>()
+        .and_then(|l| l.0)
+        .filter(|_| sun_depth.is_some())
+        .unwrap_or([0.0; 32]);
+    world.resource::<RenderQueue>().write_buffer(
+        &textures.sun_buf,
+        0,
+        bytemuck::cast_slice(&sun_lanes),
+    );
     render_device.create_bind_group(
         "ffx_glow_combine_uw",
         &pipeline_cache.get_bind_group_layout(&pipelines.layout_combine_uw),
@@ -1405,6 +1470,9 @@ fn uw_bind_group(
             (7, depth),
             (9, shadow.unwrap_or(depth)),
             (10, ao),
+            (11, sun_depth.unwrap_or(&pipelines.sun_blank)),
+            (12, &pipelines.sun_sampler),
+            (13, textures.sun_buf.as_entire_binding()),
         )),
     )
 }
@@ -1683,6 +1751,7 @@ impl ViewNode for FfxTransparent2dNode {
                     (Some(uw), Some(depth)) => {
                         queue.write_buffer(&textures.uw_buf, 0, bytemuck::cast_slice(&uw.lanes));
                         uw_bind_group(
+                            world,
                             render_context.render_device(),
                             pipeline_cache,
                             pipelines,

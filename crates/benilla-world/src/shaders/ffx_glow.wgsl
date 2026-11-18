@@ -1302,6 +1302,22 @@ struct FfxUwBlock {
 // benilla-gamepad fork: the crease shade's half-size image (`fs_mfx_ao`): r the open share, g the
 // view Z it was taken at. The depth stands in, unread, while `ffx.look.w` is under 2.
 @group(0) @binding(10) var mfx_ao_tex: texture_2d<f32>;
+// benilla-gamepad fork: the sun's shadow map (`modern::sun_shadow`): the depth a camera at the
+// lighting sun drew (reverse Z), its compare sampler and its block.
+struct SunLanes {
+    clip_from_world: mat4x4<f32>,
+    // xyz the direction to the sun, w the strength (0 while the map does not run).
+    sun: vec4<f32>,
+    // rgb the ambient colour (gamma, as the lighting adds it), w the map's texel in yards.
+    ambient: vec4<f32>,
+    // rgb the sun's diffuse colour.
+    diffuse: vec4<f32>,
+    // xyz the direction to the lighting sun, whose share of the light a shadow takes.
+    light: vec4<f32>,
+};
+@group(0) @binding(11) var sun_map: texture_depth_2d;
+@group(0) @binding(12) var sun_samp: sampler_comparison;
+@group(0) @binding(13) var<uniform> sun_lanes: SunLanes;
 #endif
 #endif
 
@@ -1730,6 +1746,73 @@ fn mfx_sun_shadow(pw: vec3<f32>, z: f32, frag: vec2<f32>) -> f32 {
     return 1.0 - MFX_SUN_STRENGTH * fade * shade;
 }
 
+/// The world-space normal of the surface under depth pixel `p` at view Z `z`, from the depth's
+/// nearer neighbour on each axis (so it does not lean across a silhouette).
+fn mfx_normal(p: vec2<f32>, z: f32, dd: vec2<f32>) -> vec3<f32> {
+    let u = uwb.u;
+    let tan_hv = vec2<f32>(length(u.cam_right.xyz), length(u.cam_up.xyz));
+    let pc = floor(p) + vec2<f32>(0.5);
+    let p0 = mfx_view_pos(pc, z, dd, tan_hv);
+    let zl = mfx_depth(pc - vec2<f32>(1.0, 0.0));
+    let zr = mfx_depth(pc + vec2<f32>(1.0, 0.0));
+    let zu = mfx_depth(pc - vec2<f32>(0.0, 1.0));
+    let zd = mfx_depth(pc + vec2<f32>(0.0, 1.0));
+    var dx = mfx_view_pos(pc + vec2<f32>(1.0, 0.0), zr, dd, tan_hv) - p0;
+    if (zr <= 0.0 || (zl > 0.0 && abs(zl - z) < abs(zr - z))) {
+        dx = p0 - mfx_view_pos(pc - vec2<f32>(1.0, 0.0), zl, dd, tan_hv);
+    }
+    var dy = mfx_view_pos(pc + vec2<f32>(0.0, 1.0), zd, dd, tan_hv) - p0;
+    if (zd <= 0.0 || (zu > 0.0 && abs(zu - z) < abs(zd - z))) {
+        dy = p0 - mfx_view_pos(pc - vec2<f32>(0.0, 1.0), zu, dd, tan_hv);
+    }
+    var n = normalize(cross(dy, dx) + vec3<f32>(0.0, 0.0, -1e-9));
+    if (dot(n, p0) > 0.0) {
+        n = -n;
+    }
+    return normalize(
+        u.cam_right.xyz / max(tan_hv.x, 1e-5) * n.x + u.cam_up.xyz / max(tan_hv.y, 1e-5) * n.y
+            + u.cam_fwd.xyz * n.z,
+    );
+}
+
+/// The sun's shadow on the world point `pw` whose surface faces `n` (what to multiply the picture
+/// by; 1 lit): nine compares of the shadow map round the point's place in it. The reference lights
+/// a surface `ambient + diffuse * n.l` from the lighting sun, so where the sun does not reach, the
+/// ambient's share of that is what stays: a surface turned from the lighting sun loses nothing,
+/// and a weak diffuse casts next to nothing. The point is pushed off its surface by a few texels,
+/// more at a grazing sun, so a surface does not shadow itself.
+fn mfx_sun_map(pw: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
+    let s = sun_lanes;
+    // A card of grass or leaves is lit by its authored normal, not the face the depth shows:
+    // never less than a share of what level ground takes.
+    let ndl = max(dot(n, s.light.xyz), 0.45 * s.light.y);
+    if (s.sun.w <= 0.0 || ndl <= 0.0) {
+        return vec3<f32>(1.0);
+    }
+    let texel = s.ambient.w;
+    let graze = 1.0 - saturate(dot(n, s.sun.xyz));
+    let q = pw + n * texel * (2.0 + 4.0 * graze) + s.sun.xyz * texel * 2.0;
+    let c = s.clip_from_world * vec4<f32>(q, 1.0);
+    let edge = max(abs(c.x), abs(c.y));
+    let fade = (1.0 - smoothstep(0.84, 0.98, edge)) * s.sun.w;
+    if (fade <= 0.0 || c.z <= 0.0 || c.z >= 1.0) {
+        return vec3<f32>(1.0);
+    }
+    let uv = vec2<f32>(c.x, -c.y) * 0.5 + vec2<f32>(0.5);
+    let px = 1.0 / vec2<f32>(textureDimensions(sun_map));
+    var lit = 0.0;
+    for (var j = -1; j <= 1; j = j + 1) {
+        for (var i = -1; i <= 1; i = i + 1) {
+            lit = lit + textureSampleCompareLevel(sun_map, sun_samp, uv + vec2<f32>(f32(i), f32(j)) * px * 1.25, c.z);
+        }
+    }
+    let shade = (1.0 - lit / 9.0) * fade;
+    var keep = s.ambient.rgb / max(s.ambient.rgb + s.diffuse.rgb * ndl, vec3<f32>(1e-3));
+    // Half the hue shift: the whole of it reads as a blue wash under a warm sun.
+    keep = mix(keep, vec3<f32>(dot(keep, vec3<f32>(0.299, 0.587, 0.114))), 0.5);
+    return mix(vec3<f32>(1.0), keep, shade);
+}
+
 /// The depth effects on the dry scene colour `sg` (gamma) at `uv`, view Z `z` (0 the sky), `t_d`
 /// yards along the pixel's ray `rd`.
 fn mfx_apply(uv: vec2<f32>, sg: vec3<f32>, z: f32, t_d: f32, rd: vec3<f32>) -> vec3<f32> {
@@ -1751,6 +1834,9 @@ fn mfx_apply(uv: vec2<f32>, sg: vec3<f32>, z: f32, t_d: f32, rd: vec3<f32>) -> v
     // blob shadow (the owner's call). `mfx_sun_shadow` stays for a later, better pass.
     if (MFX_SUN_ON) {
         c = c * mfx_sun_shadow(u.cam_pos.xyz + rd * t_d, z, p);
+    }
+    if (z > 0.0 && sun_lanes.sun.w > 0.0) {
+        c = c * mfx_sun_map(u.cam_pos.xyz + rd * t_d, mfx_normal(p, z, dd));
     }
     if (z > 0.0) {
         let haze = MFX_HAZE.x * (1.0 - exp(-t_d / MFX_HAZE.y));

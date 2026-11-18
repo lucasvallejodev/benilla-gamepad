@@ -179,10 +179,15 @@ fn auto_exposure(ambient: [f32; 3], diffuse: [f32; 3]) -> f32 {
         .clamp(1.0, AUTO_EXPOSURE_MAX)
 }
 
-/// Whether the crease shade (ambient occlusion) runs: `$WOW_LOOK_AO=0|1` for the session, else on.
-fn crease_shade() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("WOW_LOOK_AO").as_deref() != Ok("0"))
+/// Whether the crease shade (ambient occlusion) runs. CVar `ambientOcclusion`; `$WOW_LOOK_AO=0|1`
+/// picks it for a session.
+#[derive(Resource, Clone, Copy, PartialEq, Eq, Debug)]
+pub struct CreaseShade(pub bool);
+
+impl Default for CreaseShade {
+    fn default() -> Self {
+        Self(std::env::var("WOW_LOOK_AO").as_deref() != Ok("0"))
+    }
 }
 
 /// The lanes this frame asks for: none in a Classic frame. The first Modern frame takes the lift
@@ -192,6 +197,7 @@ fn update_lanes(
     look: Res<ActiveLook>,
     auto: Res<AutoExposure>,
     quality: Res<super::LookQuality>,
+    crease: Res<CreaseShade>,
     reading: Res<super::meter::MeterReading>,
     lighting: Option<Res<WowLighting>>,
     time: Res<Time>,
@@ -234,7 +240,7 @@ fn update_lanes(
         // 2 adds the crease shade's pass (`ffx_glow`'s `fs_mfx_ao`).
         let depth_fx = match *quality {
             super::LookQuality::Low => 0.0,
-            _ if crease_shade() => 2.0,
+            _ if crease.0 => 2.0,
             _ => 1.0,
         };
         LookLanes(Some(look.0.lanes(*eye, depth_fx)))
@@ -249,6 +255,7 @@ fn update_lanes(
 
 pub(super) fn plugin(app: &mut App) {
     app.init_resource::<AutoExposure>()
+        .init_resource::<CreaseShade>()
         .init_resource::<ActiveLook>()
         .add_systems(Last, update_lanes);
 }

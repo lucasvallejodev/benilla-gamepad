@@ -332,6 +332,8 @@ pub(crate) struct VideoKnobs<'w> {
     look_model: ResMut<'w, benilla_world::modern::LookModel>,
     look_quality: ResMut<'w, benilla_world::modern::LookQuality>,
     auto_exposure: ResMut<'w, benilla_world::modern::look::AutoExposure>,
+    sun_shadows: ResMut<'w, benilla_world::modern::sun_shadow::SunShadows>,
+    crease_shade: ResMut<'w, benilla_world::modern::look::CreaseShade>,
 }
 
 impl VideoKnobs<'_> {
@@ -359,6 +361,8 @@ impl VideoKnobs<'_> {
             look_model,
             look_quality,
             auto_exposure,
+            sun_shadows,
+            crease_shade,
         } = self;
         use benilla_world::view::{FARCLIP_RANGE, MSAA_RANGE};
         let v = ev.num();
@@ -394,6 +398,8 @@ impl VideoKnobs<'_> {
             "lookmodel" => **look_model = benilla_world::modern::LookModel::from_cvar(v),
             "lookquality" => **look_quality = benilla_world::modern::LookQuality::from_cvar(v),
             "autoexposure" => auto_exposure.0 = ev.flag(),
+            "sunshadows" => sun_shadows.0 = ev.flag(),
+            "ambientocclusion" => crease_shade.0 = ev.flag(),
             // benilla-gamepad fork: the ground cover's reach; its built chunks re-cut off the change.
             "grassdistance" => {
                 clutter.fade_far = v.clamp(

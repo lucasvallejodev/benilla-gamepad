@@ -90,6 +90,7 @@ type UnmarkedPassViews<'w, 's> = Query<
             With<crate::view::WorldCamera>,
             With<crate::liquid::ReflectionCamera>,
             With<crate::liquid::ProbeFace>,
+            With<crate::modern::sun_shadow::SunShadowCamera>,
         )>,
         Without<StaticGxView>,
     ),

@@ -12,6 +12,7 @@ use bevy::render::extract_resource::{ExtractResource, ExtractResourcePlugin};
 
 pub mod look;
 pub mod meter;
+pub mod sun_shadow;
 
 /// Which look the world's frame is presented with. CVar `lookModel`: `0` Classic, `1` Modern.
 #[derive(Resource, Clone, Copy, PartialEq, Eq, Debug)]
@@ -113,7 +114,8 @@ pub(crate) fn plugin(app: &mut App) {
         .init_resource::<LookLanes>()
         .add_plugins(ExtractResourcePlugin::<LookLanes>::default())
         .add_plugins(look::plugin)
-        .add_plugins(meter::plugin);
+        .add_plugins(meter::plugin)
+        .add_plugins(sun_shadow::plugin);
 }
 
 #[cfg(test)]

@@ -466,6 +466,15 @@
             .. "gloomy zone - so the world stays visible. Daylight and dusk are left as they are, "
             .. "and a night still reads as night.\n\n"
             .. "Has no effect without Modern Look."
+        BENILLA_TOOLTIP_SUN_SHADOWS =
+            "Real shadows from the sun: characters, trees, fences and buildings shade the ground "
+            .. "and each other. They are short at noon, long toward evening and gone at night.\n\n"
+            .. "Draws the nearby world a second time, so turn it off if the frame rate suffers. "
+            .. "Needs Modern Look, Improved Water and Effects Quality above Low."
+        BENILLA_TOOLTIP_AMBIENT_OCCLUSION =
+            "Darkens creases and the corners where things meet - under eaves, round a doorstep, "
+            .. "at a character's feet - so the world looks less flat.\n\n"
+            .. "Needs Modern Look, Improved Water and Effects Quality above Low."
         BENILLA_TOOLTIP_LOOK_QUALITY =
             "How much the Modern Look spends.\n\n"
             .. "Low: tone curve, bloom and colour grade only - the lightest. Medium and High add "
@@ -512,7 +521,8 @@
                 "RowWeatherDensity",
                 "RowDisplayMode", "RowVerticalSync", "RowRenderScale", "RowWaterStyle",
                 -- benilla-gamepad fork: the Modern look's rows.
-                "RowLookModel", "RowLookQuality", "RowAutoExposure", "RowGrassDistance",
+                "RowLookModel", "RowLookQuality", "RowAutoExposure", "RowSunShadows",
+                "RowAmbientOcclusion", "RowGrassDistance",
             },
             -- Guild Names and Player Titles are children of Player Names
             -- (UIOptionsFrame.lua:703-709).
@@ -2113,10 +2123,34 @@
                                                     "BENILLA_TOOLTIP_AUTO_EXPOSURE")
                                             </OnLoad></Scripts>
                                         </Frame>
-                                        <Frame name="$parentRowGrassDistance" inherits="BenillaOptionsSliderRowTemplate">
+                                        <Frame name="$parentRowSunShadows" inherits="BenillaOptionsCheckboxRowTemplate">
                                             <Anchors>
                                                 <Anchor point="TOPLEFT" relativeTo="$parentRowAutoExposure" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
                                                 <Anchor point="TOPRIGHT" relativeTo="$parentRowAutoExposure" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                                            </Anchors>
+                                            <Scripts><OnLoad>
+                                                -- benilla-gamepad fork: Sun Shadows, `sunShadows`,
+                                                -- the Modern look's shadow map.
+                                                BenillaOptionsRow_OnLoad(this, "sunShadows", "Sun Shadows",
+                                                    "BENILLA_TOOLTIP_SUN_SHADOWS")
+                                            </OnLoad></Scripts>
+                                        </Frame>
+                                        <Frame name="$parentRowAmbientOcclusion" inherits="BenillaOptionsCheckboxRowTemplate">
+                                            <Anchors>
+                                                <Anchor point="TOPLEFT" relativeTo="$parentRowSunShadows" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                                                <Anchor point="TOPRIGHT" relativeTo="$parentRowSunShadows" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                                            </Anchors>
+                                            <Scripts><OnLoad>
+                                                -- benilla-gamepad fork: Ambient Occlusion,
+                                                -- `ambientOcclusion`, the Modern look's crease shade.
+                                                BenillaOptionsRow_OnLoad(this, "ambientOcclusion", "Ambient Occlusion",
+                                                    "BENILLA_TOOLTIP_AMBIENT_OCCLUSION")
+                                            </OnLoad></Scripts>
+                                        </Frame>
+                                        <Frame name="$parentRowGrassDistance" inherits="BenillaOptionsSliderRowTemplate">
+                                            <Anchors>
+                                                <Anchor point="TOPLEFT" relativeTo="$parentRowAmbientOcclusion" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                                                <Anchor point="TOPRIGHT" relativeTo="$parentRowAmbientOcclusion" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
                                             </Anchors>
                                             <Scripts><OnLoad>
                                                 -- benilla-gamepad fork: Grass Distance,
