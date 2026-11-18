@@ -37,3 +37,24 @@ pub(crate) fn water_classes(map: &str) -> Option<Arc<dyn WaterClasses>> {
 pub fn classify_liquids(liquids: &[&LiquidMesh]) -> Option<Arc<dyn WaterClasses>> {
     (CLASSIFIER.get()?.batch)(liquids)
 }
+
+/// benilla-gamepad fork: classify `maps` on a background thread, once both the chain and a
+/// classifier are there. A map's first classification reads every one of its tiles (10-17 s for a
+/// continent on a cold cache), and a tile load waits on it; started at boot, it is done, or well
+/// on, by the time the player reaches the world. A map already classified or cached costs nothing.
+pub fn prewarm_water_classes(maps: &'static [&'static str]) {
+    if CHAIN.get().is_none() || CLASSIFIER.get().is_none() {
+        return;
+    }
+    // A thread a map: one continent does not wait on the other.
+    for map in maps {
+        let spawned = std::thread::Builder::new()
+            .name("water-prewarm".into())
+            .spawn(move || {
+                let _ = water_classes(map);
+            });
+        if let Err(e) = spawned {
+            bevy::log::warn!("water: could not start the classification prewarm: {e}");
+        }
+    }
+}

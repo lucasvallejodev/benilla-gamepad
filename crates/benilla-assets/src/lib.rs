@@ -41,7 +41,9 @@ pub use model::{
 };
 mod adt;
 mod water_hook;
-pub use water_hook::{classify_liquids, set_water_classifier, WaterClassifier};
+pub use water_hook::{
+    classify_liquids, prewarm_water_classes, set_water_classifier, WaterClassifier,
+};
 mod terrain;
 mod wdt;
 pub use adt::{chunk_to_mesh, chunks_to_mesh, AdtLoader, AdtTile, ChunkShading};

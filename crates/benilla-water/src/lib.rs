@@ -63,6 +63,13 @@ impl Plugin for ImprovedWaterPlugin {
             map: water_map::water_map,
             batch: liquid_planar::classify_batch,
         });
+        // The fork's: the two continents' classifications start at boot, off the main thread, so
+        // the first world entry on a fresh cache does not wait 10-17 s on one.
+        app.add_systems(
+            Startup,
+            (|| benilla_assets::prewarm_water_classes(&["Azeroth", "Kalimdor"]))
+                .after(benilla_assets::AssetSet::Open),
+        );
         bevy::asset::embedded_asset!(app, "shaders/probe_face.wgsl");
         bevy::asset::embedded_asset!(app, "shaders/probe_filter.wgsl");
         bevy::asset::embedded_asset!(app, "shaders/hiz_reduce.wgsl");
