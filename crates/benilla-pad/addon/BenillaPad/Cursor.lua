@@ -286,3 +286,17 @@ poll:SetScript("OnUpdate", function()
     glow:SetHeight(f:GetHeight() * s + 6)
     glow:Show()
 end)
+
+-- ── Quest text ──
+-- 1.12 writes a quest's text in letter by letter and keeps Accept greyed until it is done. A
+-- pressed meanwhile finishes the writing (the panel's own OnUpdate then shows the objectives
+-- and enables Accept), so a quest is X, A, A without waiting on the scroll.
+P.Listen(function(event, button, down)
+    if event ~= "BENILLAPAD_BUTTON" or button ~= "A" or not down then
+        return
+    end
+    local panel = QuestFrameDetailPanel
+    if panel and panel:IsVisible() and panel.fading then
+        panel.fadingProgress = 100000
+    end
+end)
