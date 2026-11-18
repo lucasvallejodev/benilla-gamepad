@@ -1177,6 +1177,36 @@ impl ViewNode for FfxGlowNode {
                 pass.draw(0..3, 0..1);
                 span.end(&mut pass);
             }
+            // benilla-gamepad fork: the Modern look's screen meter (`modern::meter`). The blur
+            // (¼a, decoded and unexposed) resampled into the meter's 32×16 image, which a
+            // readback hands the exposure a few frames on. The Gauss H pass is the resampler: it
+            // already binds ¼a.
+            if modern {
+                let target = world
+                    .get_resource::<crate::modern::meter::LookMeterTarget>()
+                    .zip(world.get_resource::<RenderAssets<GpuImage>>())
+                    .and_then(|(t, images)| images.get(&t.0));
+                if let Some(gpu) = target {
+                    let mut pass =
+                        render_context
+                            .command_encoder()
+                            .begin_render_pass(&RenderPassDescriptor {
+                                label: Some("ffx_look_meter"),
+                                color_attachments: &[Some(RenderPassColorAttachment {
+                                    view: &gpu.texture_view,
+                                    depth_slice: None,
+                                    resolve_target: None,
+                                    ops: Operations::default(),
+                                })],
+                                depth_stencil_attachment: None,
+                                timestamp_writes: None,
+                                occlusion_query_set: None,
+                            });
+                    pass.set_pipeline(gauss_h);
+                    pass.set_bind_group(0, &textures.gauss_h_bind, &[]);
+                    pass.draw(0..3, 0..1);
+                }
+            }
         }
 
         let Some((combine, out)) = out else {

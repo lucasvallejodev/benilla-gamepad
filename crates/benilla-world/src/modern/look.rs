@@ -119,6 +119,31 @@ const AUTO_EXPOSURE_MAX: f32 = 2.0;
 /// The time constant the lift eases with, in seconds: an eye adapting, not a meter snapping.
 const AUTO_EXPOSURE_SECONDS: f32 = 1.5;
 
+/// **The screen meter's exposure** (`super::meter`), the Medium and High tiers' meter: the
+/// picture's log-average luminance against [`METER_KEY`] (an Elwynn noon in the trees' shade,
+/// 0.052 by capture). A brighter picture is held back by [`METER_BRIGHT`]'s share of the
+/// difference in stops, never under its floor: Booty Bay's planks (0.10) take 0.86, the Barrens
+/// at noon (0.20) the floor. A darker one is lifted by [`METER_DARK`]'s share up to its cap, so
+/// a gloomy zone or a room stays gloomy; the night's own lift is the light rows'
+/// ([`auto_exposure`]), and the larger of the two is taken.
+const METER_KEY: f32 = 0.055;
+/// (strength, floor).
+const METER_BRIGHT: (f32, f32) = (0.25, 0.82);
+/// (strength, cap).
+const METER_DARK: (f32, f32) = (0.3, 1.2);
+/// A reading older than this many seconds is stale (the world is not drawing: a loading screen).
+const METER_FRESH_SECONDS: f32 = 1.0;
+
+/// The exposure a metered log-average luminance asks for, given the light rows' lift `rows`.
+fn meter_exposure(log_average: f32, rows: f32) -> f32 {
+    let ratio = METER_KEY / log_average.max(1e-4);
+    if ratio < 1.0 {
+        ratio.powf(METER_BRIGHT.0).max(METER_BRIGHT.1)
+    } else {
+        ratio.powf(METER_DARK.0).min(METER_DARK.1).max(rows)
+    }
+}
+
 fn srgb_to_linear(c: f32) -> f32 {
     if c <= 0.04045 {
         c / 12.92
@@ -154,6 +179,7 @@ fn update_lanes(
     look: Res<ActiveLook>,
     auto: Res<AutoExposure>,
     quality: Res<super::LookQuality>,
+    reading: Res<super::meter::MeterReading>,
     lighting: Option<Res<WowLighting>>,
     time: Res<Time>,
     mut adapted: Local<Option<f32>>,
@@ -161,10 +187,17 @@ fn update_lanes(
     mut lanes: ResMut<LookLanes>,
 ) {
     let next = if model.is_modern() {
-        let lift = match (lighting.as_deref(), auto.0) {
+        let rows = match (lighting.as_deref(), auto.0) {
             (Some(l), true) => auto_exposure(l.ambient, l.diffuse),
             _ => 1.0,
         };
+        // The screen meter where it runs and has a fresh reading; the light rows otherwise.
+        let metered = reading
+            .0
+            .filter(|&(_, at)| time.elapsed_secs() - at < METER_FRESH_SECONDS)
+            .filter(|_| auto.0 && *quality != super::LookQuality::Low)
+            .map(|(l, _)| meter_exposure(l, rows));
+        let lift = metered.unwrap_or(rows);
         // `$WOW_LOOK_LOG=1`: the light rows and the key the meter read, once a second.
         static LOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *LOG.get_or_init(|| std::env::var_os("WOW_LOOK_LOG").is_some()) {
@@ -173,10 +206,11 @@ fn update_lanes(
                 if *log_sec != sec {
                     *log_sec = sec;
                     info!(
-                        "look: ambient {:?} diffuse {:?} key {:.3} lift {lift:.3}",
+                        "look: ambient {:?} diffuse {:?} key {:.3} rows {rows:.3} meter {:?} lift {lift:.3}",
                         l.ambient,
                         l.diffuse,
-                        light_key(l.ambient, l.diffuse)
+                        light_key(l.ambient, l.diffuse),
+                        reading.0.map(|r| r.0),
                     );
                 }
             }
@@ -222,6 +256,18 @@ mod tests {
         // Darker light, more lift; a black light sits at the ceiling.
         assert!(auto_exposure([0.05; 3], [0.05; 3]) > night);
         assert_eq!(auto_exposure([0.0; 3], [0.0; 3]), AUTO_EXPOSURE_MAX);
+    }
+
+    #[test]
+    fn the_meter_holds_a_glare_back_and_lifts_gloom_a_little() {
+        // The key itself is 1; a glare is held back, never under the floor.
+        assert_eq!(meter_exposure(METER_KEY, 1.0), 1.0);
+        let bay = meter_exposure(0.10, 1.0);
+        assert!(bay < 0.9 && bay > METER_BRIGHT.1, "{bay}");
+        assert_eq!(meter_exposure(1.0, 1.0), METER_BRIGHT.1);
+        // Gloom lifts to the cap at most; a night keeps the light rows' larger lift.
+        assert_eq!(meter_exposure(0.01, 1.0), METER_DARK.1);
+        assert_eq!(meter_exposure(0.006, 1.45), 1.45);
     }
 
     #[test]
