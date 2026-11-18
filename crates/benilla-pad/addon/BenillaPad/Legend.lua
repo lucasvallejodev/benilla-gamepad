@@ -56,11 +56,24 @@ local function worldRows()
     }
 end
 
+-- What A does in the open windows: the primary button's own label ("Accept", "Complete Quest"),
+-- while the pointer is on it; "Click" otherwise.
+local function primaryLabel()
+    local p = P.Cursor and P.Cursor.Primary and P.Cursor.Primary()
+    if p and GetMouseFocus() == p and p.GetText then
+        local text = p:GetText()
+        if text and text ~= "" and string.len(text) <= 22 then
+            return text
+        end
+    end
+    return "Click"
+end
+
 local function cursorRows()
     return {
         { "R stick", "Pointer" },
         { "D-pad", "Jump to button" },
-        { face("A"), "Click" },
+        { face("A"), primaryLabel() },
         { face("X"), "Right-click" },
         { "LB / RB", "Scroll" },
         { face("B"), "Close" },

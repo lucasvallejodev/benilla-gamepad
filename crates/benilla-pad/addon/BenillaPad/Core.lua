@@ -66,6 +66,9 @@ P.DEFAULTS = {
     -- The top-left legend of what the buttons do now, and the Interact prompt above the bar.
     legend = true,
     prompt = true,
+    -- The camera's swing back behind the character: "game" leaves the game's own setting
+    -- (Interface options, Camera Following Style), "always" and "never" set it.
+    followCam = "always",
 }
 
 local FACES = { A = true, B = true, X = true, Y = true }
@@ -253,7 +256,21 @@ function P.Binding(btn, layer)
 end
 
 -- Tell every view that a binding or a slot changed.
+-- The follow camera: 1.12's own `cameraSmoothStyle` (0 never, 1 smart, 2 always). With a pad the
+-- camera should come back behind the character as it walks, since no mouse drags it there.
+function P.ApplyFollowCamera()
+    if not P.connected then
+        return
+    end
+    local want = P.Setting("followCam")
+    local value = (want == "always" and "2") or (want == "never" and "0") or nil
+    if value and GetCVar("cameraSmoothStyle") ~= value then
+        SetCVar("cameraSmoothStyle", value)
+    end
+end
+
 function P.Changed()
+    P.ApplyFollowCamera()
     if P.Bar then
         P.Bar.Layout()
         P.Bar.Refresh()
@@ -526,6 +543,7 @@ function BenillaPad_Signal(event, arg1, arg2, arg3, arg4)
     elseif event == "BENILLAPAD_CONNECTED" then
         P.connected = true
         P.style = arg1 or "xbox"
+        P.ApplyFollowCamera()
     elseif event == "BENILLAPAD_DISCONNECTED" then
         P.connected = false
         P.held = {}
