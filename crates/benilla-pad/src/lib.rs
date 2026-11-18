@@ -169,6 +169,8 @@ struct PadState {
     resolve_failed: bool,
     /// Last frame was in the cursor mode.
     cursor: bool,
+    /// The addon's primary-button serial last frame (`BenillaPad_Mode`'s third answer).
+    primary: u32,
     /// The last target we had, which a soft Interact loots first: 1.12 clears the selection when
     /// the target dies.
     last_target: Option<u64>,
@@ -324,16 +326,16 @@ fn drive(
     // stock UI loaded (`UIParent` is FrameXML's): nothing of the world's survives, and the pad
     // drives those screens' own keys and the cursor.
     // One Lua call a frame answers it, with the addon's mode and settings generation.
-    let (in_world, mode, gen) = script
+    let (in_world, mode, gen, primary) = script
         .as_ref()
         .and_then(|s| {
-            s.eval::<(bool, Option<String>, Option<u32>)>(
+            s.eval::<(bool, Option<String>, Option<u32>, Option<u32>)>(
                 "if BenillaPad_Mode then return UIParent ~= nil, BenillaPad_Mode() end \
                  return UIParent ~= nil",
             )
             .ok()
         })
-        .unwrap_or((false, None, None));
+        .unwrap_or((false, None, None, None));
     if !in_world {
         *state = PadState::default();
         let pad = pads.iter().next().map(|(_, g)| g);
@@ -419,13 +421,17 @@ fn drive(
         .single()
         .ok()
         .map(|w| CursorWindow::new(w, &mut cursor_to.0));
-    // Entering the cursor mode: onto an open popup's first button, if there is one.
-    if cursor && !state.cursor {
+    // Entering the cursor mode, or the windows' primary button becoming another one (the
+    // addon's `Cursor.Serial`: a popup's button, a quest's Accept or Complete, the first gossip
+    // option): the pointer lands on it, so a hand-in is A, A, A.
+    let primary = primary.unwrap_or(0);
+    if cursor && (!state.cursor || primary != state.primary) {
         if let Some(w) = window.as_mut() {
             snap(script, w, "enter");
         }
     }
     state.cursor = cursor;
+    state.primary = primary;
     let typing = script.has_keyboard_focus();
 
     // ── Interact's upkeep ──

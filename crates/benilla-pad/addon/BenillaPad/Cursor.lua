@@ -108,17 +108,102 @@ function Cursor.PopupButton(i)
     return getglobal("StaticPopup" .. i .. "Button" .. index)
 end
 
+-- ── The primary button ──
+-- What A most likely wants in the open windows (a console UI's default focus): a popup's button,
+-- a quest's Accept / Continue / Complete, the first gossip option, the first loot, the trainer's
+-- Train. The pointer lands on it when the windows change, so a quest hand-in is A, A, A.
+
+local function shown(name)
+    local f = getglobal(name)
+    if f and f:IsVisible() then
+        return f
+    end
+    return nil
+end
+
+-- A shown button that is not greyed out (1.12's IsEnabled answers 1 or nil / 0).
+local function usable(name)
+    local f = shown(name)
+    if f and f.IsEnabled then
+        local e = f:IsEnabled()
+        if not e or e == 0 then
+            return nil
+        end
+    end
+    return f
+end
+
+function Cursor.Primary()
+    for i = 1, 4 do
+        local button = Cursor.PopupButton(i)
+        if button and button:IsVisible() then
+            return button
+        end
+    end
+    if shown("QuestFrame") then
+        if shown("QuestFrameDetailPanel") then
+            return shown("QuestFrameAcceptButton")
+        end
+        if shown("QuestFrameProgressPanel") then
+            return usable("QuestFrameCompleteButton") or shown("QuestFrameGoodbyeButton")
+        end
+        if shown("QuestFrameRewardPanel") then
+            -- A reward to choose first; once one is chosen, the hand-in.
+            local chosen = QuestFrameRewardPanel.itemChoice or 0
+            if GetNumQuestChoices and GetNumQuestChoices() > 1 and chosen == 0 then
+                return shown("QuestRewardItem1")
+            end
+            return usable("QuestFrameCompleteQuestButton")
+        end
+        if shown("QuestFrameGreetingPanel") then
+            return shown("QuestTitleButton1")
+        end
+    end
+    if shown("GossipFrame") then
+        return shown("GossipTitleButton1")
+    end
+    if shown("LootFrame") then
+        return shown("LootButton1")
+    end
+    if shown("ClassTrainerFrame") then
+        return usable("ClassTrainerTrainButton")
+    end
+    if shown("MerchantFrame") then
+        return shown("MerchantItem1ItemButton")
+    end
+    if shown("TaxiFrame") then
+        return nil
+    end
+    if shown("GameMenuFrame") then
+        return shown("GameMenuButtonContinue")
+    end
+    return nil
+end
+
+-- A number that steps each time the primary button becomes another one: the Rust side moves the
+-- pointer onto it when the number changes (BenillaPad_Mode's third answer).
+local serial, lastKey = 0, ""
+function Cursor.Serial()
+    local f = Cursor.Primary()
+    local key = f and f:GetName() or ""
+    if key ~= lastKey then
+        lastKey = key
+        if f then
+            serial = serial + 1
+        end
+    end
+    return serial
+end
+
 -- The button to jump to from (x, y) toward `dir` (DUP / DDOWN / DLEFT / DRIGHT), or, for "enter",
--- an open popup's first button (Cancel on a destructive one). Answers absolute units, or nothing.
+-- the primary button (Cancel on a destructive popup). Answers absolute units, or nothing.
 function BenillaPad_Snap(dir, x, y)
     if dir == "enter" then
-        for i = 1, 4 do
-            local button = Cursor.PopupButton(i)
-            if button and button:IsVisible() then
-                local s = button:GetEffectiveScale()
-                return (button:GetLeft() + button:GetWidth() / 2) * s,
-                    (button:GetBottom() + button:GetHeight() / 2) * s
-            end
+        local button = Cursor.Primary()
+        if button and button:GetLeft() then
+            local s = button:GetEffectiveScale()
+            return (button:GetLeft() + button:GetWidth() / 2) * s,
+                (button:GetBottom() + button:GetHeight() / 2) * s
         end
         return nil
     end

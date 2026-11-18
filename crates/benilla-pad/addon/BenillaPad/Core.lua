@@ -449,9 +449,10 @@ end
 -- This addon's own windows set P.mode; otherwise an open stock window asks for the cursor.
 function BenillaPad_Mode()
     if P.mode == "world" and P.Cursor and P.Cursor.Wanted() then
-        return "cursor", P.settingsGen
+        -- The third answer steps when the windows' primary button changes (Cursor.Serial).
+        return "cursor", P.settingsGen, P.Cursor.Serial()
     end
-    return P.mode, P.settingsGen
+    return P.mode, P.settingsGen, 0
 end
 
 -- The settings the Rust side applies: deadzone, look speed, invert Y, shoulder zoom, cursor speed.
