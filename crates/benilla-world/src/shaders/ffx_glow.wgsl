@@ -1594,6 +1594,7 @@ fn mfx_dof(uv: vec2<f32>, p: vec2<f32>, sg: vec3<f32>, z: f32) -> vec3<f32> {
 
 /// The contact shadow: its reach toward the sun in yards (growing with the view distance), its
 /// steps, its strength at full daylight, and the view distances it fades out over.
+const MFX_SUN_ON: bool = false;
 const MFX_SUN_REACH_YD: f32 = 2.4;
 const MFX_SUN_STEPS: i32 = 28;
 const MFX_SUN_STRENGTH: f32 = 0.38;
@@ -1665,7 +1666,11 @@ fn mfx_apply(uv: vec2<f32>, sg: vec3<f32>, z: f32, t_d: f32, rd: vec3<f32>) -> v
     let p = uv * dd;
     var c = mfx_dof(uv, p, sg, z);
     c = c * mfx_ao(p, z, u.cam_fwd.w * vec2<f32>(textureDimensions(in_tex)).y / max(dd.y, 1.0));
-    c = c * mfx_sun_shadow(u.cam_pos.xyz + rd * t_d, z, p);
+    // The sun contact shadows are off: on characters they read worse than the reference's own
+    // blob shadow (the owner's call). `mfx_sun_shadow` stays for a later, better pass.
+    if (MFX_SUN_ON) {
+        c = c * mfx_sun_shadow(u.cam_pos.xyz + rd * t_d, z, p);
+    }
     if (z > 0.0) {
         let haze = MFX_HAZE.x * (1.0 - exp(-t_d / MFX_HAZE.y));
         c = mix(c, mix(u.fog_dry.rgb, u.sky_horizon.rgb, 0.4), haze);
