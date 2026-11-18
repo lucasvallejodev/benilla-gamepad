@@ -130,6 +130,17 @@ impl Plugin for WorldFoundation {
         // One solver substep, not avian's 6: with no dynamic bodies, kinematic motion is exact at
         // any count. Revisit when a dynamic body enters the world.
         app.insert_resource(SubstepCount(1))
+            // The fork's: avian optimises a collider tree each step colliders were added to it
+            // by cloning the whole BVH into a task and then blocking the step on that task. With
+            // no narrow phase or solver to overlap it, the clone of the static tree (every terrain
+            // tile and prop in view) is pure cost: 60-100 ms a frame each time a tile's colliders
+            // landed, the hitch a fast traveller felt at every tile row. In place, on this thread:
+            // nothing queries the trees inside the physics step.
+            .insert_resource(avian3d::collider_tree::ColliderTreeOptimization {
+                optimize_in_place: true,
+                use_async_tasks: false,
+                ..default()
+            })
             // WoW's 19.29 yd/s² gravity for avian's 9.81; a feel knob, not a fidelity target.
             .insert_resource(Gravity(Vec3::NEG_Y * 19.291_105))
             // The view distance (`farclip`), one source for the far wall and the per-object cull.
