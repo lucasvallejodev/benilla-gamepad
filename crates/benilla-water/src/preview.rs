@@ -67,6 +67,20 @@ fn wind_at(secs: f64, storm: f32) -> (Vec2, f32) {
     )
 }
 
+/// The fork's share of the caustic net's physical contrast that the look keeps.
+const CAUSTICS_LOOK: f32 = 0.7;
+/// What the moon keeps of the sun's caustics, shafts and in-scatter under water.
+const MOON_SHARE: f32 = 0.08;
+
+/// How much of the day's direct light is up, [`MOON_SHARE`] to 1, from the visible sun's
+/// direction (camera to sun, Bevy space): the lighting sun never sets, so the water's sun
+/// effects (caustics, shafts, the sunlit in-scatter) follow this one down at dusk.
+pub(crate) fn daylight(celestial_dir: Vec3) -> f32 {
+    let h = celestial_dir.normalize_or(Vec3::Y).y;
+    let t = ((h + 0.08) / 0.30).clamp(0.0, 1.0);
+    MOON_SHARE + (1.0 - MOON_SHARE) * t * t * (3.0 - 2.0 * t)
+}
+
 /// Fill the rows from the lever, the clock and the weather.
 pub(super) fn drive_preview(
     clock: Res<WaterClock>,
@@ -74,6 +88,7 @@ pub(super) fn drive_preview(
     glint: Res<benilla_world::sun::SunGlintVisibility>,
     mut lanes: ResMut<PreviewLanes>,
     dev: Res<crate::dev_state::DebugState>,
+    lighting: Option<Res<benilla_world::lighting::WowLighting>>,
 ) {
     let secs = clock.secs();
     let at = |lane: usize| lane - PREVIEW_LANES.start;
@@ -121,7 +136,12 @@ pub(super) fn drive_preview(
     );
     // The caustic net's gain, live from the debug panel ($WOW_PREVIEW_CAUSTICS_GAIN at boot): the
     // one lane the net reads above water and the underwater rows copy below it.
-    gains[0] = dev.water.caustics.clamp(0.0, 3.0);
+    // The fork's: the net is the sun's, so it follows the visible sun down ([`daylight`]), at
+    // `CAUSTICS_LOOK` of the physical contrast (the full net read as paint on a bright shelf).
+    let day = lighting
+        .as_deref()
+        .map_or(1.0, |l| daylight(l.celestial_dir));
+    gains[0] = dev.water.caustics.clamp(0.0, 3.0) * CAUSTICS_LOOK * day;
     row(PV_GAINS, gains);
     // The owner's look switches, live from the debug panel, each lane 1 where its switch is off.
     let off = |on: bool| f32::from(u8::from(!on));

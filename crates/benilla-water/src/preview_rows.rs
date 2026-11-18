@@ -272,7 +272,17 @@ fn drive_under_lanes(
             2,
             [right.x * tan_h, right.y * tan_h, right.z * tan_h, drift[0]],
         );
-        row(3, [up.x * tan_v, up.y * tan_v, up.z * tan_v, drift[1]]);
+        // The fork's web does not ride the drift; lane w carries the daylight instead
+        // (`preview::daylight`), which dims the water's in-scatter at night.
+        row(
+            3,
+            [
+                up.x * tan_v,
+                up.y * tan_v,
+                up.z * tan_v,
+                crate::preview::daylight(lighting.celestial_dir),
+            ],
+        );
     }
     let sub = eye.submersion();
     let in_water = sub.is_water() && style.is_stylised();
@@ -344,7 +354,17 @@ fn drive_under_lanes(
     row(12, [xz.x, y, xz.y, lanes.0[at(PV_CLOCKS) + 1]]);
     let e_sun_foam = body(9);
     let share = luma(e_sun) / (luma(e_sun) + luma(e_sky)).max(1e-4);
-    row(13, [e_sun_foam[0], e_sun_foam[1], e_sun_foam[2], share]);
+    // The fork's: the sun's light under water follows the visible sun down (`preview::daylight`).
+    let day = crate::preview::daylight(lighting.celestial_dir);
+    row(
+        13,
+        [
+            e_sun_foam[0] * day,
+            e_sun_foam[1] * day,
+            e_sun_foam[2] * day,
+            share * day,
+        ],
+    );
     let tier = match *quality {
         WaterQuality::Low => 0.0,
         WaterQuality::Medium => 1.0,

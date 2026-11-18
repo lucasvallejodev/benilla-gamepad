@@ -58,6 +58,11 @@ pub(crate) enum CollisionLayer {
 /// wall. Nothing may hardcode it: a fixture sweeping another radius tests another client.
 pub const CAMERA_PROBE_RADIUS: f32 = 0.3;
 
+/// How far off the water plane the camera's arm stops, in yards: over the near rectangle's
+/// lowest corner (`nearclip` 0.1 at any pitch drops it under 0.12), so the submersion verdict and
+/// the eye agree and no frame is cut by the waterline.
+const WATERLINE_EYE_CLEARANCE: f32 = 0.15;
+
 /// `CollisionLayers` for a WMO's walking collider, which the camera query never hits.
 pub(crate) fn walk_layers() -> CollisionLayers {
     CollisionLayers::new(CollisionLayer::Walk, LayerMask::ALL)
@@ -230,7 +235,19 @@ impl WorldCollision<'_, '_> {
                 &Self::camera_filter(),
             )
             .map(|h| h.distance);
-        let water = liquid.then(|| self.waterline_ray(from, movement)).flatten();
+        // The fork's: the reference seats the eye on the waterline itself, where the near
+        // rectangle straddles the surface and the frame is half under water. The arm stops
+        // [`WATERLINE_EYE_CLEARANCE`] short of the plane, measured along the plane's normal, so
+        // the whole near rectangle stays on the side the arm started on.
+        let water = liquid
+            .then(|| self.waterline_ray(from, movement))
+            .flatten()
+            .map(|d| {
+                let steep = (movement.y / movement.length().max(1.0e-6))
+                    .abs()
+                    .max(1.0e-3);
+                (d - WATERLINE_EYE_CLEARANCE / steep).max(0.0)
+            });
         match (solid, water) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
@@ -591,11 +608,13 @@ mod liquid_trace_mask {
             );
         }
 
-        // A boom descending at 20 deg sheds the 2/9 yd clearance 0.65 yd along it (sin 20 deg).
+        // A boom descending at 20 deg sheds the 2/9 yd clearance 0.65 yd along it (sin 20 deg);
+        // the fork stops it `WATERLINE_EYE_CLEARANCE` over the plane, 0.21 yd along.
         let aimed = open_arm(&mut app, feet_y, geo, 20.0f32.to_radians());
+        let want = (2.0 / 9.0 - WATERLINE_EYE_CLEARANCE) / 20.0f32.to_radians().sin();
         assert!(
-            (aimed - 0.65).abs() < 0.05,
-            "aimed 20 deg up the boom must still stop ON the surface, got {aimed}"
+            (aimed - want).abs() < 0.05,
+            "aimed 20 deg up the boom must stop the clearance over the surface, got {aimed}"
         );
     }
 
@@ -604,13 +623,12 @@ mod liquid_trace_mask {
         let mut app = world_with_waterline();
         let on = descend_camera(&mut app, true);
         assert!(
-            on.is_some_and(|d| (d - 3.0).abs() < 0.01),
-            "with cameraWaterCollision the boom stops at the surface, got {on:?}"
+            on.is_some_and(|d| (d - (3.0 - WATERLINE_EYE_CLEARANCE)).abs() < 0.01),
+            "with cameraWaterCollision the boom stops the fork's clearance over the surface, got {on:?}"
         );
         assert!(
-            on.is_some_and(|d| d > 2.95),
-            "and it stops ON the plane, not a probe radius short of it — the water leg is a ray, \
-             which is what makes the corridor's 2/9 yd of clearance a clearance"
+            on.is_some_and(|d| d > 2.8),
+            "and not a probe radius short of that: the water leg is a ray"
         );
         assert_eq!(
             descend_camera(&mut app, false),

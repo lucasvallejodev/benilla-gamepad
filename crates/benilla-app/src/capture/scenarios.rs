@@ -1469,6 +1469,16 @@ pub(super) fn scene_dive(name: &str) -> Option<[f32; 2]> {
     match name {
         "water-redridge-under" => Some([-3.0, -3.0]),
         "water-savage-dive" => Some([2.0, -3.0]),
+        // The fork's knob: `WOW_VISTA_DIVE=<first>[,<last>]` stands the vista's eye on the water.
+        "vista" => {
+            let v = std::env::var("WOW_VISTA_DIVE").ok()?;
+            let c: Vec<f32> = v.split(',').filter_map(|p| p.trim().parse().ok()).collect();
+            match c[..] {
+                [a] => Some([a, a]),
+                [a, b] => Some([a, b]),
+                _ => None,
+            }
+        }
         _ => None,
     }
 }

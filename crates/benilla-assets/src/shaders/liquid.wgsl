@@ -1712,7 +1712,8 @@ const WU_CAU_FLOW_PERIOD_S: f32 = 1.6;
 /// World XZ `x` on the net's octave lattice at its drift `drift` (tiles).
 fn wu_caustic_uv(x: vec2<f32>, drift: vec2<f32>) -> vec2<f32> {
     let r = WU_CAU_ROT;
-    return vec2<f32>(r.x * x.x + r.y * x.y, -r.y * x.x + r.x * x.y) / WU_CAU_TILE_YD + drift;
+    // The fork's web animates by its slice, not by sliding: the drift's wrap would jump it.
+    return vec2<f32>(r.x * x.x + r.y * x.y, -r.y * x.x + r.x * x.y) / WU_CAU_TILE_YD + 0.0 * drift;
 }
 
 /// One ripple's share of the Hessian, `(h_xx, h_zz, h_xz)` per unit focus, and in `w` the square
@@ -1773,21 +1774,52 @@ fn wu_caustic_lens(h: vec4<f32>, rho: f32) -> f32 {
     return inverseSqrt(det * det + WU_CAU_EPS * WU_CAU_EPS) / wu_caustic_mean(rho * sqrt(h.w));
 }
 
-/// Both sets' net at lattice point `uv` down a path of `path` yards, seen through a footprint of
-/// `fp` yards an output pixel on the bed, mean 1: the fine net sharp in the first yard or two,
-/// handing over to the coarse net, which focuses `WU_CAU_COARSE` times deeper, as the bed falls
-/// away; each ripple fades as the footprint nears it, the fine set's first.
+/// The fork's caustic web (benilla-gamepad): the least distance to three turned 3D lattices, sliced
+/// by the clock, raised to a ridge. It reads as light through a rippled surface (an irregular wavy
+/// web with no cell grid and no visible tile), where the Hessian net above drew a honeycomb. `q` in
+/// cells of the first lattice (a third of a unit), `t` the slice. Mean 1, never over
+/// `WU_WEB_CAP / WU_WEB_MEAN`. The lattices repeat every 25 units of `q` and of `t`, so both are
+/// reduced first and a far coordinate keeps its precision.
+const WU_WEB_CAP: f32 = 4.0;
+const WU_WEB_MEAN: f32 = 0.7583;
+fn wu_web_turn(v: vec3<f32>) -> vec3<f32> {
+    return vec3<f32>(
+        dot(v, vec3<f32>(-2.0, 3.0, 1.0)),
+        dot(v, vec3<f32>(-1.0, -2.0, 2.0)),
+        dot(v, vec3<f32>(2.0, 1.0, 2.0)),
+    );
+}
+fn wu_web(q: vec2<f32>, t: f32) -> f32 {
+    let u = vec3<f32>(q - 25.0 * floor(q / 25.0), t - 25.0 * floor(t / 25.0));
+    let a = wu_web_turn(u);
+    let b = wu_web_turn(a) * 0.4;
+    let c = wu_web_turn(b) * 0.3;
+    let k = min(min(length(0.5 - fract(a)), length(0.5 - fract(b))), length(0.5 - fract(c)));
+    let k2 = k * k;
+    let v = k2 * k2 * k / 0.012565;
+    return WU_WEB_CAP * (1.0 - exp(-v / WU_WEB_CAP)) / WU_WEB_MEAN;
+}
+
+/// The web's cell on the bed, yards: the fine one in the first yards, the coarse one deeper.
+const WU_WEB_CELL_YD: vec2<f32> = vec2<f32>(0.6, 1.4);
+
+/// Both webs at lattice point `uv` down a path of `path` yards, seen through a footprint of `fp`
+/// yards an output pixel on the bed, mean 1: the fine web in the first yard or two, handing over
+/// to the coarse one as the bed falls away; each fades as the footprint nears its cell, so a far
+/// shelf goes flat instead of aliasing. `phi` is the weather clock's phase: 25 slices a period.
 fn wu_caustic_at(uv: vec2<f32>, path: f32, phi: f32, fp: f32) -> f32 {
     let wf = 1.0 - smoothstep(1.0, 3.5, path);
     let wc = smoothstep(0.4, 2.0, path);
+    let x = uv * WU_CAU_TILE_YD;
+    let px = max(fp, 1e-5);
     var c = 1.0;
     if (wf > 0.0) {
-        let rho = min(path / WU_CAU_FOCUS_YD, WU_CAU_RHO_MAX);
-        c += wf * (wu_caustic_lens(wu_caustic_hessian(uv, phi, fp), rho) - 1.0);
+        let k = smoothstep(WU_CAU_RIPPLE_PX.x, WU_CAU_RIPPLE_PX.y, 2.0 * WU_WEB_CELL_YD.x / px);
+        c += wf * k * (wu_web(x / (3.0 * WU_WEB_CELL_YD.x), 25.0 * phi) - 1.0);
     }
     if (wc > 0.0) {
-        let rho = min(path / (WU_CAU_FOCUS_YD * WU_CAU_COARSE), WU_CAU_RHO_MAX);
-        c += wc * (wu_caustic_lens(wu_caustic_hessian_coarse(uv, phi, fp), rho) - 1.0);
+        let k = smoothstep(WU_CAU_RIPPLE_PX.x, WU_CAU_RIPPLE_PX.y, 2.0 * WU_WEB_CELL_YD.y / px);
+        c += wc * k * (wu_web(x / (3.0 * WU_WEB_CELL_YD.y) + vec2<f32>(7.3, 3.1), 25.0 * phi + 11.0) - 1.0);
     }
     return c;
 }
@@ -1952,7 +1984,7 @@ fn wu_post(
                         let fp = t_d * u.cam_fwd.w / max(abs(dot(rd, nr)), 0.1);
                         // No current from below: the eye's body has none on the CPU.
                         let c = wu_caustic_net(entry, path, u.sun_refr.w,
-                            vec2<f32>(u.cam_right.w, u.cam_up.w), vec2<f32>(0.0), 0.0, fp);
+                            vec2<f32>(0.0), vec2<f32>(0.0), 0.0, fp);
                         lin = lin * wu_caustic_gain(c, amp);
                     }
                 }
@@ -1963,7 +1995,10 @@ fn wu_post(
         let t_mid = 0.5 * (t0 + min(t1, 60.0));
         let depth_mid = h - (eye.y + rd.y * t_mid);
         let mid = wu_palette(u.fog_wet.rgb);
-        let ins = wu_inscatter(rd, mid, u.sun_refr.xyz, u.sun_e.rgb, depth_mid);
+        // The fork's: the body's glow follows the daylight down (`cam_up.w`, 0.08 at night to 1),
+        // so the water is not a lit room at midnight.
+        let ins = wu_inscatter(rd, mid, u.sun_refr.xyz, u.sun_e.rgb, depth_mid)
+            * mix(0.3, 1.0, smoothstep(0.08, 0.8, u.cam_up.w));
         lin = lin * tr + ins * w_in;
         if (wu_has(bits, WU_SHAFTS) && u.sun_e.w > 0.01) {
             // Round 2: the light columns, added as the sun's light they scatter, strongest
