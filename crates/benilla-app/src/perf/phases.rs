@@ -102,6 +102,11 @@ pub(super) fn plugin(app: &mut App) {
     app.add_systems(
         Update,
         (
+            // The fork's finer marks: before and after the UI's input records.
+            stamp("Update/start").before(crate::ui_script::UiInput),
+            stamp("Update/ui-input")
+                .after(crate::ui_script::UiInput)
+                .before(crate::player::WorldMouse),
             // After the frame's input records, which run ahead of the net drain.
             stamp("Update/pre-Net")
                 .after(crate::player::WorldMouse)

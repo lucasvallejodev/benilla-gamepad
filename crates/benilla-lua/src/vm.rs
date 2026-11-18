@@ -2376,6 +2376,11 @@ impl Vm {
     #[cold]
     #[inline(never)]
     pub fn full_gc(&mut self) {
+        // `$WOW_GC_LOG=1`: each collection's wall time on stderr (the fork's instrument).
+        static LOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let _timer = LOG
+            .get_or_init(|| std::env::var_os("WOW_GC_LOG").is_some())
+            .then(GcTimer::start);
         self.heap.collections += 1;
         self.check_stack_sizes();
         let mut roots: Vec<Value> = self.stack[..self.top].to_vec();
@@ -3777,5 +3782,20 @@ mod tests {
         vm.full_gc();
         let count = vm.heap.bytes();
         assert_eq!(vm.heap.threshold(), count + count / 4);
+    }
+}
+
+/// Prints a collection's wall time when dropped (`$WOW_GC_LOG`).
+struct GcTimer(std::time::Instant);
+
+impl GcTimer {
+    fn start() -> Self {
+        Self(std::time::Instant::now())
+    }
+}
+
+impl Drop for GcTimer {
+    fn drop(&mut self) {
+        eprintln!("[gc] {:.1} ms", self.0.elapsed().as_secs_f32() * 1000.0);
     }
 }
