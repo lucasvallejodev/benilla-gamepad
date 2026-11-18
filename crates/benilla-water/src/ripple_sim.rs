@@ -869,9 +869,15 @@ pub(crate) fn drive_ripple_sim(
         }
     }
     // Last frame's step: the field back, and its texture published.
-    if let Some(task) = sim.step.take() {
+    if let Some(mut task) = sim.step.take() {
         let t0 = std::time::Instant::now();
-        let done = block_on(task);
+        // The fork's: polled, never waited on. The step shares the compute pool with the tile
+        // streamer's builds (a tile's water and ground cover), and behind one of those the wait
+        // stalled the frame 60-90 ms; a step still running keeps last frame's field on screen.
+        let Some(done) = block_on(bevy::tasks::futures_lite::future::poll_once(&mut task)) else {
+            sim.step = Some(task);
+            return;
+        };
         let RippleSim {
             image,
             field,
