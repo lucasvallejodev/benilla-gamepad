@@ -47,6 +47,46 @@ layerText:SetFont("Fonts\\FRIZQT__.TTF", 22, "OUTLINE")
 layerText:SetPoint("CENTER", frame, "CENTER", 0, 4)
 layerText:SetTextColor(1, 0.82, 0)
 
+-- The action sets as three tabs under the label (a crossbar's set indicator): the one the
+-- triggers hold is lit in its own colour, the others dim, so the set in play reads at a glance
+-- and the other sets are seen to exist.
+local LAYER_COLOR = {
+    bare = { 1, 0.82, 0 }, lt = { 0.35, 0.75, 1 }, rt = { 1, 0.45, 0.3 }, ltrt = { 0.75, 0.5, 1 },
+}
+local TABS = { { "lt", "LT" }, { "ltrt", "LT+RT" }, { "rt", "RT" } }
+local tabs = {}
+for i = 1, 3 do
+    local t = CreateFrame("Frame", nil, frame)
+    t:SetWidth(58)
+    t:SetHeight(16)
+    t:SetPoint("CENTER", frame, "CENTER", (i - 2) * 62, -22)
+    local bg = t:CreateTexture(nil, "BACKGROUND")
+    bg:SetAllPoints(t)
+    t.bg = bg
+    local text = t:CreateFontString(nil, "OVERLAY")
+    text:SetFont("Fonts\\FRIZQT__.TTF", 10, "OUTLINE")
+    text:SetPoint("CENTER", t, "CENTER", 0, 0)
+    text:SetText(TABS[i][2])
+    t.text = text
+    tabs[i] = t
+end
+
+local function paintTabs()
+    for i = 1, 3 do
+        local t, layer = tabs[i], TABS[i][1]
+        local c = LAYER_COLOR[layer]
+        if P.layer == layer then
+            t.bg:SetTexture(c[1], c[2], c[3], 0.85)
+            t.text:SetTextColor(0, 0, 0)
+        else
+            t.bg:SetTexture(0, 0, 0, 0.4)
+            t.text:SetTextColor(c[1], c[2], c[3])
+        end
+    end
+    local c = LAYER_COLOR[P.layer] or LAYER_COLOR.bare
+    layerText:SetTextColor(c[1], c[2], c[3])
+end
+
 -- ── Building a button ──
 
 local function newIconSquare(b, size)
@@ -406,6 +446,7 @@ function Bar.Refresh()
         return
     end
     layerText:SetText(P.LAYER_LABEL[P.layer] or "")
+    paintTabs()
     for key, b in pairs(Bar.buttons) do
         Bar.UpdateButton(b)
     end
