@@ -71,6 +71,8 @@ P.DEFAULTS = {
     -- The camera's swing back behind the character: "game" leaves the game's own setting
     -- (Interface options, Camera Following Style), "always" and "never" set it.
     followCam = "always",
+    -- Interact (X) on a target out of reach walks up to it (the game's Click-to-Move).
+    walkToInteract = true,
 }
 
 local FACES = { A = true, B = true, X = true, Y = true }
@@ -263,6 +265,16 @@ end
 function P.ApplyFollowCamera()
     if not P.connected then
         return
+    end
+    -- Interact on something out of reach walks up to it: 1.12's own Click-to-Move
+    -- (`AutoInteract`, which only ever walks to an interact target). Without a mouse there is
+    -- no other way to close the last few yards than steering by hand.
+    if P.Setting("walkToInteract") then
+        pcall(function()
+            if GetCVar("AutoInteract") ~= "1" then
+                SetCVar("AutoInteract", "1")
+            end
+        end)
     end
     local want = P.Setting("followCam")
     local value = (want == "always" and "2") or (want == "never" and "0") or nil

@@ -71,6 +71,9 @@ Menu.pages = {
     buttons = {
         title = "Buttons",
         rows = {
+            { label = "Interact walks to the target",
+                desc = "X on an NPC, a corpse or an object that is out of reach walks up to it and then interacts (turns on the game's Click-to-Move). Off leaves the game's own setting alone.",
+                key = "walkToInteract" },
             { label = "Cast spells on press", desc = "On: a spell casts when the button goes down. Off: when it comes up, as 1.12's keys do.",
                 key = "castOnPress" },
             { label = "A / B / X / Y with no trigger",
