@@ -466,6 +466,12 @@
             .. "gloomy zone - so the world stays visible. Daylight and dusk are left as they are, "
             .. "and a night still reads as night.\n\n"
             .. "Has no effect without Modern Look."
+        BENILLA_TOOLTIP_LOOK_QUALITY =
+            "How much the Modern Look spends.\n\n"
+            .. "Low: tone curve, bloom and colour grade only - the lightest. Medium and High add "
+            .. "the depth effects (a soft far focus, shading in creases, a light distance haze) and "
+            .. "meter the picture to set the exposure per zone.\n\n"
+            .. "The depth effects need Improved Water. Has no effect without Modern Look."
         BENILLA_TOOLTIP_GRASS_DISTANCE =
             "How far away grass, flowers and other small ground cover are drawn, in yards. The "
             .. "1.12 client stops at 70.\n\n"
@@ -506,7 +512,7 @@
                 "RowWeatherDensity",
                 "RowDisplayMode", "RowVerticalSync", "RowRenderScale", "RowWaterStyle",
                 -- benilla-gamepad fork: the Modern look's rows.
-                "RowLookModel", "RowAutoExposure", "RowGrassDistance",
+                "RowLookModel", "RowLookQuality", "RowAutoExposure", "RowGrassDistance",
             },
             -- Guild Names and Player Titles are children of Player Names
             -- (UIOptionsFrame.lua:703-709).
@@ -2081,10 +2087,24 @@
                                                     "BENILLA_TOOLTIP_LOOK_MODEL")
                                             </OnLoad></Scripts>
                                         </Frame>
-                                        <Frame name="$parentRowAutoExposure" inherits="BenillaOptionsCheckboxRowTemplate">
+                                        <Frame name="$parentRowLookQuality" inherits="BenillaOptionsSliderRowTemplate">
                                             <Anchors>
                                                 <Anchor point="TOPLEFT" relativeTo="$parentRowLookModel" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
                                                 <Anchor point="TOPRIGHT" relativeTo="$parentRowLookModel" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                                            </Anchors>
+                                            <Scripts><OnLoad>
+                                                -- benilla-gamepad fork: Effects Quality,
+                                                -- `lookQuality`, the Modern look's tier.
+                                                BenillaOptionsRow_OnLoad(this, "lookQuality", "Effects Quality",
+                                                    "BENILLA_TOOLTIP_LOOK_QUALITY")
+                                                BenillaOptionsSliderRow_Setup(this, 0, 2, 1, nil,
+                                                    { "Low", "Medium", "High" })
+                                            </OnLoad></Scripts>
+                                        </Frame>
+                                        <Frame name="$parentRowAutoExposure" inherits="BenillaOptionsCheckboxRowTemplate">
+                                            <Anchors>
+                                                <Anchor point="TOPLEFT" relativeTo="$parentRowLookQuality" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                                                <Anchor point="TOPRIGHT" relativeTo="$parentRowLookQuality" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
                                             </Anchors>
                                             <Scripts><OnLoad>
                                                 -- benilla-gamepad fork: Auto Exposure,

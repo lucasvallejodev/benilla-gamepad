@@ -2377,6 +2377,7 @@ fn every_row_tooltip_key_resolves_in_the_real_global_strings() {
             ("BENILLA_TOOLTIP_LOOK_MODEL", "GraphicsRowLookModel"),
             ("BENILLA_TOOLTIP_AUTO_EXPOSURE", "GraphicsRowAutoExposure"),
             ("BENILLA_TOOLTIP_GRASS_DISTANCE", "GraphicsRowGrassDistance"),
+            ("BENILLA_TOOLTIP_LOOK_QUALITY", "GraphicsRowLookQuality"),
         ];
         if let Some((_, want_row)) = BENILLA_OWNED.iter().find(|(k, _)| *k == key) {
             assert_eq!(row, *want_row, "{row}: not this row's string");
@@ -2400,10 +2401,10 @@ fn every_row_tooltip_key_resolves_in_the_real_global_strings() {
         );
         checked += 1;
     }
-    // 88 rows less the three untipped below; eight of the 85 carry a `BENILLA_` key (two of them
+    // 89 rows less the three untipped below; nine of the 86 carry a `BENILLA_` key (two of them
     // the benilla-gamepad fork's Modern look rows), and a dropdown row is checked on the key it
     // wears at rest.
-    assert_eq!(checked, 85, "every tipped row carries a live key");
+    assert_eq!(checked, 86, "every tipped row carries a live key");
     assert_eq!(
         untipped,
         vec![
@@ -2499,8 +2500,8 @@ fn every_flavor_of_row_raises_its_plate_from_the_page_it_lives_on() {
             s.errors()
         );
     }
-    // Every tipped row: the same 85 the key census counts.
-    assert_eq!(raised, 85, "every row but Auto Loot raises a description");
+    // Every tipped row: the same 86 the key census counts.
+    assert_eq!(raised, 86, "every row but Auto Loot raises a description");
 }
 
 /// 1.12's AdvancedOptionsCombatText box as saved-global rows: a click writes the global, never a
