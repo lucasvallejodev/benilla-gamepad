@@ -131,6 +131,8 @@ const METER_KEY: f32 = 0.055;
 const METER_BRIGHT: (f32, f32) = (0.25, 0.72);
 /// (strength, cap).
 const METER_DARK: (f32, f32) = (0.3, 1.2);
+/// The dark cap at full night.
+const METER_NIGHT_CAP: f32 = 2.0;
 /// A reading older than this many seconds is stale (the world is not drawing: a loading screen).
 const METER_FRESH_SECONDS: f32 = 1.0;
 
@@ -140,7 +142,12 @@ fn meter_exposure(log_average: f32, rows: f32) -> f32 {
     if ratio < 1.0 {
         ratio.powf(METER_BRIGHT.0).max(METER_BRIGHT.1)
     } else {
-        ratio.powf(METER_DARK.0).min(METER_DARK.1).max(rows)
+        // By day the cap keeps a gloomy zone gloomy; as the light rows say night (`rows` over
+        // 1) it opens to [`METER_NIGHT_CAP`], so a night under trees is lifted as far as an
+        // open moonlit field needs no lift at all, and both stay readable.
+        let night = ((rows - 1.0) / 0.4).clamp(0.0, 1.0);
+        let cap = METER_DARK.1 + (METER_NIGHT_CAP - METER_DARK.1) * night;
+        ratio.powf(METER_DARK.0).min(cap).max(rows)
     }
 }
 
@@ -267,7 +274,11 @@ mod tests {
         assert_eq!(meter_exposure(1.0, 1.0), METER_BRIGHT.1);
         // Gloom lifts to the cap at most; a night keeps the light rows' larger lift.
         assert_eq!(meter_exposure(0.01, 1.0), METER_DARK.1);
-        assert_eq!(meter_exposure(0.006, 1.45), 1.45);
+        // At night the cap opens: a black wood lifts past the rows' own lift, a moonlit field
+        // that already meters near the key does not.
+        let wood = meter_exposure(0.006, 1.45);
+        assert!(wood > 1.8 && wood <= METER_NIGHT_CAP, "{wood}");
+        assert_eq!(meter_exposure(0.04, 1.45), 1.45);
     }
 
     #[test]
