@@ -1516,6 +1516,7 @@ fn veil_apply(sg: vec3<f32>, rd: vec3<f32>, t_d: f32) -> vec3<f32> {
 // darkening of creases and contact corners, and a light aerial haze. None casts a ray.
 
 /// The crease shade: its reach in yards, its strength, and the view distances it fades out over.
+const MFX_AO_ON: bool = false;
 const MFX_AO_REACH_YD: f32 = 0.9;
 const MFX_AO_STRENGTH: f32 = 0.6;
 const MFX_AO_FADE_YD: vec2<f32> = vec2<f32>(90.0, 170.0);
@@ -1665,7 +1666,12 @@ fn mfx_apply(uv: vec2<f32>, sg: vec3<f32>, z: f32, t_d: f32, rd: vec3<f32>) -> v
     let dd = vec2<f32>(textureDimensions(uw_depth));
     let p = uv * dd;
     var c = mfx_dof(uv, p, sg, z);
-    c = c * mfx_ao(p, z, u.cam_fwd.w * vec2<f32>(textureDimensions(in_tex)).y / max(dd.y, 1.0));
+    // The crease shade is off: with six fixed tap pairs it stamped offset copies of every
+    // silhouette (a character, a grass tuft) onto the ground around it, which read as doubled
+    // and tripled shadows. `mfx_ao` stays for a proper many-tap pass later.
+    if (MFX_AO_ON) {
+        c = c * mfx_ao(p, z, u.cam_fwd.w * vec2<f32>(textureDimensions(in_tex)).y / max(dd.y, 1.0));
+    }
     // The sun contact shadows are off: on characters they read worse than the reference's own
     // blob shadow (the owner's call). `mfx_sun_shadow` stays for a later, better pass.
     if (MFX_SUN_ON) {

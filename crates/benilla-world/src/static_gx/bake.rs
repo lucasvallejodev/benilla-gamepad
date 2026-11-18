@@ -47,6 +47,22 @@ const CENSUS_SETTLE_FRAMES: u32 = 60;
 /// The ceiling on that hold (~10 s), so counts that never settle, as on a flight path, still print.
 const CENSUS_MAX_HOLD_FRAMES: u32 = 600;
 
+/// `$WOW_GX_TIMES=1`: a bake over 3 ms, with its kind and size, on stderr (the fork's instrument).
+fn gx_time(kind: &str, t0: std::time::Instant, baked: &render::GxCellDraw) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("WOW_GX_TIMES").is_some()) {
+        return;
+    }
+    let ms = t0.elapsed().as_secs_f32() * 1000.0;
+    if ms >= 3.0 {
+        eprintln!(
+            "[gx] {kind} {ms:.1} ms, {} draw(s), {} vert(s)",
+            baked.draws.len(),
+            baked.draws.last().map_or(0, |d| d.vertex_range.end)
+        );
+    }
+}
+
 /// Bake dirty-and-quiet cells into retained draw data; publish into [`render::GxWorld`].
 pub(super) fn flush_static_gx(mut gx: ResMut<StaticGx>, mut meshes: ResMut<Assets<Mesh>>) {
     let _t = super::gx_perf_guard(0);
@@ -76,7 +92,9 @@ pub(super) fn flush_static_gx(mut gx: ResMut<StaticGx>, mut meshes: ResMut<Asset
             .items
             .sort_by_key(|i| ((u8::from(i.cutout) << 1) | u8::from(i.two_sided), i.texture));
         remap_fader_items(state);
+        let gx_t0 = std::time::Instant::now();
         let baked = bake_cell(&state.items, &mut meshes);
+        gx_time("cell", gx_t0, &baked);
         debug!(
             "static-gx: cell ({},{}) baked — {} item(s), {} vert(s)",
             cell.0,
@@ -103,7 +121,9 @@ pub(super) fn flush_static_gx(mut gx: ResMut<StaticGx>, mut meshes: ResMut<Asset
                 i.wmo.as_ref().map_or(0, |w| w.group),
             )
         });
+        let gx_t0 = std::time::Instant::now();
         let baked = bake_cell(&state.items, &mut meshes);
+        gx_time("wmo", gx_t0, &baked);
         debug!(
             "static-gx: wmo {instance} baked — {} item(s), {} group(s), {} vert(s)",
             state.items.len(),
@@ -129,7 +149,9 @@ pub(super) fn flush_static_gx(mut gx: ResMut<StaticGx>, mut meshes: ResMut<Asset
                 i.prop.as_ref().map_or(0, |p| p.set),
             )
         });
+        let gx_t0 = std::time::Instant::now();
         let mut baked = bake_cell(&state.items, &mut meshes);
+        gx_time("props", gx_t0, &baked);
         baked.sets = state.sets.clone();
         debug!(
             "static-gx: props {instance} baked — {} item(s), {} set(s), {} vert(s)",
