@@ -92,7 +92,8 @@ function Legend.Refresh()
         rows = cursorRows()
         -- The game's windows open at the top left: the legend steps to the right edge, under
         -- the minimap, while one is up.
-        f:SetPoint("TOPRIGHT", UIParent, "TOPRIGHT", -14, -210)
+        -- At the right edge's middle: the quest tracker hangs under the minimap above it.
+        f:SetPoint("RIGHT", UIParent, "RIGHT", -14, -60)
     else
         rows = worldRows()
         f:SetPoint("TOPLEFT", UIParent, "TOPLEFT", 14, -92)
