@@ -4923,6 +4923,11 @@ fn pv_fresnel_lobe(mu: f32, sig: f32, alpha: f32) -> f32 {
     return 0.5 * (pv_fresnel(mu - sig, alpha) + pv_fresnel(mu + sig, alpha));
 }
 
+/// The fork's reflection look: the share of the mirror kept, and of that in the shallows; the
+/// depths (yards of water over the bed) between which the shallow share hands over.
+const FORK_REFLECT: vec2<f32> = vec2<f32>(0.6, 0.2);
+const FORK_REFLECT_DEPTH: vec2<f32> = vec2<f32>(0.5, 8.0);
+
 /// The lively reflection (`preview.looks.y`): the reflectance per pixel on the resolved wave normal
 /// `n`, averaged over the lobe of the slope variance the surface no longer resolves, under the
 /// gloss's grazing `ceiling` as a level rather than a clip. The clip held every far pixel whose
@@ -8445,7 +8450,13 @@ fn stylised_water(
             pv_f = pv_fresnel_lively(n, flat_n, to_view, surf.a2, surf.alpha, water_reflect.look.composite.w);
         }
     }
-    let f_surf = pv_f;
+    // The fork's: the mirror keeps `FORK_REFLECT.x` of its share, and `FORK_REFLECT.y` of that
+    // over the first yards of clear water, where a pale reflection of the far shore's fog lay on
+    // the bed like a film; a falling sheet keeps its own.
+    let fork_depth = select(FORK_REFLECT_DEPTH.y, max(sb.vertical, 0.0), sb.known);
+    let fork_keep = FORK_REFLECT.x
+        * mix(FORK_REFLECT.y, 1.0, smoothstep(FORK_REFLECT_DEPTH.x, FORK_REFLECT_DEPTH.y, fork_depth));
+    let f_surf = select(pv_f, max(pv_f * fork_keep, F0_WATER), eye_above && rf.sheet <= 0.0);
 #else
     let f_surf = min(water_fresnel(dot(n, to_view), surf.alpha), water_reflect.look.composite.x);
 #endif
