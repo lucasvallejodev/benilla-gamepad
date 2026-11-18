@@ -466,6 +466,10 @@
             .. "gloomy zone - so the world stays visible. Daylight and dusk are left as they are, "
             .. "and a night still reads as night.\n\n"
             .. "Has no effect without Modern Look."
+        BENILLA_TOOLTIP_GRASS_DISTANCE =
+            "How far away grass, flowers and other small ground cover are drawn, in yards. The "
+            .. "1.12 client stops at 70.\n\n"
+            .. "Higher values fill the middle distance and cost some performance."
 
         -- 1.12's WINDOWED_MODE text describes a checkbox and exclusive-mode gamma.
         BENILLA_TOOLTIP_DISPLAY_MODE =
@@ -502,7 +506,7 @@
                 "RowWeatherDensity",
                 "RowDisplayMode", "RowVerticalSync", "RowRenderScale", "RowWaterStyle",
                 -- benilla-gamepad fork: the Modern look's rows.
-                "RowLookModel", "RowAutoExposure",
+                "RowLookModel", "RowAutoExposure", "RowGrassDistance",
             },
             -- Guild Names and Player Titles are children of Player Names
             -- (UIOptionsFrame.lua:703-709).
@@ -2087,6 +2091,20 @@
                                                 -- `autoExposure`, the Modern look's exposure.
                                                 BenillaOptionsRow_OnLoad(this, "autoExposure", "Auto Exposure",
                                                     "BENILLA_TOOLTIP_AUTO_EXPOSURE")
+                                            </OnLoad></Scripts>
+                                        </Frame>
+                                        <Frame name="$parentRowGrassDistance" inherits="BenillaOptionsSliderRowTemplate">
+                                            <Anchors>
+                                                <Anchor point="TOPLEFT" relativeTo="$parentRowAutoExposure" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                                                <Anchor point="TOPRIGHT" relativeTo="$parentRowAutoExposure" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                                            </Anchors>
+                                            <Scripts><OnLoad>
+                                                -- benilla-gamepad fork: Grass Distance,
+                                                -- `grassDistance`, the ground cover's reach in
+                                                -- yards (the reference's fixed 70 is the low end).
+                                                BenillaOptionsRow_OnLoad(this, "grassDistance", "Grass Distance",
+                                                    "BENILLA_TOOLTIP_GRASS_DISTANCE")
+                                                BenillaOptionsSliderRow_Setup(this, 70, 280, 35, "raw")
                                             </OnLoad></Scripts>
                                         </Frame>
                                     </Frames>

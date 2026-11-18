@@ -909,6 +909,14 @@ pub(crate) const REGISTERED: &[Registered] = &[
         "1",
         "the fork's own — the reference's exposure never moves",
     ),
+    // benilla-gamepad fork: how far the ground cover (grass, flowers, small rocks) is drawn, in
+    // yards; the reference's is a hardcoded 70 (`[0x867958]`). The knob is
+    // `benilla_world::clutter::ClutterConfig::fade_far`.
+    ours(
+        "grassDistance",
+        "140",
+        "the fork's own — the reference draws ground cover to a fixed 70 yd and has no setting",
+    ),
     // benilla's own: `/console fpsJournal 1` appends a per-second row of position, frame cost and
     // per-pass GPU time to `benilla-config/Diagnostics/fps-journal.csv`. The knob is
     // [`crate::perf::FpsJournalSetting`].

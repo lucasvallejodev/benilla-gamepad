@@ -51,12 +51,14 @@ fn remesh_on_cutout_change(
     mut commands: Commands,
     cfg: Res<ClutterConfig>,
     mut chunks: Query<&mut ClutterChunk>,
-    mut last: Local<Option<f32>>,
+    mut last: Local<Option<(f32, f32)>>,
 ) {
-    let Some(prev) = last.replace(cfg.alpha_ref) else {
+    // The fade distance is baked into the material beside the ref (`grassDistance`).
+    let now = (cfg.alpha_ref, cfg.fade_far);
+    let Some(prev) = last.replace(now) else {
         return;
     };
-    if prev == cfg.alpha_ref {
+    if prev == now {
         return;
     }
     let mut n = 0;
@@ -67,8 +69,9 @@ fn remesh_on_cutout_change(
         }
     }
     info!(
-        "clutter: detailDoodadAlpha {} — dropped {n} built mesh(es) to re-cut",
-        (cfg.alpha_ref * 255.0).round() as u32
+        "clutter: detailDoodadAlpha {}, distance {} yd — dropped {n} built mesh(es) to re-cut",
+        (cfg.alpha_ref * 255.0).round() as u32,
+        cfg.fade_far
     );
 }
 
@@ -126,6 +129,11 @@ pub(crate) const DETAIL_DOODAD_ALPHA_REF: f32 = 128.0 / 255.0;
 /// over its last quarter.
 pub(crate) const DETAIL_DOODAD_FADE_FAR: f32 = 70.0;
 
+/// The fork's `grassDistance` CVar: its default and the range it is held to, yards. The low end
+/// is the reference's horizon; the build cost grows with the square of the distance.
+pub const GRASS_DISTANCE_DEFAULT: f32 = 140.0;
+pub const GRASS_DISTANCE_RANGE: std::ops::RangeInclusive<f32> = DETAIL_DOODAD_FADE_FAR..=280.0;
+
 /// Ground-clutter tunables. `density` scales the reference's 16 cells per chunk (`frillDensity`),
 /// and a change re-scatters loaded tiles, as the 1.12 setter rebuilds its chunks. Seeded from
 /// `$WOW_CLUTTER_DENSITY`, `$WOW_CLUTTER_ALPHA` and `$WOW_CLUTTER_FADE`; density 0 is no clutter.
@@ -162,8 +170,10 @@ impl Default for ClutterConfig {
             alpha_ref: env("WOW_CLUTTER_ALPHA")
                 .unwrap_or(DETAIL_DOODAD_ALPHA_REF)
                 .clamp(0.0, 1.0),
+            // The fork's `grassDistance` default ([`GRASS_DISTANCE_DEFAULT`]), twice the
+            // reference's 70 yd, so the ground cover does not end a few steps ahead.
             fade_far: env("WOW_CLUTTER_FADE")
-                .unwrap_or(DETAIL_DOODAD_FADE_FAR)
+                .unwrap_or(GRASS_DISTANCE_DEFAULT)
                 .max(1.0),
         }
     }

@@ -394,6 +394,13 @@ impl VideoKnobs<'_> {
             "lookmodel" => **look_model = benilla_world::modern::LookModel::from_cvar(v),
             "lookquality" => **look_quality = benilla_world::modern::LookQuality::from_cvar(v),
             "autoexposure" => auto_exposure.0 = ev.flag(),
+            // benilla-gamepad fork: the ground cover's reach; its built chunks re-cut off the change.
+            "grassdistance" => {
+                clutter.fade_far = v.clamp(
+                    *benilla_world::clutter::GRASS_DISTANCE_RANGE.start(),
+                    *benilla_world::clutter::GRASS_DISTANCE_RANGE.end(),
+                )
+            }
             // Clamped, where the reference refuses an out-of-range write and keeps the value
             // (`0x688d90` echoes "NearClip must be in range 0.01 - 0.33" and returns 0).
             "nearclip" => view.set_nearclip(v),
