@@ -264,9 +264,15 @@ function P.ApplyFollowCamera()
     end
     local want = P.Setting("followCam")
     local value = (want == "always" and "2") or (want == "never" and "0") or nil
-    if value and GetCVar("cameraSmoothStyle") ~= value then
-        SetCVar("cameraSmoothStyle", value)
+    if not value then
+        return
     end
+    -- Guarded: a client without the CVar must not stop the pad's other listeners.
+    pcall(function()
+        if GetCVar("cameraSmoothStyle") ~= value then
+            SetCVar("cameraSmoothStyle", value)
+        end
+    end)
 end
 
 function P.Changed()
