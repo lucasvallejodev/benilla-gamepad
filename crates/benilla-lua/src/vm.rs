@@ -3661,6 +3661,21 @@ fn precall_top50(base: usize, nargs: usize, p: &Proto) -> usize {
     }
 }
 
+/// Prints a collection's wall time when dropped (`$WOW_GC_LOG`).
+struct GcTimer(std::time::Instant);
+
+impl GcTimer {
+    fn start() -> Self {
+        Self(std::time::Instant::now())
+    }
+}
+
+impl Drop for GcTimer {
+    fn drop(&mut self) {
+        eprintln!("[gc] {:.1} ms", self.0.elapsed().as_secs_f32() * 1000.0);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3782,20 +3797,5 @@ mod tests {
         vm.full_gc();
         let count = vm.heap.bytes();
         assert_eq!(vm.heap.threshold(), count + count / 4);
-    }
-}
-
-/// Prints a collection's wall time when dropped (`$WOW_GC_LOG`).
-struct GcTimer(std::time::Instant);
-
-impl GcTimer {
-    fn start() -> Self {
-        Self(std::time::Instant::now())
-    }
-}
-
-impl Drop for GcTimer {
-    fn drop(&mut self) {
-        eprintln!("[gc] {:.1} ms", self.0.elapsed().as_secs_f32() * 1000.0);
     }
 }
