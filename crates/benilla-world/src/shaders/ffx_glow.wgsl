@@ -1546,9 +1546,9 @@ const MFX_AO_FADE_YD: vec2<f32> = vec2<f32>(110.0, 190.0);
 const MFX_AO_TAPS: i32 = 12;
 /// The far focus: the view distances the blur grows over, and its radius in pixels of a 900-row
 /// frame at full strength. The sky takes `MFX_DOF_SKY` of it.
-const MFX_DOF_YD: vec2<f32> = vec2<f32>(50.0, 300.0);
-const MFX_DOF_PX: f32 = 2.2;
-const MFX_DOF_SKY: f32 = 0.5;
+const MFX_DOF_YD: vec2<f32> = vec2<f32>(90.0, 420.0);
+const MFX_DOF_PX: f32 = 1.3;
+const MFX_DOF_SKY: f32 = 0.25;
 /// The aerial haze: the most of the picture it takes, and the distance scale in yards.
 const MFX_HAZE: vec2<f32> = vec2<f32>(0.2, 340.0);
 
