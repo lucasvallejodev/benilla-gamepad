@@ -48,7 +48,7 @@ fn half(bits: u16) -> f32 {
 /// is no finite texel. The geometric mean, so a strip of bright sky does not carry the picture.
 pub fn log_average(bytes: &[u8]) -> Option<f32> {
     let (mut sum, mut n) = (0.0f64, 0u32);
-    for px in bytes.chunks_exact(8) {
+    for px in bytes.as_chunks::<8>().0 {
         let c = |i: usize| half(u16::from_le_bytes([px[i], px[i + 1]]));
         let l = 0.2126 * c(0) + 0.7152 * c(2) + 0.0722 * c(4);
         if l.is_finite() {
