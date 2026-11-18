@@ -22,6 +22,8 @@
 pub mod addon;
 pub mod interact;
 pub mod map;
+#[cfg(feature = "dev")]
+mod script;
 
 use bevy::ecs::system::SystemParam;
 use bevy::input::keyboard::{Key, KeyboardInput};
@@ -52,6 +54,9 @@ impl Plugin for PadPlugin {
                 PreUpdate,
                 (drive_pad, apply_pad_writes).chain().after(InputSystems),
             );
+        // `WOW_PAD_SCRIPT`: a scripted pad for unattended runs (`script`).
+        #[cfg(feature = "dev")]
+        script::plugin(app);
     }
 }
 
@@ -339,6 +344,10 @@ fn drive(
             .ok()
         })
         .unwrap_or((false, None, None, None));
+    #[cfg(feature = "dev")]
+    if in_world {
+        script::mark_world(time.elapsed_secs());
+    }
     if !in_world {
         *state = PadState::default();
         let pad = pads.iter().next().map(|(_, g)| g);
