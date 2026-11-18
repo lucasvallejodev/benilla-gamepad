@@ -420,6 +420,8 @@ struct FfxGlowPipelines {
     downsample_water_hdr: CachedRenderPipelineId,
     gauss_h: CachedRenderPipelineId,
     gauss_v: CachedRenderPipelineId,
+    /// benilla-gamepad fork: the Modern look's crease shade (`fs_mfx_ao`).
+    ao: CachedRenderPipelineId,
     combine: FfxCombinePipeline,
 }
 
@@ -573,6 +575,12 @@ fn init_pipelines(
                     9,
                     texture_2d(TextureSampleType::Float { filterable: false }),
                 ),
+                // benilla-gamepad fork: the crease shade's image (`fs_mfx_ao`), read with loads;
+                // the depth stands in while it does not run.
+                (
+                    10,
+                    texture_2d(TextureSampleType::Float { filterable: false }),
+                ),
             ),
         ),
     );
@@ -685,6 +693,27 @@ fn init_pipelines(
         pipeline_cache.queue_render_pipeline(pipeline("ffx_glow_h", &layout_filter, "fs_gauss_h"));
     let gauss_v =
         pipeline_cache.queue_render_pipeline(pipeline("ffx_glow_v", &layout_filter, "fs_gauss_v"));
+    // benilla-gamepad fork: the crease shade's half-size pass, on the improved combine's layout.
+    let ao = pipeline_cache.queue_render_pipeline(RenderPipelineDescriptor {
+        label: Some("ffx_look_ao".into()),
+        layout: vec![layout_combine_uw.clone()],
+        vertex: fullscreen_shader.to_vertex_state(),
+        fragment: Some(FragmentState {
+            shader: shader.clone(),
+            shader_defs: vec![
+                "UNDERWATER_IMPROVED".into(),
+                "MODERN_LOOK".into(),
+                "MFX_AO_PASS".into(),
+            ],
+            entry_point: Some("fs_mfx_ao".into()),
+            targets: vec![Some(ColorTargetState {
+                format: AO_FORMAT,
+                blend: None,
+                write_mask: ColorWrites::ALL,
+            })],
+        }),
+        ..default()
+    });
     let combine = FfxCombinePipeline {
         layout: layout_combine.clone(),
         layout_uw: layout_combine_uw.clone(),
@@ -705,9 +734,13 @@ fn init_pipelines(
         downsample_water_hdr,
         gauss_h,
         gauss_v,
+        ao,
         combine,
     });
 }
+
+/// benilla-gamepad fork: the crease shade's image, `(open share, view Z)`.
+const AO_FORMAT: TextureFormat = TextureFormat::Rg16Float;
 
 /// One view's ¼-res ping-pong pair (the reference downsamples full to ¼ in one Box4 pass,
 /// `0x6ca9d0`) and the GPU objects built from it, kept across frames.
@@ -728,6 +761,8 @@ struct FfxGlowTextures {
     combine: Option<FfxCombinePair>,
     /// The improved combines' 512-byte uniform, [`FfxUnderwater::lanes`].
     uw_buf: Buffer,
+    /// benilla-gamepad fork: the crease shade's half-size image ([`AO_FORMAT`]).
+    ao: CachedTexture,
 }
 
 /// One view's dry and underwater combine pipelines, Classic and Modern, and the key they were
@@ -912,6 +947,23 @@ fn prepare_textures(
         };
         let quarter_a = tex("ffx_glow_quarter_a", vp.x / 4, vp.y / 4);
         let quarter_b = tex("ffx_glow_quarter_b", vp.x / 4, vp.y / 4);
+        let ao = texture_cache.get(
+            &render_device,
+            TextureDescriptor {
+                label: Some("ffx_look_ao"),
+                size: Extent3d {
+                    width: (vp.x / 2).max(8),
+                    height: (vp.y / 2).max(8),
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: TextureDimension::D2,
+                format: AO_FORMAT,
+                usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            },
+        );
         // The cache returns the same textures while the viewport holds: rebuild only on a change.
         if existing.is_some_and(|t| {
             t.quarter_a.texture.id() == quarter_a.texture.id()
@@ -954,6 +1006,7 @@ fn prepare_textures(
             gauss_v_bind,
             combine,
             uw_buf,
+            ao,
         });
     }
 }
@@ -1209,6 +1262,51 @@ impl ViewNode for FfxGlowNode {
             }
         }
 
+        // benilla-gamepad fork: the crease shade's pass, before whichever node runs the combine.
+        let look = ao_gated(look, pipeline_cache, pipelines, wave, improved);
+        if let (true, Some(uw), Some(depth), Some(ao)) = (
+            ao_runs(look),
+            uw,
+            uw_depth.as_ref(),
+            pipeline_cache.get_render_pipeline(pipelines.ao),
+        ) {
+            world.resource::<RenderQueue>().write_buffer(
+                &textures.uw_buf,
+                0,
+                bytemuck::cast_slice(&uw.lanes),
+            );
+            let bind = uw_bind_group(
+                &render_device,
+                pipeline_cache,
+                pipelines,
+                textures,
+                source,
+                depth,
+                uw_shadow.as_ref(),
+                depth,
+            );
+            let mut pass =
+                render_context
+                    .command_encoder()
+                    .begin_render_pass(&RenderPassDescriptor {
+                        label: Some("ffx_look_ao"),
+                        color_attachments: &[Some(RenderPassColorAttachment {
+                            view: &textures.ao.default_view,
+                            depth_slice: None,
+                            resolve_target: None,
+                            ops: Operations::default(),
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                    });
+            let span = diagnostics.pass_span(&mut pass, "ffx_look_ao");
+            pass.set_pipeline(ao);
+            pass.set_bind_group(0, &bind, &[]);
+            pass.draw(0..3, 0..1);
+            span.end(&mut pass);
+        }
+
         let Some((combine, out)) = out else {
             return Ok(()); // claimed: the combine is the UI camera's pass
         };
@@ -1226,21 +1324,19 @@ impl ViewNode for FfxGlowNode {
                     0,
                     bytemuck::cast_slice(&uw.lanes),
                 );
-                let layout = pipeline_cache.get_bind_group_layout(&pipelines.layout_combine_uw);
-                render_device.create_bind_group(
-                    "ffx_glow_combine_uw",
-                    &layout,
-                    &BindGroupEntries::with_indices((
-                        (0, out.source),
-                        (1, &pipelines.sampler),
-                        (2, &textures.quarter_a.default_view),
-                        (3, textures.gain_buf.as_entire_binding()),
-                        (4, &pipelines.wave_view),
-                        (5, &pipelines.wave_sampler),
-                        (6, textures.uw_buf.as_entire_binding()),
-                        (7, depth),
-                        (9, uw_shadow.as_ref().unwrap_or(depth)),
-                    )),
+                uw_bind_group(
+                    &render_device,
+                    pipeline_cache,
+                    pipelines,
+                    textures,
+                    out.source,
+                    depth,
+                    uw_shadow.as_ref(),
+                    if ao_runs(look) {
+                        &textures.ao.default_view
+                    } else {
+                        depth
+                    },
                 )
             }
             _ => {
@@ -1280,6 +1376,61 @@ impl ViewNode for FfxGlowNode {
         span.end(&mut pass);
         Ok(())
     }
+}
+
+/// The improved combine's bind group over the scene `source`: `ao` is the crease shade's image,
+/// or the depth standing in for it.
+#[allow(clippy::too_many_arguments)]
+fn uw_bind_group(
+    render_device: &RenderDevice,
+    pipeline_cache: &PipelineCache,
+    pipelines: &FfxGlowPipelines,
+    textures: &FfxGlowTextures,
+    source: &TextureView,
+    depth: &TextureView,
+    shadow: Option<&TextureView>,
+    ao: &TextureView,
+) -> BindGroup {
+    render_device.create_bind_group(
+        "ffx_glow_combine_uw",
+        &pipeline_cache.get_bind_group_layout(&pipelines.layout_combine_uw),
+        &BindGroupEntries::with_indices((
+            (0, source),
+            (1, &pipelines.sampler),
+            (2, &textures.quarter_a.default_view),
+            (3, textures.gain_buf.as_entire_binding()),
+            (4, &pipelines.wave_view),
+            (5, &pipelines.wave_sampler),
+            (6, textures.uw_buf.as_entire_binding()),
+            (7, depth),
+            (9, shadow.unwrap_or(depth)),
+            (10, ao),
+        )),
+    )
+}
+
+/// benilla-gamepad fork: the look's lanes with the crease shade's arm (`look.w` 2) kept only
+/// where its pass runs this frame: a dry improved frame, its pipeline compiled. Both combine
+/// nodes ask, so they agree.
+fn ao_gated(
+    look: Option<[f32; 8]>,
+    pipeline_cache: &PipelineCache,
+    pipelines: &FfxGlowPipelines,
+    wave: bool,
+    improved: bool,
+) -> Option<[f32; 8]> {
+    look.map(|mut l| {
+        let ready = !wave && improved && pipeline_cache.get_render_pipeline(pipelines.ao).is_some();
+        if l[3] > 1.5 && !ready {
+            l[3] = 1.0;
+        }
+        l
+    })
+}
+
+/// Whether the gated lanes arm the crease shade.
+fn ao_runs(look: Option<[f32; 8]>) -> bool {
+    look.is_some_and(|l| l[3] > 1.5)
 }
 
 /// The Improved Water preview's inputs to a world view's combine this frame.
@@ -1507,7 +1658,13 @@ impl ViewNode for FfxTransparent2dNode {
                 let (uniform, preview) = preview_combine(world, glow, wave, uniform);
                 let improved = preview.uw_depth.is_some();
                 let water = preview.water_glow.is_some();
-                let look = modern_lanes(world, glow);
+                let look = ao_gated(
+                    modern_lanes(world, glow),
+                    pipeline_cache,
+                    pipelines,
+                    wave,
+                    improved,
+                );
                 // Still compiling: this frame has no world in it.
                 let combine = pipeline_cache.get_render_pipeline(view.pair.armed(
                     wave,
@@ -1525,20 +1682,19 @@ impl ViewNode for FfxTransparent2dNode {
                 let bind = match (preview.uw, preview.uw_depth.as_ref()) {
                     (Some(uw), Some(depth)) => {
                         queue.write_buffer(&textures.uw_buf, 0, bytemuck::cast_slice(&uw.lanes));
-                        render_context.render_device().create_bind_group(
-                            "ffx_glow_combine_uw",
-                            &pipeline_cache.get_bind_group_layout(&pipelines.layout_combine_uw),
-                            &BindGroupEntries::with_indices((
-                                (0, world_target.main_texture_view()),
-                                (1, &pipelines.sampler),
-                                (2, &textures.quarter_a.default_view),
-                                (3, textures.gain_buf.as_entire_binding()),
-                                (4, &pipelines.wave_view),
-                                (5, &pipelines.wave_sampler),
-                                (6, textures.uw_buf.as_entire_binding()),
-                                (7, depth),
-                                (9, preview.uw_shadow.as_ref().unwrap_or(depth)),
-                            )),
+                        uw_bind_group(
+                            render_context.render_device(),
+                            pipeline_cache,
+                            pipelines,
+                            textures,
+                            world_target.main_texture_view(),
+                            depth,
+                            preview.uw_shadow.as_ref(),
+                            if ao_runs(look) {
+                                &textures.ao.default_view
+                            } else {
+                                depth
+                            },
                         )
                     }
                     _ => render_context.render_device().create_bind_group(

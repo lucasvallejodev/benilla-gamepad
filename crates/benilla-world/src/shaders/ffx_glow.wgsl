@@ -1297,6 +1297,13 @@ struct FfxUwBlock {
 // The lighting sun's terrain shadow torus (`benilla_water::mcsh`, 1 shadowed), inside the window
 // `uwb.u.shadow`; the depth stands in, unread, while the window is not valid.
 @group(0) @binding(9) var uw_shadow: texture_2d<f32>;
+#ifdef MODERN_LOOK
+#ifndef MFX_AO_PASS
+// benilla-gamepad fork: the crease shade's half-size image (`fs_mfx_ao`): r the open share, g the
+// view Z it was taken at. The depth stands in, unread, while `ffx.look.w` is under 2.
+@group(0) @binding(10) var mfx_ao_tex: texture_2d<f32>;
+#endif
+#endif
 
 /// The map's north-west corner from its centre and the shadow torus's span, yards
 /// (`liquid.wgsl`'s `MAP_HALF_YD`, `MCSH_SPAN_YD`).
@@ -1515,11 +1522,12 @@ fn veil_apply(sg: vec3<f32>, rd: vec3<f32>, t_d: f32) -> vec3<f32> {
 // dry frame, while `look.w` (the look's quality, Medium and up) is set: a soft far focus, a
 // darkening of creases and contact corners, and a light aerial haze. None casts a ray.
 
-/// The crease shade: its reach in yards, its strength, and the view distances it fades out over.
-const MFX_AO_ON: bool = false;
-const MFX_AO_REACH_YD: f32 = 0.9;
-const MFX_AO_STRENGTH: f32 = 0.6;
-const MFX_AO_FADE_YD: vec2<f32> = vec2<f32>(90.0, 170.0);
+/// The crease shade (ambient occlusion): its reach in yards, its strength, and the view distances
+/// it fades out over.
+const MFX_AO_REACH_YD: f32 = 1.1;
+const MFX_AO_STRENGTH: f32 = 1.6;
+const MFX_AO_FADE_YD: vec2<f32> = vec2<f32>(110.0, 190.0);
+const MFX_AO_TAPS: i32 = 12;
 /// The far focus: the view distances the blur grows over, and its radius in pixels of a 900-row
 /// frame at full strength. The sky takes `MFX_DOF_SKY` of it.
 const MFX_DOF_YD: vec2<f32> = vec2<f32>(50.0, 300.0);
@@ -1534,37 +1542,103 @@ fn mfx_depth(p: vec2<f32>) -> f32 {
     return textureLoad(uw_depth, vec2<i32>(clamp(p, vec2<f32>(0.0), dd - vec2<f32>(1.0))), 0).r;
 }
 
-/// The crease shade at depth pixel `p`, view Z `z` (1 open, lower in a crease): six opposite
-/// pairs of depth taps; a pair's mean of 1/z over the centre's is zero on any plane and positive
-/// in a hollow, so a flat floor at any angle takes none. `px_angle` is a pixel's angle.
-fn mfx_ao(p: vec2<f32>, z: f32, px_angle: f32) -> f32 {
-    if (z <= 0.0) {
-        return 1.0;
-    }
-    let fade = 1.0 - smoothstep(MFX_AO_FADE_YD.x, MFX_AO_FADE_YD.y, z);
-    if (fade <= 0.0) {
-        return 1.0;
-    }
-    let r = clamp(MFX_AO_REACH_YD / (z * px_angle), 3.0, 72.0);
-    var occ = 0.0;
-    for (var k = 0; k < 6; k = k + 1) {
-        let a = (f32(k) + 0.5) * 0.5235988;
-        let d = vec2<f32>(cos(a), sin(a)) * r * select(1.0, 0.45, (k & 1) == 1);
-        let za = mfx_depth(p + d);
-        let zb = mfx_depth(p - d);
-        if (za <= 0.0 || zb <= 0.0) {
-            continue;
-        }
-        let len = length(d) * z * px_angle;
-        // The hollow's depth in yards over the pair's reach.
-        let hollow = ((1.0 / za + 1.0 / zb) * 0.5 - 1.0 / z) * z * z / len;
-        // Something far in front (a character before a hill) is not a crease.
-        let near = 1.0 - smoothstep(1.5, 4.0, max(abs(z - za), abs(z - zb)) / len);
-        occ = occ + smoothstep(0.22, 0.9, hollow) * near;
-    }
-    return 1.0 - MFX_AO_STRENGTH * fade * occ / 6.0;
+/// The view-space point (x right, y up, z along the view) under depth pixel `q` at view Z `z`.
+fn mfx_view_pos(q: vec2<f32>, z: f32, dd: vec2<f32>, tan_hv: vec2<f32>) -> vec3<f32> {
+    let ndc = q / dd * 2.0 - 1.0;
+    return vec3<f32>(ndc.x * tan_hv.x, -ndc.y * tan_hv.y, 1.0) * z;
 }
 
+#ifdef MFX_AO_PASS
+/// The crease shade's own pass, at half size: how open the point under each pixel is to the sky
+/// around it (r; 1 open), and its view Z (g) for the combine's blur. The surface's normal comes
+/// from the depth's nearer neighbours; twelve taps on a spiral within `MFX_AO_REACH_YD` of the
+/// point, the spiral turned per pixel on a 4x4 pattern the combine's 4x4 blur averages away, each
+/// counted by how far above the surface's own plane it stands and falling off with its distance.
+/// A flat floor at any angle takes none, and a thing far in front of the point (a character
+/// before a hill) is out of reach, so nothing stamps a copy of its outline.
+@fragment
+fn fs_mfx_ao(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
+    let u = uwb.u;
+    let dd = vec2<f32>(textureDimensions(uw_depth));
+    let pc = floor(in.uv * dd) + vec2<f32>(0.5);
+    let z = mfx_depth(pc);
+    if (z <= 0.0 || z > MFX_AO_FADE_YD.y) {
+        return vec4<f32>(1.0, z, 0.0, 1.0);
+    }
+    let tan_hv = vec2<f32>(length(u.cam_right.xyz), length(u.cam_up.xyz));
+    let p0 = mfx_view_pos(pc, z, dd, tan_hv);
+    // The nearer neighbour on each axis, so the normal does not lean across an edge.
+    let zl = mfx_depth(pc - vec2<f32>(1.0, 0.0));
+    let zr = mfx_depth(pc + vec2<f32>(1.0, 0.0));
+    let zu = mfx_depth(pc - vec2<f32>(0.0, 1.0));
+    let zd = mfx_depth(pc + vec2<f32>(0.0, 1.0));
+    var dx = mfx_view_pos(pc + vec2<f32>(1.0, 0.0), zr, dd, tan_hv) - p0;
+    if (zr <= 0.0 || (zl > 0.0 && abs(zl - z) < abs(zr - z))) {
+        dx = p0 - mfx_view_pos(pc - vec2<f32>(1.0, 0.0), zl, dd, tan_hv);
+    }
+    var dy = mfx_view_pos(pc + vec2<f32>(0.0, 1.0), zd, dd, tan_hv) - p0;
+    if (zd <= 0.0 || (zu > 0.0 && abs(zu - z) < abs(zd - z))) {
+        dy = p0 - mfx_view_pos(pc - vec2<f32>(0.0, 1.0), zu, dd, tan_hv);
+    }
+    var n = normalize(cross(dy, dx));
+    if (dot(n, p0) > 0.0) {
+        n = -n;
+    }
+    // A depth pixel's angle, and the reach in depth pixels: never under four, never over an
+    // eighth of the image (near the eye the reach in yards shrinks with it).
+    let px_angle = 2.0 * tan_hv.y / dd.y;
+    let r_px = clamp(MFX_AO_REACH_YD / (z * px_angle), 4.0, 0.125 * dd.y);
+    let reach = r_px * z * px_angle;
+    let cell = vec2<i32>(in.position.xy) & vec2<i32>(3);
+    // An ordered 4x4 pattern (0..15), every value once per cell.
+    var bayer = array<f32, 16>(0.0, 8.0, 2.0, 10.0, 12.0, 4.0, 14.0, 6.0, 3.0, 11.0, 1.0, 9.0, 15.0, 7.0, 13.0, 5.0);
+    let turn = bayer[cell.x + cell.y * 4] / 16.0;
+    var occ = 0.0;
+    for (var k = 0; k < MFX_AO_TAPS; k = k + 1) {
+        let a = f32(k) * 2.3999632 + turn * 6.2831853;
+        let rr = sqrt((f32(k) + 0.5) / f32(MFX_AO_TAPS)) * r_px;
+        let q = floor(pc + vec2<f32>(cos(a), sin(a)) * rr) + vec2<f32>(0.5);
+        let zs = mfx_depth(q);
+        if (zs <= 0.0) {
+            continue;
+        }
+        let v = mfx_view_pos(q, zs, dd, tan_hv) - p0;
+        let d2 = dot(v, v);
+        let d = sqrt(max(d2, 1e-6));
+        // How far above the surface's plane the tap stands, as a sine; a shallow rise (a low
+        // polygon's own curve, the depth's steps) is not a crease.
+        let rise = saturate((dot(n, v) / d - 0.18) / 0.7);
+        occ = occ + rise * saturate(1.0 - d2 / (reach * reach));
+    }
+    let fade = 1.0 - smoothstep(MFX_AO_FADE_YD.x, MFX_AO_FADE_YD.y, z);
+    let open = 1.0 - saturate(MFX_AO_STRENGTH * occ / f32(MFX_AO_TAPS)) * fade;
+    return vec4<f32>(open, z, 0.0, 1.0);
+}
+#else
+/// The crease shade at `uv`, view Z `z` (1 open): the half-size image's 4x4 texels round the
+/// pixel, each weighed by how near its own view Z is to this pixel's, so the pattern averages
+/// away and the shade does not bleed across a silhouette.
+fn mfx_ao(uv: vec2<f32>, z: f32) -> f32 {
+    if (z <= 0.0 || z > MFX_AO_FADE_YD.y) {
+        return 1.0;
+    }
+    let ad = vec2<i32>(textureDimensions(mfx_ao_tex));
+    let base = vec2<i32>(floor(uv * vec2<f32>(ad) - vec2<f32>(0.5))) - vec2<i32>(1);
+    var sum = 0.0;
+    var w = 0.0;
+    for (var j = 0; j < 4; j = j + 1) {
+        for (var i = 0; i < 4; i = i + 1) {
+            let t = textureLoad(mfx_ao_tex, clamp(base + vec2<i32>(i, j), vec2<i32>(0), ad - vec2<i32>(1)), 0).rg;
+            let wk = 1.0 / (1.0 + abs(t.g - z) * 24.0 / (0.25 + 0.04 * z));
+            sum = sum + t.r * wk;
+            w = w + wk;
+        }
+    }
+    return sum / max(w, 1e-4);
+}
+#endif
+
+#ifndef MFX_AO_PASS
 /// How far out of focus view Z `z` is, 0 to 1.
 fn mfx_coc(z: f32) -> f32 {
     return select(smoothstep(MFX_DOF_YD.x, MFX_DOF_YD.y, z), MFX_DOF_SKY, z <= 0.0);
@@ -1666,11 +1740,12 @@ fn mfx_apply(uv: vec2<f32>, sg: vec3<f32>, z: f32, t_d: f32, rd: vec3<f32>) -> v
     let dd = vec2<f32>(textureDimensions(uw_depth));
     let p = uv * dd;
     var c = mfx_dof(uv, p, sg, z);
-    // The crease shade is off: with six fixed tap pairs it stamped offset copies of every
-    // silhouette (a character, a grass tuft) onto the ground around it, which read as doubled
-    // and tripled shadows. `mfx_ao` stays for a proper many-tap pass later.
-    if (MFX_AO_ON) {
-        c = c * mfx_ao(p, z, u.cam_fwd.w * vec2<f32>(textureDimensions(in_tex)).y / max(dd.y, 1.0));
+    // The crease shade, from its own half-size pass (`fs_mfx_ao`), while `look.w` is 2.
+    if (ffx.look.w > 1.5) {
+        // Less on what is lit bright: the shade is the sky's light missing, not the sun's.
+        let ao = mfx_ao(uv, z);
+        let lum = dot(c, vec3<f32>(0.299, 0.587, 0.114));
+        c = c * mix(ao, 1.0, 0.35 * smoothstep(0.55, 0.95, lum));
     }
     // The sun contact shadows are off: on characters they read worse than the reference's own
     // blob shadow (the owner's call). `mfx_sun_shadow` stays for a later, better pass.
@@ -1684,7 +1759,9 @@ fn mfx_apply(uv: vec2<f32>, sg: vec3<f32>, z: f32, t_d: f32, rd: vec3<f32>) -> v
     return c;
 }
 #endif
+#endif
 
+#ifndef MFX_AO_PASS
 /// The dry combine with the veil (round 3): the veil over the scene, then the glow as ever.
 @fragment
 fn fs_combine_veil(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
@@ -1705,4 +1782,5 @@ fn fs_combine_veil(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     }
     return combine_body_on(uv, in.position.xy, sg, scene.a);
 }
+#endif
 #endif

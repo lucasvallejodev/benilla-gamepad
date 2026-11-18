@@ -57,8 +57,8 @@ impl Look {
         toe: 1.0,
     };
 
-    /// The combine's two lanes at the auto-exposure's `lift`; `depth_fx` (1 on) arms the depth
-    /// effects (the far focus, the crease shade, the haze) where the combine has a depth.
+    /// The combine's two lanes at the auto-exposure's `lift`; `depth_fx` arms the depth effects
+    /// where the combine has a depth: 1 the far focus and the haze, 2 the crease shade too.
     pub fn lanes(&self, lift: f32, depth_fx: f32) -> [f32; 8] {
         [
             self.exposure * lift,
@@ -179,6 +179,12 @@ fn auto_exposure(ambient: [f32; 3], diffuse: [f32; 3]) -> f32 {
         .clamp(1.0, AUTO_EXPOSURE_MAX)
 }
 
+/// Whether the crease shade (ambient occlusion) runs: `$WOW_LOOK_AO=0|1` for the session, else on.
+fn crease_shade() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("WOW_LOOK_AO").as_deref() != Ok("0"))
+}
+
 /// The lanes this frame asks for: none in a Classic frame. The first Modern frame takes the lift
 /// whole, so entering the world at night opens on the adapted picture; after it the lift eases.
 fn update_lanes(
@@ -225,7 +231,12 @@ fn update_lanes(
         let eye = adapted.get_or_insert(lift);
         *eye += (lift - *eye) * (1.0 - (-time.delta_secs() / AUTO_EXPOSURE_SECONDS).exp());
         // The depth effects are the Medium and High tiers'; Low keeps the picture's cost flat.
-        let depth_fx = f32::from(u8::from(*quality != super::LookQuality::Low));
+        // 2 adds the crease shade's pass (`ffx_glow`'s `fs_mfx_ao`).
+        let depth_fx = match *quality {
+            super::LookQuality::Low => 0.0,
+            _ if crease_shade() => 2.0,
+            _ => 1.0,
+        };
         LookLanes(Some(look.0.lanes(*eye, depth_fx)))
     } else {
         *adapted = None;
