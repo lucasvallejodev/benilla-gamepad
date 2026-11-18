@@ -110,7 +110,9 @@ fn setup_clutter(mut commands: Commands, world_assets: Option<ResMut<WorldAssets
     match load_ground_effect_catalog(&mut chain, true) {
         Ok(catalog) => {
             info!("ground-effect catalog: {} effects", catalog.len());
-            commands.insert_resource(GroundClutter { catalog });
+            commands.insert_resource(GroundClutter {
+                catalog: std::sync::Arc::new(catalog),
+            });
         }
         Err(e) => warn!("ground-effect catalog unavailable, no ground clutter: {e:#}"),
     }
@@ -119,7 +121,7 @@ fn setup_clutter(mut commands: Commands, world_assets: Option<ResMut<WorldAssets
 /// The `effectId → (models, density)` catalog; absent, and no clutter, when the DBCs fail to load.
 #[derive(Resource)]
 pub(crate) struct GroundClutter {
-    pub(crate) catalog: GroundEffectCatalog,
+    pub(crate) catalog: std::sync::Arc<GroundEffectCatalog>,
 }
 
 /// The detail-doodad alpha-test ref, `detailDoodadAlpha` = 128/255, lower than the model key.
@@ -273,6 +275,21 @@ pub(crate) fn scatter_tile_clutter(
     density: f32,
     entities: &mut Vec<Entity>,
 ) {
+    for chunk in scatter_tile_chunks(chunks, tile_x, tile_y, catalog, density) {
+        entities.push(commands.spawn(chunk).id());
+    }
+}
+
+/// [`scatter_tile_clutter`]'s work with no ECS access, safe on any thread (the fork's: a tile's
+/// scatter costs 12-23 ms, which the streamer now pays off the main thread).
+pub(crate) fn scatter_tile_chunks(
+    chunks: &[ChunkMesh],
+    tile_x: u32,
+    tile_y: u32,
+    catalog: &GroundEffectCatalog,
+    density: f32,
+) -> Vec<ClutterChunk> {
+    let mut out = Vec::new();
     for chunk in chunks {
         let mut by_model: HashMap<String, Vec<ShadedPlacement>> = HashMap::new();
         for placement in scatter_ground_doodads(chunk, catalog, tile_x, tile_y, density) {
@@ -299,16 +316,13 @@ pub(crate) fn scatter_tile_clutter(
             hi = hi.max(v);
         }
         hi.y += CLUTTER_TUFT_HEIGHT;
-        entities.push(
-            commands
-                .spawn(ClutterChunk {
-                    bounds: (lo, hi),
-                    models: by_model.into_iter().collect(),
-                    built: Vec::new(),
-                })
-                .id(),
-        );
+        out.push(ClutterChunk {
+            bounds: (lo, hi),
+            models: by_model.into_iter().collect(),
+            built: Vec::new(),
+        });
     }
+    out
 }
 
 /// Build one chunk's clutter: each model's instances merged into one mesh per submesh, every tuft's

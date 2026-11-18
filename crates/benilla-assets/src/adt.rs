@@ -40,7 +40,8 @@ pub struct AdtTile {
     pub wmos: Vec<WmoInstance>,
     /// The decoded MCNK chunks, kept resident: the app derives the collider, the MCLQ liquids and
     /// the ground clutter from them.
-    pub chunks: Vec<ChunkMesh>,
+    /// Shared: the streamer hands the same chunks to its background builds (the liquids).
+    pub chunks: Arc<Vec<ChunkMesh>>,
     /// The map's whole water classification — which water the planar mirrors serve and where the
     /// probes stand — shared by all its tiles; `None` on a dry tile.
     pub planar: Option<Arc<dyn WaterClasses>>,
@@ -241,7 +242,7 @@ impl AssetLoader for AdtLoader {
             shadow_array: ctx.add_labeled_asset("shadow_array".to_string(), shadow_array),
             doodads: tile.doodads,
             wmos: tile.wmos,
-            chunks: tile.chunks,
+            chunks: Arc::new(tile.chunks),
             planar,
         })
     }

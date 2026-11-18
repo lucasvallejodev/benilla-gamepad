@@ -206,7 +206,8 @@ pub use ripple::{RippleStats, SIZE as RIPPLE_SIZE};
 pub(crate) use spatial::maintain_water_index;
 pub use spatial::WaterIndex;
 pub(crate) use surface::{
-    spawn_liquids, spawn_wmo_liquids, LiquidAssets, LiquidSoundSource, WetLattice,
+    prepare_liquids, spawn_prepared_liquids, spawn_wmo_liquids, LiquidAssets, LiquidSoundSource,
+    PreparedLiquids, WetLattice,
 };
 pub use surface::{warm_liquid_mesh, LiquidSurface, RippleMap, WaterMapRef};
 

@@ -152,6 +152,7 @@ pub(crate) struct LiquidSoundSource {
 }
 
 /// Spawn an ADT tile's liquid surfaces into `entities`, to despawn with the tile.
+#[cfg(test)]
 pub(crate) fn spawn_liquids<'a>(
     commands: &mut Commands,
     liquids: impl Iterator<Item = &'a LiquidMesh>,
@@ -165,30 +166,100 @@ pub(crate) fn spawn_liquids<'a>(
     meshes: &mut Assets<Mesh>,
     entities: &mut Vec<Entity>,
 ) {
-    let Some(liquid) = liquid_assets else {
+    if liquid_assets.is_none() {
         return;
-    };
-    // One lattice for the whole tile: a chunk cannot tell where its water ends from itself alone.
+    }
+    let prepared = prepare_liquids(liquids, chunks, planar);
+    spawn_prepared_liquids(commands, prepared, liquid_assets, meshes, entities);
+}
+
+/// One ADT surface built by [`prepare_liquids`]: its source, its coarse mesh, its footprint and
+/// its waterline collider.
+pub(crate) struct PreparedLiquid {
+    lq: LiquidMesh,
+    mesh: Mesh,
+    info: super::query::WaterChunkInfo,
+    collider: Option<Collider>,
+}
+
+/// A tile's surfaces, built off the main thread (the fork's: the lattice, the shoreline trace
+/// and the meshes cost a tile 35-140 ms, a visible stall each time the streamer crossed a row).
+pub(crate) struct PreparedLiquids {
+    lattice: Option<Arc<WetLattice>>,
+    shoreline: Option<Arc<Shoreline>>,
+    planar: Option<Arc<dyn WaterClasses>>,
+    surfaces: Vec<PreparedLiquid>,
+}
+
+/// Everything [`spawn_prepared_liquids`] needs of a tile's liquids, with no ECS access: the one
+/// lattice and shoreline of the whole tile (a chunk cannot tell where its water ends from itself
+/// alone), then each surface's mesh, footprint and collider. Safe on any thread.
+pub(crate) fn prepare_liquids<'a>(
+    liquids: impl Iterator<Item = &'a LiquidMesh>,
+    chunks: &[ChunkMesh],
+    planar: Option<&Arc<dyn WaterClasses>>,
+) -> PreparedLiquids {
     let batch: Vec<&LiquidMesh> = liquids.collect();
     let lattice = WetLattice::build(batch.iter().copied()).map(Arc::new);
     let shoreline = Shoreline::build(&batch, chunks).map(Arc::new);
-    for lq in batch {
+    let surfaces = batch
+        .into_iter()
+        .map(|lq| PreparedLiquid {
+            lq: lq.clone(),
+            mesh: liquid_bevy_mesh(
+                lq,
+                None,
+                lattice.as_deref(),
+                planar.map(|p| &**p),
+                true,
+                shoreline.as_deref(),
+            ),
+            info: wet_footprint(lq, &Transform::IDENTITY, LiquidSource::AdtChunk)
+                .with_planes(planar.map(|p| p.planes(lq))),
+            collider: liquid_collider(lq),
+        })
+        .collect();
+    PreparedLiquids {
+        lattice,
+        shoreline,
+        planar: planar.cloned(),
+        surfaces,
+    }
+}
+
+/// Spawn a tile's prepared surfaces: the cheap half, on the main thread.
+pub(crate) fn spawn_prepared_liquids(
+    commands: &mut Commands,
+    prepared: PreparedLiquids,
+    liquid_assets: Option<&LiquidAssets>,
+    meshes: &mut Assets<Mesh>,
+    entities: &mut Vec<Entity>,
+) {
+    let Some(liquid) = liquid_assets else {
+        return;
+    };
+    let PreparedLiquids {
+        lattice,
+        shoreline,
+        planar,
+        surfaces,
+    } = prepared;
+    let planar = planar.as_ref();
+    for PreparedLiquid {
+        lq,
+        mesh,
+        info,
+        collider,
+    } in surfaces
+    {
+        let lq = &lq;
         // The scene fog (the ADT passes submit none and draw under the scene submit `0x66ff20`),
         // and never a scroll, though ADT magma is nibble 6: its kernel zeroes the v-translate.
         let Some(material) = liquid.material(lq.kind, LiquidPath::Adt, false) else {
             continue; // this kind's frames failed to load (warned at setup)
         };
-        let info = wet_footprint(lq, &Transform::IDENTITY, LiquidSource::AdtChunk)
-            .with_planes(planar.map(|p| p.planes(lq)));
         let foam = !lq.kind.is_fullbright(); // white surf is a water thing
-        let coarse = meshes.add(liquid_bevy_mesh(
-            lq,
-            None,
-            lattice.as_deref(),
-            planar.map(|p| &**p),
-            true,
-            shoreline.as_deref(),
-        ));
+        let coarse = meshes.add(mesh);
         let fine = (!lq.kind.is_fullbright())
             .then(|| LiquidFine::new(lq, coarse.clone(), &lattice, &shoreline, planar));
         entities.push(
@@ -228,7 +299,7 @@ pub(crate) fn spawn_liquids<'a>(
                 .insert(WaterMapRef(p.clone()));
         }
         // The waterline for the camera sweep under `cameraWaterCollision`; nothing else queries it.
-        if let Some(collider) = liquid_collider(lq) {
+        if let Some(collider) = collider {
             commands
                 .entity(*entities.last().expect("just pushed"))
                 .insert((collider, RigidBody::Static, liquid_layers()));

@@ -848,7 +848,7 @@ mod tests {
             shadow_array: Handle::default(),
             doodads: Vec::new(),
             wmos: Vec::new(),
-            chunks: vec![chunk_at_global(k, Some(vec![shadow; CHUNK_BYTES]))],
+            chunks: std::sync::Arc::new(vec![chunk_at_global(k, Some(vec![shadow; CHUNK_BYTES]))]),
             planar: None,
         };
         let a = tiles.add(tile(255)).id();
@@ -903,7 +903,7 @@ mod tests {
             shadow_array: Handle::default(),
             doodads: Vec::new(),
             wmos: Vec::new(),
-            chunks: vec![chunk_at_global(k, Some(vec![255; CHUNK_BYTES]))],
+            chunks: std::sync::Arc::new(vec![chunk_at_global(k, Some(vec![255; CHUNK_BYTES]))]),
             planar: None,
         }
     }

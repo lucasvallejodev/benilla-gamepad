@@ -16,7 +16,7 @@ use crate::clutter::{scatter_tile_clutter, ClutterConfig, GroundClutter};
 use crate::collision::{walk_layers, GroundDecalSurface, PickOccluder};
 use crate::interior::WmoResidency;
 use crate::lighting::SharedLightBuffer;
-use crate::liquid::{spawn_liquids, LiquidAssets};
+use crate::liquid::LiquidAssets;
 use crate::model_render::MaterialCache;
 use crate::schedule::WorldStage;
 use crate::view::WorldCamera;
@@ -157,6 +157,11 @@ struct TileState {
     /// The uniqueIds of the placements this tile references, released when it unloads.
     placements: Vec<u32>,
     liquid: Vec<Entity>,
+    /// The tile's liquids being built off-thread ([`crate::liquid::prepare_liquids`]); their
+    /// entities land in `liquid` when it answers. Dropped, and so cancelled, with the tile.
+    liquid_task: Option<bevy::tasks::Task<crate::liquid::PreparedLiquids>>,
+    /// The tile's ground clutter being scattered off-thread; its chunks land in `clutter`.
+    clutter_task: Option<bevy::tasks::Task<Vec<crate::clutter::ClutterChunk>>>,
     /// The impassable-chunk wall collider, a body of its own since its audience differs.
     wall: Option<Entity>,
     /// The per-chunk `ClutterChunk`s, whose meshes are children and despawn with them.
@@ -184,7 +189,7 @@ fn rearm_load(p: &mut WorldLoadProgress, was_paced: bool, focus: &ViewFocus, rel
 /// Whether the load counts the tile as in: furnished, or its ADT read failed, as the reference's
 /// wait-all completes on a failed read (`0x443d30`) and loads on without the tile.
 fn tile_done(t: &TileState, server: &AssetServer) -> bool {
-    t.furnished
+    (t.furnished && t.liquid_task.is_none())
         || (t.entity.is_none()
             && matches!(
                 server.load_state(&t.handle),
@@ -203,6 +208,8 @@ impl TileState {
             furnished: false,
             placements: Vec::new(),
             liquid: Vec::new(),
+            liquid_task: None,
+            clutter_task: None,
             wall: None,
             clutter: Vec::new(),
             welds: Vec::new(),
@@ -1009,6 +1016,7 @@ fn spawn_streamed_tiles(
         let Some(adt) = tiles.get(&tile.handle) else {
             continue;
         };
+        let tt0 = Instant::now();
         let material = materials.add(ExtendedMaterial {
             base: terrain_base_material(),
             extension: TerrainExtension {
@@ -1027,6 +1035,7 @@ fn spawn_streamed_tiles(
         // The root draws nothing: it carries the collider and surface roles, and its cells of
         // 4×4 chunks are children, a unit small enough for the exterior and frustum culls.
         // `furnish_tile_cells` spawns them a few per frame; the root keeps the visibility chain.
+        let tt1 = Instant::now();
         let mut tile_ent = commands.spawn((Transform::IDENTITY, Visibility::default()));
         tile_ent.vis_chain_only();
         if let Some((verts, tris)) = collider_data {
@@ -1052,6 +1061,7 @@ fn spawn_streamed_tiles(
 
         // Placements register by uniqueId; their ground shade resolves at spawn by a global lookup,
         // since a doodad's origin may lie on another tile.
+        let tt2 = Instant::now();
         for d in &adt.doodads {
             register_doodad(placements, &asset_server, d, (tx, ty));
             tile.placements.push(d.unique_id);
@@ -1061,31 +1071,75 @@ fn spawn_streamed_tiles(
             tile.placements.push(w.unique_id);
         }
 
-        let mut liquid_ents = Vec::new();
-        spawn_liquids(
-            &mut commands,
-            adt.chunks.iter().flat_map(|c| c.liquids.iter()),
-            &adt.chunks,
-            adt.planar.as_ref(),
-            liquid_assets.as_deref(),
-            &mut meshes,
-            &mut liquid_ents,
-        );
-        tile.liquid = liquid_ents;
+        let tt3 = Instant::now();
+        // The liquids' lattice, shoreline and meshes are built off-thread (the fork's: 35-140 ms
+        // a tile on this thread); `land_tile_liquids` below spawns them when the build answers.
+        if liquid_assets.is_some() && adt.chunks.iter().any(|c| !c.liquids.is_empty()) {
+            let (chunks, planar) = (adt.chunks.clone(), adt.planar.clone());
+            tile.liquid_task = Some(bevy::tasks::AsyncComputeTaskPool::get().spawn(async move {
+                crate::liquid::prepare_liquids(
+                    chunks.iter().flat_map(|c| c.liquids.iter()),
+                    &chunks,
+                    planar.as_ref(),
+                )
+            }));
+        }
 
+        let tt4 = Instant::now();
         // Ground clutter per chunk, meshed lazily within ~70 yd by `stream_chunk_clutter`.
         if let (Some(clutter), Some(clutter_cfg)) = (clutter.as_ref(), clutter_cfg.as_ref()) {
-            let mut clutter_ents = Vec::new();
-            scatter_tile_clutter(
-                &mut commands,
-                &adt.chunks,
-                tx as u32,
-                ty as u32,
-                &clutter.catalog,
+            // Scattered off-thread (the fork's); the chunks land below when the task answers.
+            let (chunks, catalog, density) = (
+                adt.chunks.clone(),
+                clutter.catalog.clone(),
                 clutter_cfg.density,
-                &mut clutter_ents,
             );
-            tile.clutter = clutter_ents;
+            tile.clutter_task = Some(bevy::tasks::AsyncComputeTaskPool::get().spawn(async move {
+                crate::clutter::scatter_tile_chunks(
+                    &chunks, tx as u32, ty as u32, &catalog, density,
+                )
+            }));
+        }
+        if std::env::var_os("WOW_TILE_TIMES").is_some() {
+            let ms = |a: Instant, b: Instant| (b - a).as_secs_f32() * 1000.0;
+            eprintln!(
+                "[tile] ({tx},{ty}) collider-data {:.1} ents {:.1} placements {:.1} ({}d {}w) liquids {:.1} clutter {:.1}",
+                ms(tt0, tt1), ms(tt1, tt2), ms(tt2, tt3), adt.doodads.len(), adt.wmos.len(),
+                ms(tt3, tt4), ms(tt4, Instant::now()),
+            );
+        }
+    }
+
+    // Land the ground clutter whose off-thread scatter has answered.
+    for tile in state.tiles.values_mut() {
+        let Some(task) = tile.clutter_task.as_mut() else {
+            continue;
+        };
+        if let Some(chunks) =
+            bevy::tasks::block_on(bevy::tasks::futures_lite::future::poll_once(task))
+        {
+            tile.clutter_task = None;
+            tile.clutter
+                .extend(chunks.into_iter().map(|c| commands.spawn(c).id()));
+        }
+    }
+
+    // Land the liquids whose off-thread build has answered.
+    for tile in state.tiles.values_mut() {
+        let Some(task) = tile.liquid_task.as_mut() else {
+            continue;
+        };
+        if let Some(prepared) =
+            bevy::tasks::block_on(bevy::tasks::futures_lite::future::poll_once(task))
+        {
+            tile.liquid_task = None;
+            crate::liquid::spawn_prepared_liquids(
+                &mut commands,
+                prepared,
+                liquid_assets.as_deref(),
+                &mut meshes,
+                &mut tile.liquid,
+            );
         }
     }
 
@@ -1094,7 +1148,7 @@ fn spawn_streamed_tiles(
         && state
             .tiles
             .values()
-            .all(|t| t.entity.is_some() && t.furnished);
+            .all(|t| t.entity.is_some() && t.furnished && t.liquid_task.is_none());
     let was_paced = std::mem::replace(&mut state.was_paced, focus.paced);
     let reloaded = state.take_reload(&focus);
     if let Some(p) = load_progress.as_mut() {
@@ -1394,6 +1448,8 @@ fn rescatter_clutter(
         let Some(adt) = adts.get(&tile.handle) else {
             continue;
         };
+        // A scatter still in flight was at the old density.
+        tile.clutter_task = None;
         for e in tile.clutter.drain(..) {
             commands.entity(e).try_despawn();
         }
@@ -1817,7 +1873,7 @@ mod inner_hold_tests {
             doodads: Vec::new(),
             wmos: Vec::new(),
             planar: None,
-            chunks,
+            chunks: std::sync::Arc::new(chunks),
         }
     }
 
