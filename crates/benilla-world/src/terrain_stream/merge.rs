@@ -38,6 +38,9 @@ const MERGE_MAX_VERTS: usize = 65_536;
 /// cover one quiet frame does, since the settle release waits on the backlog.
 const MERGE_IDLE_FRAMES: u32 = 15;
 
+/// Most merged meshes built in one live frame (see `flush_static_merge`).
+const MERGE_BLOBS_PER_FRAME: u64 = 32;
+
 /// Quiet frames (~3 s at 60 Hz) before a settled cell's fragments re-bake into one blob.
 const RECONSOLIDATE_IDLE_FRAMES: u32 = 180;
 
@@ -312,6 +315,14 @@ pub(super) fn flush_static_merge(
     merge.frame = merge.frame.wrapping_add(1);
     let frame = merge.frame;
     let idle = if focus.paced { MERGE_IDLE_FRAMES } else { 1 };
+    // The fork's: while live, at most [`MERGE_BLOBS_PER_FRAME`] merged meshes a frame. A tile's
+    // props settle together, and 250 meshes built in one frame cost the render world's mesh
+    // allocator 30-50 ms the next; the rest wait a frame each. A load takes them all at once.
+    let cap = if focus.paced {
+        MERGE_BLOBS_PER_FRAME
+    } else {
+        u64::MAX
+    };
     let mut blobs = 0u64;
     {
         let StaticMerge {
@@ -321,7 +332,7 @@ pub(super) fn flush_static_merge(
             let Some(tile) = streamer.tiles.get_mut(&key.0) else {
                 return false;
             };
-            if !acc.ready(frame, idle) {
+            if !acc.ready(frame, idle) || blobs >= cap {
                 return true;
             }
             blobs += 1;
@@ -351,7 +362,7 @@ pub(super) fn flush_static_merge(
         let Some(p) = placements.by_id.get_mut(&key.0) else {
             return false;
         };
-        if !acc.ready(frame, idle) {
+        if !acc.ready(frame, idle) || blobs >= cap {
             return true;
         }
         blobs += 1;
