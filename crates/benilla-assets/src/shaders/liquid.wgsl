@@ -5345,6 +5345,12 @@ fn light_release(h: vec3<u32>) -> LightHeld {
 #ifdef WATER_PREVIEW
 // ---- the preview's underside glue (wake-underwater) ---------------------------------------------
 
+/// benilla-gamepad fork: how much of Snell's window is the frame behind the surface, how far the
+/// ripples bend that view (pixels per unit of slope), and how strongly they shade the mirror.
+const UNDER_THROUGH: f32 = 0.8;
+const UNDER_BEND_PX: f32 = 70.0;
+const UNDER_SHEEN: f32 = 7.0;
+
 /// The underside's output ([`wu_underside`]): Snell's window over the internal mirror, the mirror
 /// the in-scatter along the reflected ray (no screen-space reflection: it reads no colour off the
 /// screen, so `n_lo` and `column` are unused); foam floating on it from below; fogged as the world
@@ -5367,7 +5373,12 @@ fn underside_out(
     let u = water_reflect.preview.under;
     let rd = -to_view;
     let r_down = vec3<f32>(rd.x, -abs(rd.y), rd.z);
-    let tir_base = wu_inscatter(
+    // benilla-gamepad fork: the mirror shimmers with the ripples (a facet tilted toward the eye
+    // mirrors deeper, darker water; one tilted away, the lit shallows), so the surface reads as a
+    // surface and not as more of the haze.
+    let level = normalize(vec2<f32>(rd.x, rd.z) + vec2<f32>(1e-5, 0.0));
+    let sheen = clamp(1.0 + UNDER_SHEEN * dot(level, vec2<f32>(n.x, n.z)), 0.5, 2.0);
+    let tir_base = sheen * wu_inscatter(
         r_down,
         wu_palette(wow_light.fog_color.rgb),
         u.sun_refr.xyz,
@@ -5388,14 +5399,23 @@ fn underside_out(
         vec3<f32>(0.0),
         0.0,
     );
-    var layer = WaterLayer(fog_diffuse(us.l, fog.f, fog.g), vec3<f32>(0.0));
+    // benilla-gamepad fork: inside the window the world over the water shows through, bent by
+    // the ripples: `UNDER_THROUGH` of the window is the frame behind the surface (the banks, the
+    // trees, whoever stands there), the rest the window's own sky.
+    let through = UNDER_THROUGH * us.win;
+    var layer = WaterLayer(fog_diffuse(us.l * (1.0 - through), fog.f, fog.g), vec3<f32>(through));
     if (foam > 0.0) {
         let foam_l = fog_diffuse(water_dec(PV_FOAM_ALBEDO) * light.foam * WU_FOAM_UNDER, fog.f, fog.g);
         layer = layer_over(foam_l, foam * 0.8, layer);
     }
     layer = layer_cover(layer, cover);
     let snap = water_snapshot_px(frag_coord);
-    return water_output(layer, frag_coord, snap, water_dec(snap), 1.0);
+    let bent = clamp(
+        frag_coord + vec2<f32>(n.x, n.z) / max(n.y, 0.3) * UNDER_BEND_PX,
+        vec2<f32>(0.5),
+        view.viewport.zw - vec2<f32>(0.5),
+    );
+    return water_output(layer, frag_coord, snap, water_dec(water_snapshot_px(bent)), 1.0);
 }
 #endif // WATER_PREVIEW
 
