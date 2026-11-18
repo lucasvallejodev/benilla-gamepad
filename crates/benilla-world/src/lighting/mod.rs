@@ -310,6 +310,7 @@ mod ordering_tests {
                 "the celestial follows: PostUpdate, BillboardPlace",
             ),
             ("weather/precip/mod.rs", "push_precip: PostUpdate"),
+            ("modern/look.rs", "the fork's update_lanes: Last"),
             (
                 "liquid/reflect.rs",
                 "drive_reflection: PostUpdate, before TransformSystems::Propagate",

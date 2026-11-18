@@ -205,7 +205,25 @@ fn combine_out(outg: vec3<f32>, alpha: f32, frag_coord: vec2<f32>) -> vec4<f32> 
 /// A quarter over white leaves them light to bloom and the shoulder to roll.
 const MODERN_SCENE_CAP: f32 = 1.25;
 /// The tonemap's knee (linear): identity below it, so a midtone keeps its reference value.
-const MODERN_KNEE: f32 = 0.8;
+const MODERN_KNEE: f32 = 0.5;
+/// The hot-colour compression: a bright, saturated light (Booty Bay's lit planks, a noon beach)
+/// gives up this share of its chroma as its peak channel passes the first stop toward the second,
+/// as film does, so it rolls toward a pale version of its hue instead of a flat neon one.
+const MODERN_HOT: vec3<f32> = vec3<f32>(0.3, 1.1, 0.45);
+
+/// The Modern ghost frame's curve: a gamma on the reference's pale frame, then a gain.
+const MODERN_GHOST: vec2<f32> = vec2<f32>(1.4, 0.92);
+
+/// [`MODERN_HOT`] on linear light `x`.
+fn modern_hot(x: vec3<f32>) -> vec3<f32> {
+    let peak = max(x.r, max(x.g, x.b));
+    let low = min(x.r, min(x.g, x.b));
+    let sat = (peak - low) / max(peak, 1e-4);
+    let lum = dot(x, vec3<f32>(0.2126, 0.7152, 0.0722));
+    // Toward the mean of its luma and its peak: a pale tint, not a grey.
+    let pale = vec3<f32>(mix(lum, peak, 0.5));
+    return mix(x, pale, smoothstep(MODERN_HOT.x, MODERN_HOT.y, peak) * sat * MODERN_HOT.z);
+}
 
 /// A gamma value (possibly above 1, the float target does not saturate) to linear, capped.
 fn modern_decode(g: vec3<f32>) -> vec3<f32> {
@@ -258,7 +276,7 @@ fn modern_inputs(uv: vec2<f32>, scene_g: vec3<f32>, blur_lin: vec3<f32>, extra: 
     // The death pass reads a byte framebuffer (`0x6cdf20`): a ghost's blur stops at white.
     let blur_hdr = select(blur_x, min(blur_x, vec3<f32>(1.0)), ffx.lane.y > 0.0);
     let bloom = max(blur_hdr - vec3<f32>(ffx.look.z), vec3<f32>(0.0)) * ffx.look.y + extra;
-    var sg = modern_encode(modern_tonemap(scene_x + bloom));
+    var sg = modern_encode(modern_tonemap(modern_hot(scene_x + bloom)));
     // All zero: no grade.
     if (ffx.grade.x > 0.0) {
         sg = modern_grade(sg, uv);
@@ -273,7 +291,10 @@ fn modern_tail(sg: vec3<f32>, bg: vec3<f32>, scene_a: f32, frag_coord: vec2<f32>
         let luma = clamp(dot(glowed, vec3<f32>(0.299, 0.587, 0.144)), 0.0, 1.0);
         let p = clamp(4.0 * luma * (1.0 - luma), 0.0, 1.0);
         let ghost_tint = vec3<f32>(83.0, 147.0, 168.0) / 255.0; // 0x5393A8
-        let outg = min(vec3<f32>(luma) + ghost_tint * p, vec3<f32>(1.0));
+        let pale = min(vec3<f32>(luma) + ghost_tint * p, vec3<f32>(1.0));
+        // The Modern ghost: the reference's is a pale, near-white frame at any hour; a deeper
+        // curve keeps its tint and reads as a dim spirit world instead of an overexposed one.
+        let outg = pow(pale, vec3<f32>(MODERN_GHOST.x)) * MODERN_GHOST.y;
         return combine_out(outg, scene_a, frag_coord);
     }
     let hazed = mix(sg, bg, ffx.lane.z);

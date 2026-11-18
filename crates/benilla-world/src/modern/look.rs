@@ -43,7 +43,7 @@ impl Look {
     pub const NEUTRAL: Self = Self {
         // The grade's S-curve pivots on mid grey, under which most of the reference frame sits:
         // a fifth more exposure keeps a noon frame's mean level where the reference's is.
-        exposure: 1.2,
+        exposure: 1.1,
         // The reference frame is dim (on a noon capture under 3% of pixels pass gamma 0.73): a
         // threshold at linear 0.3 lets lit stone, sky and lamps bloom, faintly.
         bloom: 0.4,
@@ -51,8 +51,8 @@ impl Look {
         // Tuned by capture from benilla-bourbon's neutral zone look (1.12, 0.86, 0.3, 1.03),
         // whose muted colour suits its linear lighting; the reference's gamma lighting wants its
         // colour kept, a little more of it.
-        contrast: 1.15,
-        saturation: 1.08,
+        contrast: 1.12,
+        saturation: 1.04,
         vignette: 0.2,
         toe: 1.0,
     };
@@ -155,6 +155,7 @@ fn update_lanes(
     lighting: Option<Res<WowLighting>>,
     time: Res<Time>,
     mut adapted: Local<Option<f32>>,
+    mut log_sec: Local<u32>,
     mut lanes: ResMut<LookLanes>,
 ) {
     let next = if model.is_modern() {
@@ -162,6 +163,22 @@ fn update_lanes(
             (Some(l), true) => auto_exposure(l.ambient, l.diffuse),
             _ => 1.0,
         };
+        // `$WOW_LOOK_LOG=1`: the light rows and the key the meter read, once a second.
+        static LOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *LOG.get_or_init(|| std::env::var_os("WOW_LOOK_LOG").is_some()) {
+            if let Some(l) = lighting.as_deref() {
+                let sec = time.elapsed_secs() as u32;
+                if *log_sec != sec {
+                    *log_sec = sec;
+                    info!(
+                        "look: ambient {:?} diffuse {:?} key {:.3} lift {lift:.3}",
+                        l.ambient,
+                        l.diffuse,
+                        light_key(l.ambient, l.diffuse)
+                    );
+                }
+            }
+        }
         let eye = adapted.get_or_insert(lift);
         *eye += (lift - *eye) * (1.0 - (-time.delta_secs() / AUTO_EXPOSURE_SECONDS).exp());
         LookLanes(Some(look.0.lanes(*eye)))
