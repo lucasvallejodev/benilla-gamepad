@@ -87,10 +87,15 @@ function Legend.Refresh()
         return
     end
     local rows
+    f:ClearAllPoints()
     if P.Cursor and P.Cursor.Wanted() then
         rows = cursorRows()
+        -- The game's windows open at the top left: the legend steps to the right edge, under
+        -- the minimap, while one is up.
+        f:SetPoint("TOPRIGHT", UIParent, "TOPRIGHT", -14, -210)
     else
         rows = worldRows()
+        f:SetPoint("TOPLEFT", UIParent, "TOPLEFT", 14, -92)
     end
     for i = 1, ROWS do
         local r = rows[i]

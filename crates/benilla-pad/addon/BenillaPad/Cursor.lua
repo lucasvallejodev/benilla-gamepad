@@ -156,11 +156,14 @@ function Cursor.Primary()
             return usable("QuestFrameCompleteQuestButton")
         end
         if shown("QuestFrameGreetingPanel") then
-            return shown("QuestTitleButton1")
+            return shown("QuestTitleButton1") or shown("QuestFrameGreetingGoodbyeButton")
         end
+        -- Any other state of the window: its way out.
+        return shown("QuestFrameGoodbyeButton") or shown("QuestFrameGreetingGoodbyeButton")
+            or shown("QuestFrameCloseButton")
     end
     if shown("GossipFrame") then
-        return shown("GossipTitleButton1")
+        return shown("GossipTitleButton1") or shown("GossipFrameGreetingGoodbyeButton")
     end
     if shown("LootFrame") then
         return shown("LootButton1")
