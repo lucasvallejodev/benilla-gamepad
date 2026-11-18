@@ -60,6 +60,8 @@ pub(crate) struct SoundKits {
     catalog: SoundKitCatalog,
     /// Decoded SFX by lowercased path, cloned per play with shared frames (SoundFileDataCache).
     cache: HashMap<String, StaticSoundData>,
+    /// Files being read and decoded off the main thread ([`SoundKits::sfx_lazy`]), by the same key.
+    pending: HashMap<String, bevy::tasks::Task<Option<StaticSoundData>>>,
     pick: HashMap<u32, PickState>,
     rng: Rng,
 }
@@ -379,6 +381,9 @@ pub(super) struct PlayExtras {
     /// `0x458890`'s per-shot multiplier (1.0 at every site but one), applied inside
     /// [`math::variation_volume`] before the 0..1 clamp and distance attenuation.
     pub(super) volume_mult: Volume,
+    /// The fork's: decode this play's file off the main thread and skip the play until it is
+    /// ready ([`SoundKits::sfx_lazy`]). For footsteps.
+    pub(super) lazy: bool,
 }
 
 /// A per-shot volume multiplier defaulting to 1.0, so `PlayExtras` can derive `Default`.
@@ -445,6 +450,7 @@ pub(super) fn play_kit_ext(
         latch,
         bus,
         volume_mult: Volume(mult),
+        lazy,
     } = extras;
     // No sound starts under the loading screen ([`SoundConfig::world_hold`]): the reference's
     // world load blocks, so the events these would voice pass unheard.
@@ -511,8 +517,15 @@ pub(super) fn play_kit_ext(
         return Ok(false);
     }
 
-    // Decode (cached).
-    let data = kits.sfx(assets, &path)?;
+    // Decode (cached); a `lazy` play waits for nothing and is skipped until its file is ready.
+    let data = if lazy {
+        match kits.sfx_lazy(assets, &path) {
+            Some(data) => data,
+            None => return Ok(false),
+        }
+    } else {
+        kits.sfx(assets, &path)?
+    };
 
     // Per-shot variation: 0x800 volume (`0x458c60`), 0x400 pitch (`0x458da0`). No 1.12 kit sets
     // 0x800.
@@ -823,6 +836,7 @@ impl SoundKits {
         Self {
             catalog,
             cache: HashMap::new(),
+            pending: HashMap::new(),
             pick: HashMap::new(),
             rng: Rng(0x9e37_79b9),
         }
@@ -875,6 +889,42 @@ impl SoundKits {
             }
         }
         st.remaining.len() - 1
+    }
+
+    /// benilla-gamepad fork: [`Self::sfx`] that never blocks. A file not decoded yet is read and
+    /// decoded on the compute pool and answers `None` until it is ready, so the play that asked
+    /// first is skipped. For sounds where that is inaudible (a footstep: the next step plays):
+    /// the first play of each file otherwise stalls the frame behind the patch chain's lock,
+    /// 12-55 ms while tiles stream.
+    fn sfx_lazy(&mut self, assets: &WorldAssets, path: &str) -> Option<StaticSoundData> {
+        let key = path.to_ascii_lowercase();
+        if let Some(d) = self.cache.get(&key) {
+            return Some(d.clone());
+        }
+        if let Some(task) = self.pending.get_mut(&key) {
+            let done = bevy::tasks::block_on(bevy::tasks::futures_lite::future::poll_once(task))?;
+            self.pending.remove(&key);
+            let data = done?;
+            self.cache.insert(key, data.clone());
+            DECODES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Some(data);
+        }
+        let (chain, loose, file) = (
+            assets.chain.clone(),
+            assets.loose().clone(),
+            path.to_string(),
+        );
+        let task = bevy::tasks::AsyncComputeTaskPool::get().spawn(async move {
+            let bytes = benilla_assets::read_loose_or_chain(
+                &chain,
+                &loose,
+                &file,
+                benilla_assets::LooseOpen::Index,
+            )?;
+            mixer::sfx_from_bytes(bytes).ok()
+        });
+        self.pending.insert(key, task);
+        None
     }
 
     /// A decoded kit file, read and decoded whole on a cache miss.

@@ -150,7 +150,11 @@ fn footstep_sounds(
                     KitRef::Id(kit),
                     Some(at),
                     SoundCategory::Sfx,
-                    PlayExtras::default(), // bus 0, uncapped, volume 1.0: `0x458870`'s
+                    // Bus 0, uncapped, volume 1.0: `0x458870`'s.
+                    PlayExtras {
+                        lazy: true,
+                        ..default()
+                    },
                 ) {
                     warn!("foley (kit {kit}): {e:#}");
                 }
@@ -207,6 +211,7 @@ fn footstep_sounds(
             SoundCategory::Sfx,
             PlayExtras {
                 bus: Bus::FOOTSTEP,
+                lazy: true,
                 ..default()
             },
         ) {
