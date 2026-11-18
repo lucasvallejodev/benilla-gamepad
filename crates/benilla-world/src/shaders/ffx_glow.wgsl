@@ -206,10 +206,12 @@ fn combine_out(outg: vec3<f32>, alpha: f32, frag_coord: vec2<f32>) -> vec4<f32> 
 const MODERN_SCENE_CAP: f32 = 1.25;
 /// The tonemap's knee (linear): identity below it, so a midtone keeps its reference value.
 const MODERN_KNEE: f32 = 0.5;
-/// The hot-colour compression: a bright, saturated light (Booty Bay's lit planks, a noon beach)
-/// gives up this share of its chroma as its peak channel passes the first stop toward the second,
-/// as film does, so it rolls toward a pale version of its hue instead of a flat neon one.
-const MODERN_HOT: vec3<f32> = vec3<f32>(0.3, 1.1, 0.45);
+/// The hot-colour compression: a bright, saturated light (Booty Bay's lit planks, a noon beach,
+/// the Barrens' grass) is held back as its peak channel passes the first stop toward the second:
+/// it gives up `z` of its chroma and `w` of its level, so it rolls toward a deeper, slightly
+/// paler version of its own hue instead of a flat neon one. Mostly level, little chroma: taking
+/// the chroma alone turned a yellow field salmon.
+const MODERN_HOT: vec4<f32> = vec4<f32>(0.3, 1.1, 0.18, 0.2);
 
 /// The Modern ghost frame's curve: a gamma on the reference's pale frame, then a gain.
 const MODERN_GHOST: vec2<f32> = vec2<f32>(1.4, 0.92);
@@ -220,9 +222,10 @@ fn modern_hot(x: vec3<f32>) -> vec3<f32> {
     let low = min(x.r, min(x.g, x.b));
     let sat = (peak - low) / max(peak, 1e-4);
     let lum = dot(x, vec3<f32>(0.2126, 0.7152, 0.0722));
+    let hot = smoothstep(MODERN_HOT.x, MODERN_HOT.y, peak) * sat;
     // Toward the mean of its luma and its peak: a pale tint, not a grey.
     let pale = vec3<f32>(mix(lum, peak, 0.5));
-    return mix(x, pale, smoothstep(MODERN_HOT.x, MODERN_HOT.y, peak) * sat * MODERN_HOT.z);
+    return mix(x, pale, hot * MODERN_HOT.z) * (1.0 - hot * MODERN_HOT.w);
 }
 
 /// A gamma value (possibly above 1, the float target does not saturate) to linear, capped.
