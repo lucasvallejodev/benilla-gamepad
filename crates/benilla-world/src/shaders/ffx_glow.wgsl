@@ -1554,6 +1554,10 @@ const MFX_DOF_SKY: f32 = 0.25;
 const MFX_HAZE: vec2<f32> = vec2<f32>(0.34, 300.0);
 /// Toward the sun the haze takes this much of the sun's colour and grows by this much.
 const MFX_HAZE_SUN: vec2<f32> = vec2<f32>(0.6, 0.9);
+/// The shadow camera's near plane in yards (`modern::sun_shadow`), and what a far caster's shade
+/// keeps of its strength.
+const MFX_SUN_NEAR: f32 = 20.0;
+const MFX_SUN_FAR_KEEP: f32 = 0.55;
 /// The light shafts: their strength and their taps toward the sun.
 const MFX_SHAFT: f32 = 0.3;
 const MFX_SHAFT_TAPS: i32 = 20;
@@ -1816,7 +1820,15 @@ fn mfx_sun_map(pw: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
             lit = lit + textureSampleCompareLevel(sun_map, sun_samp, uv + vec2<f32>(f32(i), f32(j)) * px * 1.25, c.z);
         }
     }
-    let shade = (1.0 - lit / 9.0) * fade;
+    // A caster far up the ray (a tree's crown, a tower) shades less than one close by (a
+    // character, a fence, an eave): its light is scattered and leaks through, and a wood or a
+    // street under full shade would otherwise go dull. The camera is a reverse-Z long lens whose
+    // near plane is `MFX_SUN_NEAR`, so a depth is that over the view distance.
+    let md = vec2<i32>(textureDimensions(sun_map));
+    let stored = textureLoad(sun_map, clamp(vec2<i32>(uv * vec2<f32>(md)), vec2<i32>(0), md - vec2<i32>(1)), 0);
+    let gap = MFX_SUN_NEAR / max(c.z, 1e-5) - MFX_SUN_NEAR / max(stored, 1e-5);
+    let far_caster = mix(1.0, MFX_SUN_FAR_KEEP, smoothstep(6.0, 30.0, gap));
+    let shade = (1.0 - lit / 9.0) * fade * far_caster;
     var keep = s.ambient.rgb / max(s.ambient.rgb + s.diffuse.rgb * ndl, vec3<f32>(1e-3));
     // Half the hue shift: the whole of it reads as a blue wash under a warm sun.
     keep = mix(keep, vec3<f32>(dot(keep, vec3<f32>(0.299, 0.587, 0.114))), 0.5);
