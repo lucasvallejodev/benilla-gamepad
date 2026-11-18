@@ -68,7 +68,7 @@ fn wind_at(secs: f64, storm: f32) -> (Vec2, f32) {
 }
 
 /// The fork's share of the caustic net's physical contrast that the look keeps.
-const CAUSTICS_LOOK: f32 = 0.7;
+const CAUSTICS_LOOK: f32 = 0.5;
 /// What the moon keeps of the sun's caustics, shafts and in-scatter under water.
 const MOON_SHARE: f32 = 0.08;
 
