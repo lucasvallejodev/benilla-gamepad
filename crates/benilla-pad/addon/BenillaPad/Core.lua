@@ -66,6 +66,8 @@ P.DEFAULTS = {
     -- The top-left legend of what the buttons do now, and the Interact prompt above the bar.
     legend = true,
     prompt = true,
+    -- Small previews on each bar button of what the other trigger sets hold there.
+    peek = true,
     -- The camera's swing back behind the character: "game" leaves the game's own setting
     -- (Interface options, Camera Following Style), "always" and "never" set it.
     followCam = "always",

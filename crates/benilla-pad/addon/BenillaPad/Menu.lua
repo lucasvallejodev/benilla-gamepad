@@ -95,6 +95,8 @@ Menu.pages = {
                 key = "xpText" },
             { label = "Cooldowns from other layers", desc = "A row above the bar with what is cooling down on the layers you are not holding.",
                 key = "layerCooldowns" },
+            { label = "Other sets' previews", desc = "Small icons at each bar button's corners: what it holds on the LT set (left) and the RT set (right).",
+                key = "peek" },
             { label = "Button legend", desc = "A panel at the top left listing what the buttons do right now: in the world, in a game window.",
                 key = "legend" },
             { label = "Interact prompt", desc = "Above the bar, what X does now: Talk, Loot, Open, Attack.",

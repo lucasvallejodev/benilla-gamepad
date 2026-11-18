@@ -87,6 +87,12 @@ local function paintTabs()
     layerText:SetTextColor(c[1], c[2], c[3])
 end
 
+-- The buttons that carry the other sets' previews, and a preview's size.
+local PEEK_KEYS = {
+    DUP = true, DDOWN = true, DLEFT = true, DRIGHT = true, A = true, B = true, X = true, Y = true,
+}
+local PEEK = 15
+
 -- ── Building a button ──
 
 local function newIconSquare(b, size)
@@ -205,6 +211,30 @@ local function newButton(key)
         glyph:Hide()
     end
 
+    -- Two small previews at the bottom corners (a crossbar's satellites): what the button
+    -- holds on the other two trigger sets, so the layout reads without holding a trigger.
+    if PEEK_KEYS[key] then
+        b.peeks = {}
+        for i = 1, 2 do
+            local edge = over:CreateTexture(nil, "ARTWORK")
+            edge:SetWidth(PEEK + 2)
+            edge:SetHeight(PEEK + 2)
+            local icon = over:CreateTexture(nil, "OVERLAY")
+            icon:SetWidth(PEEK)
+            icon:SetHeight(PEEK)
+            icon:SetTexCoord(TRIM, 1 - TRIM, TRIM, 1 - TRIM)
+            if i == 1 then
+                edge:SetPoint("CENTER", b, "BOTTOMLEFT", 3, 3)
+            else
+                edge:SetPoint("CENTER", b, "BOTTOMRIGHT", -3, 3)
+            end
+            icon:SetPoint("CENTER", edge, "CENTER", 0, 0)
+            edge:Hide()
+            icon:Hide()
+            b.peeks[i] = { edge = edge, icon = icon }
+        end
+    end
+
     -- The mouse: drop a spell or item on a button, drag one off, read its tooltip.
     b:RegisterForDrag("LeftButton")
     b:SetScript("OnReceiveDrag", function()
@@ -272,6 +302,44 @@ local function setGlyph(b)
     end
 end
 
+-- The icon of a button's binding on a layer, or nil for an empty slot.
+local function iconOf(key, layer)
+    local kind, value = P.Binding(key, layer)
+    if kind == "form" then
+        return value.icon
+    elseif kind == "slot" then
+        local slot = P.PagedSlot(value)
+        return HasAction(slot) and GetActionTexture(slot) or nil
+    elseif kind == "action" then
+        return P.ActionIcon(value)
+    end
+    return nil
+end
+
+-- The previews: left the LT set, right the RT set; the set the triggers hold gives its corner to
+-- the bare set, so every other set stays in sight.
+local function updatePeeks(b)
+    if not b.peeks then
+        return
+    end
+    local on = P.Setting("peek")
+    local layers = { (P.layer == "lt") and "bare" or "lt", (P.layer == "rt") and "bare" or "rt" }
+    for i = 1, 2 do
+        local peek, layer = b.peeks[i], layers[i]
+        local tex = on and iconOf(b.key, layer)
+        if tex then
+            local c = LAYER_COLOR[layer]
+            peek.edge:SetTexture(c[1], c[2], c[3], 0.95)
+            peek.icon:SetTexture(tex)
+            peek.edge:Show()
+            peek.icon:Show()
+        else
+            peek.edge:Hide()
+            peek.icon:Hide()
+        end
+    end
+end
+
 -- What a button shows: its binding on the held layer.
 function Bar.UpdateButton(b)
     local kind, value = P.Binding(b.key, P.layer)
@@ -289,6 +357,7 @@ function Bar.UpdateButton(b)
     end
     setIcon(b, tex)
     setGlyph(b)
+    updatePeeks(b)
     if b.slot and HasAction(b.slot) then
         setCooldown(b, GetActionCooldown(b.slot))
         if IsConsumableAction(b.slot) then
