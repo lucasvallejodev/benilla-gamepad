@@ -71,17 +71,37 @@ function Prompt.Refresh()
         label:SetText(verb .. "  |cffd0d0d0" .. UnitName("target") .. "|r")
     end
     f:SetWidth(label:GetStringWidth() + 46)
+    Prompt.Place()
+    f:Show()
+end
+
+-- Over the name of what X acts on (BENILLAPAD_ANCHOR, absolute units from the Rust side), as a
+-- console UI hangs its prompt on the thing itself; above the bar while that is off screen.
+local anchorX, anchorY
+function Prompt.Place()
     f:ClearAllPoints()
+    if anchorX then
+        local s = UIParent:GetEffectiveScale()
+        f:SetPoint("BOTTOM", UIParent, "BOTTOMLEFT", anchorX / s, anchorY / s + 6)
+        return
+    end
     local bar = P.Bar and P.Bar.frame
     if bar and bar:IsShown() then
         f:SetPoint("BOTTOM", bar, "TOP", 0, 34)
     else
         f:SetPoint("BOTTOM", UIParent, "BOTTOM", 0, 200)
     end
-    f:Show()
 end
 
-P.Listen(function(event, arg1)
+P.Listen(function(event, arg1, arg2)
+    if event == "BENILLAPAD_ANCHOR" then
+        -- Every frame the subject moves on screen: only the place, not a whole refresh.
+        anchorX, anchorY = arg1, arg2
+        if f:IsShown() then
+            Prompt.Place()
+        end
+        return
+    end
     if event == "BENILLAPAD_SOFT" then
         soft = arg1
     end

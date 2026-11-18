@@ -15,6 +15,14 @@ use bevy::prelude::*;
 /// benilla's own reach).
 const CORPSE_RANGE: f32 = 10.0;
 const RANGE: f32 = 6.0;
+/// A service beside the camera's line (not ahead of it) still counts this near, yards, and down
+/// to this cosine of the angle off the camera's heading (120 degrees).
+const BESIDE_RANGE: f32 = 4.0;
+const SIDE_COS: f32 = -0.5;
+/// How far over an object's feet the Interact prompt sits, yards: over a unit's name, and lower
+/// over a chest or a herb.
+const PROMPT_HEIGHT: f32 = 2.9;
+const PROMPT_HEIGHT_OBJECT: f32 = 1.4;
 /// `UNIT_FLAG_SKINNABLE`.
 const UNIT_FLAG_SKINNABLE: u32 = 0x0400_0000;
 /// The GameObject types a soft Interact uses: quest giver, chest (herbs and veins too), goober,
@@ -28,7 +36,7 @@ const GO_FLAG_NO_INTERACT: u32 = 0x10;
 pub struct Interacting<'w, 's> {
     objects: Objects<'w, 's>,
     transforms: Query<'w, 's, &'static Transform>,
-    camera: Query<'w, 's, &'static GlobalTransform, With<WorldCamera>>,
+    camera: Query<'w, 's, (&'static GlobalTransform, &'static Camera), With<WorldCamera>>,
     out: MessageWriter<'w, Interact>,
     me: Local<'s, Option<(Entity, u64)>>,
 }
@@ -90,7 +98,8 @@ pub fn verb_of(fields: &ObjectFields) -> &'static str {
 
 /// The soft target among `candidates`: a corpse within [`CORPSE_RANGE`] (`last`, the last target,
 /// first, else the nearest), else the service within [`RANGE`] that is nearest and most ahead of
-/// the camera (`ahead`, flat and unit, or zero for no preference); nothing behind the camera.
+/// the camera (`ahead`, flat and unit, or zero for no preference), or beside it at the elbow;
+/// nothing behind the camera.
 pub fn soft_target(
     candidates: impl Iterator<Item = Candidate>,
     ahead: Vec2,
@@ -113,7 +122,9 @@ pub fn soft_target(
                 } else {
                     c.offset.normalize().dot(ahead)
                 };
-                if facing <= 0.0 {
+                // Ahead, or beside within [`BESIDE_RANGE`]: an NPC at the character's elbow is
+                // meant, whichever way the camera was left looking; never one behind it.
+                if facing <= SIDE_COS || (facing <= 0.0 && d > BESIDE_RANGE) {
                     continue;
                 }
                 let rank = d * (2.0 - facing);
@@ -163,10 +174,32 @@ impl Interacting<'_, '_> {
         true
     }
 
-    /// What a soft Interact would do now: the soft target's verb, for the prompt.
-    pub fn soft_verb(&mut self, last: Option<u64>) -> Option<&'static str> {
+    /// What a soft Interact would do now: the soft target and its verb, for the prompt.
+    pub fn soft_pick(&mut self, last: Option<u64>) -> Option<(u64, &'static str)> {
         let guid = self.soft(last)?;
-        self.objects.object(guid).map(verb_of)
+        self.objects.object(guid).map(|f| (guid, verb_of(f)))
+    }
+
+    /// Where the prompt for `guid` sits on screen: the point [`PROMPT_HEIGHT`] over the object's
+    /// feet (over a unit's name), as fractions of the view from its top-left corner; `None` off
+    /// screen or behind the camera.
+    pub fn anchor(&self, guid: u64) -> Option<Vec2> {
+        let entity = self.objects.entity(guid)?;
+        let unit = matches!(
+            self.objects.object(guid)?.object_type(),
+            Some(ObjectType::Unit | ObjectType::Player)
+        );
+        let mut at = self.transforms.get(entity).ok()?.translation;
+        at.y += if unit {
+            PROMPT_HEIGHT
+        } else {
+            PROMPT_HEIGHT_OBJECT
+        };
+        let (transform, camera) = self.camera.single().ok()?;
+        let px = camera.world_to_viewport(transform, at).ok()?;
+        let size = camera.logical_viewport_size()?;
+        let f = px / size;
+        (f.cmpge(Vec2::ZERO).all() && f.cmple(Vec2::ONE).all()).then_some(f)
     }
 
     /// The soft target's guid, if there is one.
@@ -177,7 +210,7 @@ impl Interacting<'_, '_> {
             .camera
             .single()
             .ok()
-            .map(|c| {
+            .map(|(c, _)| {
                 let f = c.forward().as_vec3();
                 Vec2::new(f.x, f.z).normalize_or_zero()
             })
@@ -194,6 +227,35 @@ impl Interacting<'_, '_> {
                 offset: Vec2::new(at.x - origin.x, at.z - origin.z),
             })
         });
+        // `$WOW_PAD_SOFT_LOG=1`: the candidates within 12 yd and the camera's heading, once a
+        // second, to see why a soft Interact found nothing.
+        static LOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *LOG.get_or_init(|| std::env::var_os("WOW_PAD_SOFT_LOG").is_some()) {
+            static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+            let mut last_at = LAST.lock().unwrap_or_else(|e| e.into_inner());
+            if last_at.is_none_or(|t| t.elapsed().as_secs_f32() > 1.0) {
+                *last_at = Some(std::time::Instant::now());
+                let near: Vec<String> = self
+                    .objects
+                    .iter()
+                    .filter(|(_, e, _)| *e != me)
+                    .filter_map(|(guid, entity, fields)| {
+                        let at = self.transforms.get(entity).ok()?.translation;
+                        let off = Vec2::new(at.x - origin.x, at.z - origin.z);
+                        (off.length() < 12.0).then(|| {
+                            format!(
+                                "{guid:x} {:?} d {:.1} facing {:.2} npc {:#x}",
+                                kind_of(fields),
+                                off.length(),
+                                off.normalize_or_zero().dot(ahead),
+                                fields.unit_npc_flags()
+                            )
+                        })
+                    })
+                    .collect();
+                eprintln!("[soft] ahead {ahead:?} near {near:?}");
+            }
+        }
         soft_target(candidates, ahead, last)
     }
 }
@@ -230,6 +292,11 @@ mod tests {
         let ahead = Vec2::new(0.0, 1.0);
         let behind = [c(1, Kind::Service, 0.0, -2.0)];
         assert_eq!(soft_target(behind.into_iter(), ahead, None), None);
+        // Beside the camera's line: taken at the elbow, not from across the room.
+        let beside = [c(1, Kind::Service, 3.0, -0.3)];
+        assert_eq!(soft_target(beside.into_iter(), ahead, None), Some(1));
+        let beside_far = [c(1, Kind::Service, 5.5, -0.3)];
+        assert_eq!(soft_target(beside_far.into_iter(), ahead, None), None);
         let far = [c(1, Kind::Service, 0.0, 7.0)];
         assert_eq!(soft_target(far.into_iter(), ahead, None), None);
         // Straight ahead beats nearer but off to the side.

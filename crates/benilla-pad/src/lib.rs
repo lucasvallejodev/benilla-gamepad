@@ -180,6 +180,9 @@ struct PadState {
     /// The soft Interact's verb the addon's prompt shows, and when it is next recomputed.
     soft_verb: Option<&'static str>,
     soft_next: f32,
+    /// The soft target itself, and where the prompt was last told to sit (absolute UI units).
+    soft_guid: Option<u64>,
+    anchor: Option<(f32, f32)>,
 }
 
 /// How often the soft Interact prompt is recomputed, in seconds.
@@ -448,11 +451,13 @@ fn drive(
     // ── The soft Interact prompt ── what X would do with no target, a few times a second.
     if now >= state.soft_next {
         state.soft_next = now + SOFT_PROMPT_EVERY;
-        let verb = if world && !cursor && interacting.target().is_none() {
-            interacting.soft_verb(state.last_target)
+        let pick = if world && !cursor && interacting.target().is_none() {
+            interacting.soft_pick(state.last_target)
         } else {
             None
         };
+        state.soft_guid = pick.map(|p| p.0);
+        let verb = pick.map(|p| p.1);
         if verb != state.soft_verb {
             state.soft_verb = verb;
             fire(
@@ -461,6 +466,36 @@ fn drive(
                 vec![verb.map_or(ScriptValue::Nil, |v| ScriptValue::Str(v.to_string()))],
             );
         }
+    }
+
+    // ── The prompt's place ── over the name of what X acts on (the target, else the soft
+    // target), in absolute UI units (768 the screen's height); nil while there is none on screen.
+    let subject = if world && !cursor {
+        interacting.target().or(state.soft_guid)
+    } else {
+        None
+    };
+    let anchor = subject.and_then(|g| interacting.anchor(g)).map(|f| {
+        let aspect = windows
+            .single()
+            .ok()
+            .map_or(16.0 / 9.0, |w| w.width() / w.height().max(1.0));
+        (f.x * 768.0 * aspect, (1.0 - f.y) * 768.0)
+    });
+    let moved = match (anchor, state.anchor) {
+        (Some(a), Some(b)) => (a.0 - b.0).abs() > 0.4 || (a.1 - b.1).abs() > 0.4,
+        (None, None) => false,
+        _ => true,
+    };
+    if moved {
+        state.anchor = anchor;
+        let args = anchor.map_or(vec![ScriptValue::Nil], |(x, y)| {
+            vec![
+                ScriptValue::Number(f64::from(x)),
+                ScriptValue::Number(f64::from(y)),
+            ]
+        });
+        fire(script, "BENILLAPAD_ANCHOR", args);
     }
 
     // ── Layer ──
