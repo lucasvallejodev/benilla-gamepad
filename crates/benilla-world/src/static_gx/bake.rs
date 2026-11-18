@@ -71,6 +71,10 @@ pub(super) fn flush_static_gx(mut gx: ResMut<StaticGx>, mut meshes: ResMut<Asset
     census_declines(&mut gx, frame);
     // A `StaticGx::flush_now` request bakes one flush's worth; the windows resume next frame.
     let now = std::mem::take(&mut gx.flush_now);
+    // `$WOW_GX_ASYNC_ALWAYS=1`: a flush bakes as a live frame does, so a capture exercises the
+    // pool path (the fork's test lever).
+    static FORCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let now = now && !*FORCE.get_or_init(|| std::env::var_os("WOW_GX_ASYNC_ALWAYS").is_some());
     let StaticGx {
         cells,
         wmos,
@@ -105,7 +109,13 @@ pub(super) fn flush_static_gx(mut gx: ResMut<StaticGx>, mut meshes: ResMut<Asset
         world.cells.insert(cell, std::sync::Arc::new(baked));
     }
     for (&instance, state) in wmos.iter_mut() {
-        if !bake_due(state, world.wmos.contains_key(&instance), frame, now) {
+        if let Some(baked) = take_bake(state, now, &mut meshes) {
+            world.wmos.insert(instance, std::sync::Arc::new(baked));
+        }
+        // One bake of a region at a time: a change meanwhile bakes after it lands.
+        if state.baking.is_some()
+            || !bake_due(state, world.wmos.contains_key(&instance), frame, now)
+        {
             continue;
         }
         state.dirty = false;
@@ -121,6 +131,10 @@ pub(super) fn flush_static_gx(mut gx: ResMut<StaticGx>, mut meshes: ResMut<Asset
                 i.wmo.as_ref().map_or(0, |w| w.group),
             )
         });
+        if bakes_async(state, now) {
+            spawn_bake(state);
+            continue;
+        }
         let gx_t0 = std::time::Instant::now();
         let baked = bake_cell(&state.items, &mut meshes);
         gx_time("wmo", gx_t0, &baked);
@@ -134,7 +148,12 @@ pub(super) fn flush_static_gx(mut gx: ResMut<StaticGx>, mut meshes: ResMut<Asset
     }
     // Prop regions: the referrer set is the selection key, and the draw carries the set list.
     for (&instance, state) in props.iter_mut() {
-        if !bake_due(state, world.props.contains_key(&instance), frame, now) {
+        if let Some(baked) = take_bake(state, now, &mut meshes) {
+            world.props.insert(instance, std::sync::Arc::new(baked));
+        }
+        if state.baking.is_some()
+            || !bake_due(state, world.props.contains_key(&instance), frame, now)
+        {
             continue;
         }
         state.dirty = false;
@@ -149,6 +168,10 @@ pub(super) fn flush_static_gx(mut gx: ResMut<StaticGx>, mut meshes: ResMut<Asset
                 i.prop.as_ref().map_or(0, |p| p.set),
             )
         });
+        if bakes_async(state, now) {
+            spawn_bake(state);
+            continue;
+        }
         let gx_t0 = std::time::Instant::now();
         let mut baked = bake_cell(&state.items, &mut meshes);
         gx_time("props", gx_t0, &baked);
@@ -203,6 +226,64 @@ fn remap_fader_items(state: &mut super::GxCell) {
 
 /// Bake one cell's or region's recentred mesh, per-item draws and per-selection-key bounds.
 fn bake_cell(items: &[GxItem], meshes: &mut Assets<Mesh>) -> render::GxCellDraw {
+    let (mesh, mut baked) = bake_parts(items);
+    baked.mesh = meshes.add(mesh);
+    baked
+}
+
+/// A region's bake in flight on the compute pool: its mesh, its draw data (the mesh handle
+/// unset) and the referrer sets it was baked against.
+pub(super) type BakeTask =
+    bevy::tasks::Task<(Mesh, render::GxCellDraw, Vec<std::sync::Arc<[u16]>>)>;
+
+/// Regions with at least this many vertices bake off the main thread while live (the fork's):
+/// a city's WMO is 800,000 vertices and 85 ms in one frame, its props 57 ms.
+const ASYNC_BAKE_VERTS: usize = 60_000;
+
+/// Whether `state`'s bake goes to the pool: a live frame and a region that large.
+fn bakes_async(state: &super::GxCell, now: bool) -> bool {
+    !now && state
+        .items
+        .iter()
+        .map(|i| i.geometry.positions.len())
+        .sum::<usize>()
+        >= ASYNC_BAKE_VERTS
+}
+
+/// Start `state`'s bake on the pool, from a copy of its sorted items.
+fn spawn_bake(state: &mut super::GxCell) {
+    let (items, sets) = (state.items.clone(), state.sets.clone());
+    state.baking = Some(bevy::tasks::AsyncComputeTaskPool::get().spawn(async move {
+        let (mesh, baked) = bake_parts(&items);
+        (mesh, baked, sets)
+    }));
+}
+
+/// A finished pool bake, its mesh added: `None` while it runs. A flush (`now`) does not wait on
+/// one: it drops it and marks the region dirty, so the caller bakes it on this thread.
+fn take_bake(
+    state: &mut super::GxCell,
+    now: bool,
+    meshes: &mut Assets<Mesh>,
+) -> Option<render::GxCellDraw> {
+    if now {
+        if state.baking.take().is_some() {
+            state.dirty = true;
+        }
+        return None;
+    }
+    let task = state.baking.as_mut()?;
+    let (mesh, mut baked, sets) =
+        bevy::tasks::block_on(bevy::tasks::futures_lite::future::poll_once(task))?;
+    state.baking = None;
+    baked.mesh = meshes.add(mesh);
+    baked.sets = sets;
+    Some(baked)
+}
+
+/// [`bake_cell`] without the asset store: the mesh and its draw data, the handle unset. Pure, so
+/// it runs on any thread.
+fn bake_parts(items: &[GxItem]) -> (Mesh, render::GxCellDraw) {
     use bevy::math::DVec3;
     // World positions stay f64 until recentred: an f32 coordinate near 9,000 yd rounds by up to
     // ~0.0005 yd, half an indoor pixel, which would shift every interpolant.
@@ -325,8 +406,8 @@ fn bake_cell(items: &[GxItem], meshes: &mut Assets<Mesh>) -> render::GxCellDraw 
     mesh.insert_indices(Indices::U32(indices));
     // All-zero; the flush marks a fader cell `bits_stale`, so the scan fills it before publish.
     let killed = vec![0u64; draws.len().div_ceil(64)];
-    render::GxCellDraw {
-        mesh: meshes.add(mesh),
+    let baked = render::GxCellDraw {
+        mesh: Handle::default(),
         origin,
         aabb: Aabb::from_min_max((mn - origin64).as_vec3(), (mx - origin64).as_vec3()),
         draws,
@@ -342,7 +423,8 @@ fn bake_cell(items: &[GxItem], meshes: &mut Assets<Mesh>) -> render::GxCellDraw 
         sets: Vec::new(), // filled by the flush for a prop region
         killed,
         killed_rev: 0,
-    }
+    };
+    (mesh, baked)
 }
 
 #[cfg(test)]

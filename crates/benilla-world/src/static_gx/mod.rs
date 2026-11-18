@@ -130,6 +130,7 @@ pub(crate) fn gx_perf_guard(i: usize) -> GxPerfGuard {
 }
 
 /// One diverted batch, kept after its cell bakes so an unload or a later admission can re-bake.
+#[derive(Clone)]
 struct GxItem {
     geometry: Arc<RenderSubmesh>,
     transform: Transform,
@@ -162,6 +163,7 @@ struct GxItem {
 
 /// A WMO-prop item's referrer set (an index into [`GxCell::sets`]) and folded SH-probe slot;
 /// `None` takes exterior light, as on the entity path.
+#[derive(Clone)]
 struct GxItemProp {
     set: u16,
     slot: Option<u16>,
@@ -210,6 +212,7 @@ enum FaderState {
 }
 
 /// A WMO item's baked facts (see [`GxWmoBatch`]).
+#[derive(Clone)]
 struct GxItemWmo {
     group: u16,
     interior: bool,
@@ -245,6 +248,8 @@ struct GxCell {
     pick_bounds: Option<(Vec3, Vec3)>,
     /// An item without a bound: the cell is always walked.
     pick_unbounded: bool,
+    /// The fork's: a large region's bake running on the compute pool (`bake::spawn_bake`).
+    baking: Option<bake::BakeTask>,
 }
 
 impl GxCell {
@@ -393,17 +398,29 @@ impl StaticGx {
         let cells = self
             .cells
             .iter()
-            .filter(|(k, s)| s.dirty && !s.items.is_empty() && !world.cells.contains_key(*k))
+            .filter(|(k, s)| {
+                (s.dirty || s.baking.is_some())
+                    && !s.items.is_empty()
+                    && !world.cells.contains_key(*k)
+            })
             .count();
         let wmos = self
             .wmos
             .iter()
-            .filter(|(k, s)| s.dirty && !s.items.is_empty() && !world.wmos.contains_key(*k))
+            .filter(|(k, s)| {
+                (s.dirty || s.baking.is_some())
+                    && !s.items.is_empty()
+                    && !world.wmos.contains_key(*k)
+            })
             .count();
         let props = self
             .props
             .iter()
-            .filter(|(k, s)| s.dirty && !s.items.is_empty() && !world.props.contains_key(*k))
+            .filter(|(k, s)| {
+                (s.dirty || s.baking.is_some())
+                    && !s.items.is_empty()
+                    && !world.props.contains_key(*k)
+            })
             .count();
         cells + wmos + props
     }
