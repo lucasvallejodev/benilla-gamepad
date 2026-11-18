@@ -1595,7 +1595,7 @@ fn mfx_dof(uv: vec2<f32>, p: vec2<f32>, sg: vec3<f32>, z: f32) -> vec3<f32> {
 /// The contact shadow: its reach toward the sun in yards (growing with the view distance), its
 /// steps, its strength at full daylight, and the view distances it fades out over.
 const MFX_SUN_REACH_YD: f32 = 2.4;
-const MFX_SUN_STEPS: i32 = 10;
+const MFX_SUN_STEPS: i32 = 28;
 const MFX_SUN_STRENGTH: f32 = 0.38;
 const MFX_SUN_FADE_YD: vec2<f32> = vec2<f32>(70.0, 130.0);
 
@@ -1624,11 +1624,13 @@ fn mfx_sun_shadow(pw: vec3<f32>, z: f32, frag: vec2<f32>) -> f32 {
     let right = u.cam_right.xyz / max(tan_h, 1e-5);
     let up = u.cam_up.xyz / max(tan_v, 1e-5);
     let dd = vec2<f32>(textureDimensions(uw_depth));
-    let reach = MFX_SUN_REACH_YD * (1.0 + z / 25.0);
+    let reach = MFX_SUN_REACH_YD * (1.0 + z / 40.0);
     let step = reach / f32(MFX_SUN_STEPS);
     let bias = 0.03 + 0.012 * z;
     var shade = 0.0;
-    var q = pw + sun * (step * (0.6 + 0.3 * mfx_noise(frag)));
+    // A step is finer than a limb (under 0.15 yd near the eye), or the march lays the caster's
+    // outline down once a step: a row of copies. The start is jittered by a whole step.
+    var q = pw + sun * (step * (0.4 + mfx_noise(frag)));
     for (var k = 0; k < MFX_SUN_STEPS; k = k + 1) {
         let v = q - u.cam_pos.xyz;
         let zc = dot(v, u.cam_fwd.xyz);
