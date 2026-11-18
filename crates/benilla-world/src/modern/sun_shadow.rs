@@ -60,6 +60,15 @@ pub struct SunShadowCamera;
 #[derive(Resource, Clone, Copy, PartialEq, Debug, Default, ExtractResource)]
 pub struct SunShadowLanes(pub Option<[f32; 32]>);
 
+/// What the static world's cull admits whatever the viewer's frustum says (`static_gx::cull`):
+/// the centre and radius, in yards, of everything that can cast into the map; `None` while the
+/// shadows are off.
+#[derive(Resource, Clone, Copy, PartialEq, Debug, Default)]
+pub struct SunShadowCull(pub Option<(Vec3, f32)>);
+
+/// How far past the map's square a caster may stand and still reach it (a tall tree up-sun).
+const CASTER_REACH: f32 = 60.0;
+
 /// Render world: the shadow camera's depth this frame, while it drew.
 #[derive(Resource, Default)]
 pub(crate) struct SunShadowDepth(pub Option<TextureView>);
@@ -173,6 +182,7 @@ fn drive(
     claim: Option<Res<crate::wmo_portal::CameraInteriorClaim>>,
     time: Res<Time>,
     mut indoors: Local<f32>,
+    mut cull: ResMut<SunShadowCull>,
 ) {
     let Ok((mut camera, mut transform, projection)) = cam.single_mut() else {
         return;
@@ -223,6 +233,17 @@ fn drive(
     if camera.is_active != shadows {
         camera.is_active = shadows;
     }
+    let admit = viewer.iter().next().filter(|_| shadows).map(|v| {
+        let fwd = Vec3::from(v.forward());
+        let level = Vec3::new(fwd.x, 0.0, fwd.z).normalize_or_zero();
+        (
+            v.translation() + level * AHEAD,
+            HALF_EXTENT * std::f32::consts::SQRT_2 + CASTER_REACH,
+        )
+    });
+    if cull.0 != admit {
+        cull.0 = admit;
+    }
     if lanes.0 != next {
         lanes.0 = next;
     }
@@ -256,6 +277,7 @@ fn publish_depth(
 pub(super) fn plugin(app: &mut App) {
     app.init_resource::<SunShadows>()
         .init_resource::<SunShadowLanes>()
+        .init_resource::<SunShadowCull>()
         .add_plugins((
             ExtractComponentPlugin::<SunShadowCamera>::default(),
             ExtractResourcePlugin::<SunShadowLanes>::default(),

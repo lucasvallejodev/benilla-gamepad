@@ -163,6 +163,7 @@ pub(super) fn cull_cells(
     claim: Res<crate::wmo_portal::CameraInteriorClaim>,
     instances: Query<&crate::wmo_portal::WmoPortalInstance>,
     probe_cull: Option<Res<crate::liquid::ProbeCull>>,
+    shadow_cull: Option<Res<crate::modern::sun_shadow::SunShadowCull>>,
 ) {
     let _t = super::gx_perf_guard(1);
     for e in gx.pending_despawn.drain(..) {
@@ -196,6 +197,14 @@ pub(super) fn cull_cells(
     // cube holds a forest and no architecture, which looks plausible and reflects a lakeside
     // cottage as empty bank.
     let probe = probe_cull.filter(|p| p.active).map(|p| (p.at, p.radius));
+    // benilla-gamepad fork: the sun shadow map's square is admitted the same way, every frame it
+    // runs: what stands beside or behind the viewer still casts into the view, and culled to the
+    // viewer's frustum the ground's shade changed as the camera turned.
+    let shadow = shadow_cull.and_then(|c| c.0);
+    let admit_all = |center: Vec3, radius: f32| {
+        probe.is_some_and(|(at, r)| center.distance(at) <= r + radius)
+            || shadow.is_some_and(|(at, r)| center.distance(at) <= r + radius)
+    };
     let gate = crate::exterior_cull::ExteriorGate::build(&windows, Some((cam_t, proj)));
     let m = &debug.models;
     let doodads_on =
@@ -344,7 +353,7 @@ pub(super) fn cull_cells(
             let center = draw.origin + Vec3::from(draw.aabb.center);
             let radius = Vec3::from(draw.aabb.half_extents).length();
             // Near the probe, neither the camera's reach nor its frustum decides what the cube needs.
-            let for_probe = probe.is_some_and(|(at, r)| center.distance(at) <= r + radius);
+            let for_probe = admit_all(center, radius);
             if !for_probe {
                 if !crate::view::within_farclip(view.farclip, cam_pos, cam_fwd, center, radius) {
                     continue;
@@ -400,7 +409,7 @@ pub(super) fn cull_cells(
                 let center = draw.origin + Vec3::from(aabb.center);
                 let radius = Vec3::from(aabb.half_extents).length();
                 // The prop regions are the second of three admission paths the probe needs.
-                let prop_for_probe = probe.is_some_and(|(at, r)| center.distance(at) <= r + radius);
+                let prop_for_probe = admit_all(center, radius);
                 if !prop_for_probe {
                     if !crate::view::within_farclip(view.farclip, cam_pos, cam_fwd, center, radius)
                     {
@@ -470,7 +479,7 @@ pub(super) fn cull_cells(
                 // prop regions, and the probe needs all three: a cubemap with the forest in it and
                 // no architecture reflects a lakeside cottage as empty bank. This was the last of
                 // the three to be found, because the first two made the cube look plausible.
-                let wmo_for_probe = probe.is_some_and(|(at, r)| center.distance(at) <= r + radius);
+                let wmo_for_probe = admit_all(center, radius);
                 if !wmo_for_probe {
                     if !crate::view::within_farclip(view.farclip, cam_pos, cam_fwd, center, radius)
                     {
