@@ -5586,6 +5586,11 @@ const SC_CAP_SHORE: vec2<f32> = vec2<f32>(8.0, 20.0);
 
 /// The bubble pattern's scale on the shore and at contacts, and on whitecaps (lookups a yard).
 const SC_FOAM_SCALE: f32 = 0.6;
+/// benilla-gamepad fork: what still water keeps of the shore's soft band, its meniscus and the
+/// drained film's gloss.
+const SC_STILL_BAND: f32 = 0.15;
+const SC_STILL_RIM: f32 = 0.2;
+const SC_STILL_FILM: f32 = 0.06;
 const SC_CAP_SCALE: f32 = 0.7;
 /// Foam's albedo, gamma: cream where it is thick, a cool lace where it is thin.
 const SC_FOAM_CREAM: vec3<f32> = PV_FOAM_ALBEDO;
@@ -6007,6 +6012,14 @@ fn shore_contact(i: ScIn, g: ScGeom) -> ShoreContact {
         } else {
             still_band = lace_c;
         }
+        // benilla-gamepad fork: a still lake's edge is only the wet bank. Its hairlines drew a
+        // hard white outline with kinks where the nearest-waterline field turns, and the drained
+        // film mirrored the sky as a pale band beside it, both plain from above.
+        let lively = max(select(0.0, 1.0, ocean), rapids);
+        line = line * lively;
+        still_band = still_band * SC_STILL_BAND;
+        o.meniscus = o.meniscus * mix(SC_STILL_RIM, 1.0, lively);
+        o.film = o.film * mix(SC_STILL_FILM, 1.0, lively);
 
         if (ocean && sea > 0.0) {
             // The swash front: dense on the uprush, thinning as the backwash drains.
