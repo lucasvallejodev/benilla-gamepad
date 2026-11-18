@@ -123,12 +123,12 @@ const AUTO_EXPOSURE_SECONDS: f32 = 1.5;
 /// picture's log-average luminance against [`METER_KEY`] (an Elwynn noon in the trees' shade,
 /// 0.052 by capture). A brighter picture is held back by [`METER_BRIGHT`]'s share of the
 /// difference in stops, never under its floor: Booty Bay's planks (0.10) take 0.86, the Barrens
-/// at noon (0.20) the floor. A darker one is lifted by [`METER_DARK`]'s share up to its cap, so
+/// at noon (0.20) 0.72, the floor. A darker one is lifted by [`METER_DARK`]'s share up to its cap, so
 /// a gloomy zone or a room stays gloomy; the night's own lift is the light rows'
 /// ([`auto_exposure`]), and the larger of the two is taken.
 const METER_KEY: f32 = 0.055;
 /// (strength, floor).
-const METER_BRIGHT: (f32, f32) = (0.25, 0.82);
+const METER_BRIGHT: (f32, f32) = (0.25, 0.72);
 /// (strength, cap).
 const METER_DARK: (f32, f32) = (0.3, 1.2);
 /// A reading older than this many seconds is stale (the world is not drawing: a loading screen).
