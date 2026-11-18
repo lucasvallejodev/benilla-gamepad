@@ -1589,9 +1589,69 @@ fn mfx_dof(uv: vec2<f32>, p: vec2<f32>, sg: vec3<f32>, z: f32) -> vec3<f32> {
     return sum / w;
 }
 
+/// The contact shadow: its reach toward the sun in yards (growing with the view distance), its
+/// steps, its strength at full daylight, and the view distances it fades out over.
+const MFX_SUN_REACH_YD: f32 = 2.4;
+const MFX_SUN_STEPS: i32 = 10;
+const MFX_SUN_STRENGTH: f32 = 0.38;
+const MFX_SUN_FADE_YD: vec2<f32> = vec2<f32>(70.0, 130.0);
+
+/// Interleaved gradient noise in [0, 1) at pixel `p`: the march's start offset, so its steps do
+/// not band.
+fn mfx_noise(p: vec2<f32>) -> f32 {
+    return fract(52.9829189 * fract(dot(p, vec2<f32>(0.06711056, 0.00583715))));
+}
+
+/// The lighting sun's contact shadow at the world point `pw` behind the pixel at view Z `z`
+/// (1 lit, lower shadowed): a short march toward the sun through the depth image, each step
+/// projected back to the screen; a step behind something not much nearer than itself is in its
+/// shadow. Short-range only (a character's feet, grass, a fence, a wall's foot): what is off the
+/// screen or far from the receiver casts nothing. `frag` is the pixel, for the noise.
+fn mfx_sun_shadow(pw: vec3<f32>, z: f32, frag: vec2<f32>) -> f32 {
+    let u = uwb.u;
+    let day = smoothstep(0.08, 0.6, u.cam_up.w);
+    let fade = (1.0 - smoothstep(MFX_SUN_FADE_YD.x, MFX_SUN_FADE_YD.y, z)) * day;
+    if (z <= 0.0 || fade <= 0.0) {
+        return 1.0;
+    }
+    let sxz = u.sun_refr.xz * WU_ETA;
+    let sun = normalize(vec3<f32>(sxz.x, sqrt(max(1.0 - dot(sxz, sxz), 1e-6)), sxz.y));
+    let tan_h = length(u.cam_right.xyz);
+    let tan_v = length(u.cam_up.xyz);
+    let right = u.cam_right.xyz / max(tan_h, 1e-5);
+    let up = u.cam_up.xyz / max(tan_v, 1e-5);
+    let dd = vec2<f32>(textureDimensions(uw_depth));
+    let reach = MFX_SUN_REACH_YD * (1.0 + z / 25.0);
+    let step = reach / f32(MFX_SUN_STEPS);
+    let bias = 0.03 + 0.012 * z;
+    var shade = 0.0;
+    var q = pw + sun * (step * (0.6 + 0.3 * mfx_noise(frag)));
+    for (var k = 0; k < MFX_SUN_STEPS; k = k + 1) {
+        let v = q - u.cam_pos.xyz;
+        let zc = dot(v, u.cam_fwd.xyz);
+        if (zc <= u.cam_pos.w) {
+            break;
+        }
+        let ndc = vec2<f32>(dot(v, right) / (zc * tan_h), dot(v, up) / (zc * tan_v));
+        if (any(abs(ndc) >= vec2<f32>(1.0))) {
+            break;
+        }
+        let zs = mfx_depth((vec2<f32>(ndc.x, -ndc.y) * 0.5 + 0.5) * dd);
+        let behind = zc - zs;
+        // Behind the depth by more than the bias, but not by so much that the occluder is some
+        // far thing in front of the whole scene.
+        if (zs > 0.0 && behind > bias && behind < 0.6 + 0.6 * reach) {
+            shade = 1.0 - f32(k) / f32(MFX_SUN_STEPS) * 0.6;
+            break;
+        }
+        q = q + sun * step;
+    }
+    return 1.0 - MFX_SUN_STRENGTH * fade * shade;
+}
+
 /// The depth effects on the dry scene colour `sg` (gamma) at `uv`, view Z `z` (0 the sky), `t_d`
-/// yards along the pixel's ray.
-fn mfx_apply(uv: vec2<f32>, sg: vec3<f32>, z: f32, t_d: f32) -> vec3<f32> {
+/// yards along the pixel's ray `rd`.
+fn mfx_apply(uv: vec2<f32>, sg: vec3<f32>, z: f32, t_d: f32, rd: vec3<f32>) -> vec3<f32> {
     if (ffx.look.w < 0.5) {
         return sg;
     }
@@ -1600,6 +1660,7 @@ fn mfx_apply(uv: vec2<f32>, sg: vec3<f32>, z: f32, t_d: f32) -> vec3<f32> {
     let p = uv * dd;
     var c = mfx_dof(uv, p, sg, z);
     c = c * mfx_ao(p, z, u.cam_fwd.w * vec2<f32>(textureDimensions(in_tex)).y / max(dd.y, 1.0));
+    c = c * mfx_sun_shadow(u.cam_pos.xyz + rd * t_d, z, p);
     if (z > 0.0) {
         let haze = MFX_HAZE.x * (1.0 - exp(-t_d / MFX_HAZE.y));
         c = mix(c, mix(u.fog_dry.rgb, u.sky_horizon.rgb, 0.4), haze);
@@ -1620,7 +1681,7 @@ fn fs_combine_veil(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     let scene = textureSample(in_tex, in_samp, uv);
     var sg = clamp(scene.rgb, vec3<f32>(0.0), vec3<f32>(1.0));
 #ifdef MODERN_LOOK
-    sg = mfx_apply(uv, sg, z, t_d);
+    sg = mfx_apply(uv, sg, z, t_d, rd);
 #endif
     // The veil's own rows are zero while only the Modern look's depth effects armed the combine.
     if (uwb.veil.b.y + uwb.veil.b.z > 0.5) {
