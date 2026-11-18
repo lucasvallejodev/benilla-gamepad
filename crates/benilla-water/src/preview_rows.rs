@@ -246,6 +246,10 @@ fn drive_under_lanes(
     shadow: (Res<WaterShadow>, Res<WaterShadowWindow>),
     mut lanes: ResMut<PreviewLanes>,
     ffx: Option<ResMut<FfxUnderwater>>,
+    look: (
+        Option<Res<benilla_world::modern::LookModel>>,
+        Option<Res<benilla_world::modern::LookQuality>>,
+    ),
 ) {
     let dry = dry.map(|d| *d).unwrap_or_default();
     let mut u = [0.0f32; 64];
@@ -412,6 +416,17 @@ fn drive_under_lanes(
     let base = at(PV_UNDER);
     lanes.0[base..base + 64].copy_from_slice(&u);
     let mut v = [0.0f32; 64];
+    // The fork's: the Modern look's depth effects (`ffx_glow.wgsl`'s `mfx_apply`) ride the veil's
+    // combine and its depth, so a dry Modern frame arms it with the veil's own rows left zero.
+    let fx_on = style.is_stylised()
+        && !in_water
+        && look.0.is_some_and(|m| m.is_modern())
+        && look
+            .1
+            .is_some_and(|q| *q != benilla_world::modern::LookQuality::Low);
+    if fx_on {
+        v[0] = 1.0;
+    }
     if veil_on {
         let pv = |i: usize| lanes.0[at(i)];
         let mut vrow = |r: usize, x: [f32; 4]| v[4 * r..4 * r + 4].copy_from_slice(&x);
@@ -430,7 +445,7 @@ fn drive_under_lanes(
     if let Some(mut ffx) = ffx {
         ffx.lanes[..64].copy_from_slice(&u);
         ffx.lanes[64..].copy_from_slice(&v);
-        ffx.depth = if u[18] > 0.5 || veil_on {
+        ffx.depth = if u[18] > 0.5 || veil_on || fx_on {
             pass.map(|p| p.scene_depth.clone())
         } else {
             None

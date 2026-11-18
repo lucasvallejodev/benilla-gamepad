@@ -1505,6 +1505,109 @@ fn veil_apply(sg: vec3<f32>, rd: vec3<f32>, t_d: f32) -> vec3<f32> {
     return wu_enc(lin);
 }
 
+#ifdef MODERN_LOOK
+// ---- benilla-gamepad fork: the Modern look's depth effects -------------------------------------
+//
+// From the opaque world's linear depth (the water plugin's, so they need Improved Water), on the
+// dry frame, while `look.w` (the look's quality, Medium and up) is set: a soft far focus, a
+// darkening of creases and contact corners, and a light aerial haze. None casts a ray.
+
+/// The crease shade: its reach in yards, its strength, and the view distances it fades out over.
+const MFX_AO_REACH_YD: f32 = 0.9;
+const MFX_AO_STRENGTH: f32 = 0.6;
+const MFX_AO_FADE_YD: vec2<f32> = vec2<f32>(90.0, 170.0);
+/// The far focus: the view distances the blur grows over, and its radius in pixels of a 900-row
+/// frame at full strength. The sky takes `MFX_DOF_SKY` of it.
+const MFX_DOF_YD: vec2<f32> = vec2<f32>(50.0, 300.0);
+const MFX_DOF_PX: f32 = 2.2;
+const MFX_DOF_SKY: f32 = 0.5;
+/// The aerial haze: the most of the picture it takes, and the distance scale in yards.
+const MFX_HAZE: vec2<f32> = vec2<f32>(0.2, 340.0);
+
+/// The linear depth at pixel `p` (clamped to the image), 0 where nothing was drawn.
+fn mfx_depth(p: vec2<f32>) -> f32 {
+    let dd = vec2<f32>(textureDimensions(uw_depth));
+    return textureLoad(uw_depth, vec2<i32>(clamp(p, vec2<f32>(0.0), dd - vec2<f32>(1.0))), 0).r;
+}
+
+/// The crease shade at depth pixel `p`, view Z `z` (1 open, lower in a crease): six opposite
+/// pairs of depth taps; a pair's mean of 1/z over the centre's is zero on any plane and positive
+/// in a hollow, so a flat floor at any angle takes none. `px_angle` is a pixel's angle.
+fn mfx_ao(p: vec2<f32>, z: f32, px_angle: f32) -> f32 {
+    if (z <= 0.0) {
+        return 1.0;
+    }
+    let fade = 1.0 - smoothstep(MFX_AO_FADE_YD.x, MFX_AO_FADE_YD.y, z);
+    if (fade <= 0.0) {
+        return 1.0;
+    }
+    let r = clamp(MFX_AO_REACH_YD / (z * px_angle), 3.0, 72.0);
+    var occ = 0.0;
+    for (var k = 0; k < 6; k = k + 1) {
+        let a = (f32(k) + 0.5) * 0.5235988;
+        let d = vec2<f32>(cos(a), sin(a)) * r * select(1.0, 0.45, (k & 1) == 1);
+        let za = mfx_depth(p + d);
+        let zb = mfx_depth(p - d);
+        if (za <= 0.0 || zb <= 0.0) {
+            continue;
+        }
+        let len = length(d) * z * px_angle;
+        // The hollow's depth in yards over the pair's reach.
+        let hollow = ((1.0 / za + 1.0 / zb) * 0.5 - 1.0 / z) * z * z / len;
+        // Something far in front (a character before a hill) is not a crease.
+        let near = 1.0 - smoothstep(1.5, 4.0, max(abs(z - za), abs(z - zb)) / len);
+        occ = occ + smoothstep(0.22, 0.9, hollow) * near;
+    }
+    return 1.0 - MFX_AO_STRENGTH * fade * occ / 6.0;
+}
+
+/// How far out of focus view Z `z` is, 0 to 1.
+fn mfx_coc(z: f32) -> f32 {
+    return select(smoothstep(MFX_DOF_YD.x, MFX_DOF_YD.y, z), MFX_DOF_SKY, z <= 0.0);
+}
+
+/// The far focus on the scene colour `sg` at `uv`: eight taps on a disc of the pixel's blur
+/// radius, each weighed by its own blur so a sharp near thing does not smear into the distance.
+fn mfx_dof(uv: vec2<f32>, p: vec2<f32>, sg: vec3<f32>, z: f32) -> vec3<f32> {
+    let c0 = mfx_coc(z);
+    if (c0 < 0.02) {
+        return sg;
+    }
+    let dims = vec2<f32>(textureDimensions(in_tex));
+    let dd = vec2<f32>(textureDimensions(uw_depth));
+    let rad = c0 * MFX_DOF_PX * dims.y / 900.0;
+    var sum = sg;
+    var w = 1.0;
+    for (var k = 0; k < 8; k = k + 1) {
+        let a = f32(k) * 0.7853982 + 0.39;
+        let off = vec2<f32>(cos(a), sin(a)) * rad * select(1.0, 0.55, (k & 1) == 1);
+        let ws = saturate(mfx_coc(mfx_depth(p + off * dd / dims)) / c0);
+        let tap = textureSampleLevel(in_tex, in_samp, uv + off / dims, 0.0).rgb;
+        sum = sum + clamp(tap, vec3<f32>(0.0), vec3<f32>(1.0)) * ws;
+        w = w + ws;
+    }
+    return sum / w;
+}
+
+/// The depth effects on the dry scene colour `sg` (gamma) at `uv`, view Z `z` (0 the sky), `t_d`
+/// yards along the pixel's ray.
+fn mfx_apply(uv: vec2<f32>, sg: vec3<f32>, z: f32, t_d: f32) -> vec3<f32> {
+    if (ffx.look.w < 0.5) {
+        return sg;
+    }
+    let u = uwb.u;
+    let dd = vec2<f32>(textureDimensions(uw_depth));
+    let p = uv * dd;
+    var c = mfx_dof(uv, p, sg, z);
+    c = c * mfx_ao(p, z, u.cam_fwd.w * vec2<f32>(textureDimensions(in_tex)).y / max(dd.y, 1.0));
+    if (z > 0.0) {
+        let haze = MFX_HAZE.x * (1.0 - exp(-t_d / MFX_HAZE.y));
+        c = mix(c, mix(u.fog_dry.rgb, u.sky_horizon.rgb, 0.4), haze);
+    }
+    return c;
+}
+#endif
+
 /// The dry combine with the veil (round 3): the veil over the scene, then the glow as ever.
 @fragment
 fn fs_combine_veil(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
@@ -1515,7 +1618,14 @@ fn fs_combine_veil(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     let rd = wu_post_ray(uv, u);
     let t_d = select(4000.0, z / max(dot(rd, u.cam_fwd.xyz), 1e-3), z > 0.0);
     let scene = textureSample(in_tex, in_samp, uv);
-    let sg = veil_apply(clamp(scene.rgb, vec3<f32>(0.0), vec3<f32>(1.0)), rd, t_d);
+    var sg = clamp(scene.rgb, vec3<f32>(0.0), vec3<f32>(1.0));
+#ifdef MODERN_LOOK
+    sg = mfx_apply(uv, sg, z, t_d);
+#endif
+    // The veil's own rows are zero while only the Modern look's depth effects armed the combine.
+    if (uwb.veil.b.y + uwb.veil.b.z > 0.5) {
+        sg = veil_apply(sg, rd, t_d);
+    }
     return combine_body_on(uv, in.position.xy, sg, scene.a);
 }
 #endif

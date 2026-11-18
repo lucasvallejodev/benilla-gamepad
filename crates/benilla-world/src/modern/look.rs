@@ -57,13 +57,14 @@ impl Look {
         toe: 1.0,
     };
 
-    /// The combine's two lanes at the auto-exposure's `lift`.
-    pub fn lanes(&self, lift: f32) -> [f32; 8] {
+    /// The combine's two lanes at the auto-exposure's `lift`; `depth_fx` (1 on) arms the depth
+    /// effects (the far focus, the crease shade, the haze) where the combine has a depth.
+    pub fn lanes(&self, lift: f32, depth_fx: f32) -> [f32; 8] {
         [
             self.exposure * lift,
             self.bloom,
             self.bloom_threshold,
-            0.0,
+            depth_fx,
             self.contrast,
             self.saturation,
             self.vignette,
@@ -152,6 +153,7 @@ fn update_lanes(
     model: Res<LookModel>,
     look: Res<ActiveLook>,
     auto: Res<AutoExposure>,
+    quality: Res<super::LookQuality>,
     lighting: Option<Res<WowLighting>>,
     time: Res<Time>,
     mut adapted: Local<Option<f32>>,
@@ -181,7 +183,9 @@ fn update_lanes(
         }
         let eye = adapted.get_or_insert(lift);
         *eye += (lift - *eye) * (1.0 - (-time.delta_secs() / AUTO_EXPOSURE_SECONDS).exp());
-        LookLanes(Some(look.0.lanes(*eye)))
+        // The depth effects are the Medium and High tiers'; Low keeps the picture's cost flat.
+        let depth_fx = f32::from(u8::from(*quality != super::LookQuality::Low));
+        LookLanes(Some(look.0.lanes(*eye, depth_fx)))
     } else {
         *adapted = None;
         LookLanes(None)
@@ -222,7 +226,7 @@ mod tests {
 
     #[test]
     fn the_lift_moves_the_exposure_lane_alone() {
-        let (a, b) = (Look::NEUTRAL.lanes(1.0), Look::NEUTRAL.lanes(1.5));
+        let (a, b) = (Look::NEUTRAL.lanes(1.0, 0.0), Look::NEUTRAL.lanes(1.5, 0.0));
         assert_eq!(b[0], a[0] * 1.5);
         assert_eq!(a[1..], b[1..]);
     }

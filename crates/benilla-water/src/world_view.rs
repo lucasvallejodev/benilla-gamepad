@@ -149,6 +149,10 @@ pub(crate) struct WaterScreenRect {
     /// by [`WATER_RECT_MARGIN_PX`] and clamped to the target.
     pub(crate) min: UVec2,
     pub(crate) max: UVec2,
+    /// The fork's: the linear depth is wanted under every pixel of the target, water on screen
+    /// or not: the Modern look's depth effects read it (`ffx_glow.wgsl`'s `mfx_apply`). Only the
+    /// seed's linear-depth write follows it; the mirrors and the pyramid keep `visible`.
+    pub(crate) depth_full: bool,
 }
 
 /// Room for a refracted or contact read beside the surface (BODY-1 clamps its offset below this).
@@ -222,7 +226,17 @@ pub(crate) fn water_screen_rect(
     >,
     materials: Res<Assets<LiquidMaterial>>,
     eye_liquid: benilla_world::liquid::EyeLiquid,
+    look: (
+        Option<Res<benilla_world::modern::LookModel>>,
+        Option<Res<benilla_world::modern::LookQuality>>,
+        Res<benilla_world::liquid::WaterStyle>,
+    ),
 ) {
+    let depth_full = look.2.is_stylised()
+        && look.0.is_some_and(|m| m.is_modern())
+        && look
+            .1
+            .is_some_and(|q| *q != benilla_world::modern::LookQuality::Low);
     // The preview's underwater combine (`tint`) reads the linear depth under every pixel while the
     // eye is in water, surface on screen or not.
     if benilla_assets::preview::on(benilla_assets::preview::TINT)
@@ -237,6 +251,7 @@ pub(crate) fn water_screen_rect(
                 visible: true,
                 min: UVec2::ZERO,
                 max: size,
+                depth_full: false,
             });
             return;
         }
@@ -275,8 +290,12 @@ pub(crate) fn water_screen_rect(
             visible: true,
             min,
             max,
+            depth_full,
         },
-        None => WaterScreenRect::default(),
+        None => WaterScreenRect {
+            depth_full,
+            ..default()
+        },
     };
     trace!("water rect {:?}", (next.visible, next.min, next.max));
     rect.set_if_neq(next);

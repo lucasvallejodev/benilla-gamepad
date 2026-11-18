@@ -414,6 +414,7 @@ mod tests {
             visible: true,
             min: UVec2::new(min.0, min.1),
             max: UVec2::new(max.0, max.1),
+            depth_full: false,
         }
     }
 

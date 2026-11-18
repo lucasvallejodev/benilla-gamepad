@@ -640,15 +640,20 @@ fn prepare_hiz_seed(
     let (Some(src), true) = (camera.physical_target_size, hiz.is_some_and(|h| h.armed)) else {
         return;
     };
-    let Some(rect) = rect.filter(|r| r.visible) else {
+    let Some(rect) = rect.filter(|r| r.visible || r.depth_full) else {
         return;
     };
-    let (lin_min, lin_max) = (rect.min.min(src), rect.max.min(src));
+    // The fork's `depth_full`: the linear depth under every pixel, for the Modern look.
+    let (lin_min, lin_max) = if rect.depth_full {
+        (UVec2::ZERO, src)
+    } else {
+        (rect.min.min(src), rect.max.min(src))
+    };
     if lin_min.cmpge(lin_max).any() {
         return;
     }
     let dst = pyramid_size(src);
-    let pyramid = consumers.is_some_and(|c| c.any());
+    let pyramid = rect.visible && consumers.is_some_and(|c| c.any());
     let (tile_origin, tiles) = if pyramid {
         (UVec2::ZERO, dst)
     } else {
@@ -686,8 +691,11 @@ impl Node for WaterHizNode {
         let Some(hiz) = world.get_resource::<WaterHiz>() else {
             return Ok(());
         };
+        let depth_full = world
+            .get_resource::<WaterScreenRect>()
+            .is_some_and(|r| r.depth_full);
         if !(hiz.armed
-            && water_on_screen(world)
+            && (water_on_screen(world) || depth_full)
             && serves_world_view(world, graph.view_entity(), Visit::Pyramid))
         {
             return Ok(());

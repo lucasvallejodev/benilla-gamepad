@@ -58,13 +58,24 @@ impl LookModel {
 
 /// How much the Modern look spends. CVar `lookQuality`: `0` Low, `1` Medium, `2` High. Low meters
 /// the exposure from the light rows; the costlier passes key on Medium and High.
-#[derive(Resource, Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[derive(Resource, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum LookQuality {
     Low,
     /// The default.
-    #[default]
     Medium,
     High,
+}
+
+/// Medium, the `lookQuality` default, unless `$WOW_LOOK_QUALITY=0|1|2` picks a tier for the
+/// session (the capture lever: a capture loads no config).
+impl Default for LookQuality {
+    fn default() -> Self {
+        match std::env::var("WOW_LOOK_QUALITY").as_deref() {
+            Ok("0") => Self::Low,
+            Ok("2") => Self::High,
+            _ => Self::Medium,
+        }
+    }
 }
 
 impl LookQuality {
