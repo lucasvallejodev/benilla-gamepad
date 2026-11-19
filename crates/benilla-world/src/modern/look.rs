@@ -130,7 +130,7 @@ const METER_KEY: f32 = 0.055;
 /// (strength, floor).
 const METER_BRIGHT: (f32, f32) = (0.25, 0.72);
 /// (strength, cap).
-const METER_DARK: (f32, f32) = (0.3, 1.2);
+const METER_DARK: (f32, f32) = (0.4, 1.4);
 /// The dark cap at full night.
 const METER_NIGHT_CAP: f32 = 2.0;
 /// A reading older than this many seconds is stale (the world is not drawing: a loading screen).
