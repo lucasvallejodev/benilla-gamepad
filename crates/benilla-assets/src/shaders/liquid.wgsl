@@ -5261,7 +5261,16 @@ fn water_body_optics(
     // benilla-gamepad fork: a seabed deeper than 25 to 45 yd is water with no bed behind it, as
     // the sea past the terrain's last tile is: read at the authored column, all in-scatter. The
     // two otherwise differ in colour along that tile's straight edge.
-    let os_deep = select(0.0, smoothstep(25.0, 45.0, z_bed), o.known && bi.adt);
+    // And so is any seabed in the last stretch before the terrain's end (the fog's end): the bed
+    // lets go over 50 to 80% of the way there, so no line shows where the terrain stops, and the
+    // swell cannot make that line wobble. A bank under a few yards of water stays a bank.
+    let os_far = select(
+        0.0,
+        smoothstep(0.5, 0.8, water_eye_z(world_pos) / max(wow_light.fog_params.y, 1.0))
+            * smoothstep(2.0, 8.0, z_bed),
+        w.kind.y > 0.5,
+    );
+    let os_deep = select(0.0, max(smoothstep(25.0, 45.0, z_bed), os_far), o.known && bi.adt);
     o.z = mix(o.z, bi.fallback_z, os_deep);
     // On ADT water the light crosses at most the authored column, the MCLQ depth byte in yards:
     // 1.12 draws a bed through as much water as the byte says, so a bed the artists left visible
@@ -5283,7 +5292,7 @@ fn water_body_optics(
     // so the known bed) ends out at sea.
     let auth_keep = 1.0 - smoothstep(18.0, 40.0, o.z);
     o.t_bed = select(o.t_bed, max(o.t_bed, vec3<f32>(bi.auth_t * auth_keep)), o.known)
-        * (1.0 - smoothstep(30.0, 50.0, o.z));
+        * (1.0 - smoothstep(30.0, 50.0, o.z)) * (1.0 - os_deep);
     o.w_in = min(o.w_in, 1.0 - max(o.t_bed.r, max(o.t_bed.g, o.t_bed.b)));
     o.w_in = mix(o.w_in, 1.0, os_deep);
     // The ramp reads the swatch at the depth the artists coloured, by the swatch's own turbidity,
@@ -8349,10 +8358,10 @@ fn stylised_water(
     // benilla-gamepad fork: the open sea's swell on the normals (all five trains; the mesh
     // carries the longer ones' height).
     if (os_on()) {
-        let os_w = os_weight(xz, bi.fallback_z, world_pos.y);
+        let os_w = os_column(bi.fallback_z, shore) * os_reach(os_at.xz, os_at.y);
         if (os_w > 0.0) {
-            let os = os_wave(xz, 0.0, pv_fr.major);
-            surf = os_surface(surf, os.yz * os_w, saturate(os.x * os_w / 1.2));
+            let os = os_wave(os_at.xz, pv_fr.major);
+            surf = os_surface(surf, os.yz * os_w, saturate(os.x * os_w / 2.5));
         }
     }
     // Held across the tiers to the composite in five words.
@@ -9448,6 +9457,10 @@ fn pv_surface_height(xz: vec2<f32>, flow: vec2<f32>, shore: f32, depth_yd: f32, 
 // stays where the reference draws it; calm round the eye when it is low over the water and round
 // the swimmer, whose game height is the flat sea's; gone by `OS_FAR` from the eye. The reference's
 // sea is a flat sheet.
+//
+// The height is taken at the liquid lattice's corners and blended across the cell
+// ([`os_lattice_height`]), so a fine cell's edge and a coarse one's are the same straight line
+// and no chunk shows a crack against its neighbour, whatever grid either draws.
 
 /// The trains: wavelength in yards, slope amplitude a·k, the second harmonic's share, and whole
 /// turns an hour (so nothing jumps when `globals.time` wraps): the deep-water periods
@@ -9455,59 +9468,104 @@ fn pv_surface_height(xz: vec2<f32>, flow: vec2<f32>, shore: f32, depth_yd: f32, 
 const OS_N: i32 = 5;
 const OS_FAR: vec2<f32> = vec2<f32>(350.0, 700.0);
 /// The authored column, yards, over which the swell grows from nothing to whole.
-const OS_DEPTH_YD: vec2<f32> = vec2<f32>(1.5, 12.0);
+const OS_DEPTH_YD: vec2<f32> = vec2<f32>(2.0, 16.0);
+/// The trains that raise the surface, longest first: a shorter one (22 yd) is under six of the
+/// lattice's cells a wave and tilts the light only.
+const OS_RAISED: i32 = 4;
 /// What the swimmer keeps of it, and the lever on the whole.
-const OS_AVATAR_KEEP: f32 = 0.35;
+const OS_AVATAR_KEEP: f32 = 0.15;
 const OS_GAIN: f32 = 1.0;
 /// The reflections' lookup takes at most this much of the swell's slope, so a mirror is bent and
 /// not torn.
 const OS_RF_MAX: f32 = 0.12;
 
+/// The fragment's risen point for the swell's slope, set by the fragment stage before the look
+/// runs: xz where the surface really is (the look's own terms read the mean level's point, which
+/// at a grazing view lies yards from it) and y the flat sea's level.
+var<private> os_at: vec3<f32>;
+
+/// Whether a facet seen from above is the rasteriser's front face (the lattice's winding).
+const OS_FACE_UP: bool = true;
+
 fn os_on() -> bool {
     return pv_on(PV_WAVES) && w.kind.y > 0.5 && w.path.x < 0.5 && w.kind.x < 0.5 && w.path.y > 0.5;
 }
 
-/// How much of the swell stands at `xz`, over an authored column of `column_yd`, on a sea whose
-/// flat level is `y_flat`: every factor is the world's or the column's, so the two stages agree.
-fn os_weight(xz: vec2<f32>, column_yd: f32, y_flat: f32) -> f32 {
+/// How much of the swell stands at `xz` on a sea whose flat level is `y_flat`, the column
+/// aside: every factor is the world's, so the two stages and every mesh agree.
+fn os_reach(xz: vec2<f32>, y_flat: f32) -> f32 {
     let eye = view.world_position.xyz;
     let d = distance(xz, eye.xz);
-    var k = OS_GAIN * (0.8 + 0.5 * pv_sea())
-        * smoothstep(OS_DEPTH_YD.x, OS_DEPTH_YD.y, column_yd)
-        * (1.0 - smoothstep(OS_FAR.x, OS_FAR.y, d));
+    var k = OS_GAIN * (0.8 + 0.5 * pv_sea()) * (1.0 - smoothstep(OS_FAR.x, OS_FAR.y, d));
     if (water_reflect.sim.z > 0.0) {
         let avatar = water_reflect.sim.xy + vec2<f32>(0.5 / water_reflect.sim.z);
-        k = k * mix(OS_AVATAR_KEEP, 1.0, smoothstep(4.0, 30.0, distance(xz, avatar)));
+        k = k * mix(OS_AVATAR_KEEP, 1.0, smoothstep(6.0, 45.0, distance(xz, avatar)));
     }
-    let low = 1.0 - smoothstep(0.75, 3.0, abs(eye.y - y_flat));
-    return k * (1.0 - low * (1.0 - smoothstep(6.0, 18.0, d)));
+    let low = 1.0 - smoothstep(1.5, 6.0, abs(eye.y - y_flat));
+    return k * (1.0 - low * (1.0 - smoothstep(8.0, 30.0, d)));
 }
 
-/// The trains at `xz`: x the height in yards, yz the slope as the fragment carries it (the normal
-/// is `(s.x, 1, s.y)`, the height `-∫s`). A train shorter than `min_l` yards gives no height (the
-/// mesh there cannot carry it), one whose wave spans under `fp` yards times a few pixels no slope.
-fn os_wave(xz: vec2<f32>, min_l: f32, fp: f32) -> vec3<f32> {
-    var lambda = array<f32, 5>(120.0, 78.0, 52.0, 34.0, 22.0);
-    var dir = array<vec2<f32>, 5>(
-        vec2<f32>(0.6, 0.8),
-        vec2<f32>(0.3399, 0.9405),
-        vec2<f32>(0.8649, 0.5019),
-        vec2<f32>(-0.0197, 0.9998),
-        vec2<f32>(0.9899, 0.1414),
-    );
-    var slope = array<f32, 5>(0.055, 0.060, 0.062, 0.062, 0.058);
-    var stokes = array<f32, 5>(0.30, 0.26, 0.22, 0.18, 0.15);
-    var turns = array<f32, 5>(430.0, 533.0, 652.0, 807.0, 1003.0);
-    var o = vec3<f32>(0.0);
+/// The authored column's share, `column_yd` yards of water, and the waterline's, `shore_yd`
+/// yards off (the mesh's distance stops at 24): no crest stands against a steep island's bank.
+fn os_column(column_yd: f32, shore_yd: f32) -> f32 {
+    return smoothstep(OS_DEPTH_YD.x, OS_DEPTH_YD.y, column_yd) * smoothstep(5.0, 23.0, shore_yd);
+}
+
+const OS_LAMBDA: array<f32, 5> = array<f32, 5>(120.0, 78.0, 52.0, 34.0, 22.0);
+const OS_DIR: array<vec2<f32>, 5> = array<vec2<f32>, 5>(
+    vec2<f32>(0.6, 0.8),
+    vec2<f32>(0.3399, 0.9405),
+    vec2<f32>(0.8649, 0.5019),
+    vec2<f32>(-0.0197, 0.9998),
+    vec2<f32>(0.9899, 0.1414),
+);
+const OS_SLOPE: array<f32, 5> = array<f32, 5>(0.095, 0.100, 0.100, 0.095, 0.075);
+const OS_STOKES: array<f32, 5> = array<f32, 5>(0.30, 0.26, 0.22, 0.18, 0.15);
+const OS_TURNS: array<f32, 5> = array<f32, 5>(430.0, 533.0, 652.0, 807.0, 1003.0);
+
+/// One train's phase at `xz`, radians.
+fn os_theta(xz: vec2<f32>, i: i32) -> f32 {
+    return TAU * fract(dot(xz, OS_DIR[i]) / OS_LAMBDA[i] - fract(globals.time * OS_TURNS[i] / 3600.0));
+}
+
+/// The raised trains' height at `xz`, yards, at full reach.
+fn os_height(xz: vec2<f32>) -> f32 {
+    var h = 0.0;
+    for (var i = 0; i < OS_RAISED; i = i + 1) {
+        let th = os_theta(xz, i);
+        h = h + OS_SLOPE[i] * OS_LAMBDA[i] / TAU * (cos(th) + 0.5 * OS_STOKES[i] * cos(2.0 * th));
+    }
+    return h;
+}
+
+/// The height a vertex at `xz` takes: the reach times the height at its lattice cell's four
+/// corners (whole multiples of [`PV_HEIGHT_CELL`], Bevy XZ), blended across the cell.
+fn os_lattice_height(xz: vec2<f32>, y_flat: f32) -> f32 {
+    let g = xz / PV_HEIGHT_CELL;
+    let c = floor(g);
+    let f = g - c;
+    let p00 = c * PV_HEIGHT_CELL;
+    let p10 = (c + vec2<f32>(1.0, 0.0)) * PV_HEIGHT_CELL;
+    let p01 = (c + vec2<f32>(0.0, 1.0)) * PV_HEIGHT_CELL;
+    let p11 = (c + vec2<f32>(1.0, 1.0)) * PV_HEIGHT_CELL;
+    let h00 = os_reach(p00, y_flat) * os_height(p00);
+    let h10 = os_reach(p10, y_flat) * os_height(p10);
+    let h01 = os_reach(p01, y_flat) * os_height(p01);
+    let h11 = os_reach(p11, y_flat) * os_height(p11);
+    return mix(mix(h00, h10, f.x), mix(h01, h11, f.x), f.y);
+}
+
+/// The trains at `xz` for the fragment: x the raised height in yards, yz the slope as it carries
+/// it (the normal is `(s.x, 1, s.y)`, the height `-∫s`). A train whose wave spans under a few of
+/// the pixel's `fp` yards gives no slope.
+fn os_wave(xz: vec2<f32>, fp: f32) -> vec3<f32> {
+    var o = vec3<f32>(os_height(xz), 0.0, 0.0);
     for (var i = 0; i < OS_N; i = i + 1) {
-        let l = lambda[i];
-        let th = TAU * fract(dot(xz, dir[i]) / l - fract(globals.time * turns[i] / 3600.0));
-        let tall = smoothstep(min_l, 1.25 * min_l, l);
-        o.x = o.x + tall * slope[i] * l / TAU * (cos(th) + 0.5 * stokes[i] * cos(2.0 * th));
-        let keep = smoothstep(2.0, 6.0, l / max(fp, 1e-4));
-        let sl = slope[i] * keep * (sin(th) + stokes[i] * sin(2.0 * th));
-        o.y = o.y + dir[i].x * sl;
-        o.z = o.z + dir[i].y * sl;
+        let th = os_theta(xz, i);
+        let keep = smoothstep(2.0, 6.0, OS_LAMBDA[i] / max(fp, 1e-4));
+        let sl = OS_SLOPE[i] * keep * (sin(th) + OS_STOKES[i] * sin(2.0 * th));
+        o.y = o.y + OS_DIR[i].x * sl;
+        o.z = o.z + OS_DIR[i].y * sl;
     }
     return o;
 }
@@ -9648,17 +9706,13 @@ fn vertex(in: LiquidVertex) -> LiquidVsOut {
         }
     }
 #ifndef WATER_TIER_LOW
-    // benilla-gamepad fork: the open sea's swell, whatever the distance. Past the fine ring only
-    // the trains the coarse grid can carry (30 yd and longer) raise it.
+    // benilla-gamepad fork: the open sea's swell, whatever the distance, on the lattice's corners.
     if (os_on()) {
         let xz = out.world_position.xz;
         let y_flat = out.world_position.y - out.height;
-        let column = clamp(out.depth, 0.0, 1.0) * REF_OCEAN_V_YD;
-        let wgt = os_weight(xz, column, y_flat);
+        let wgt = os_column(clamp(out.depth, 0.0, 1.0) * REF_OCEAN_V_YD, out.shore);
         if (wgt > 0.0) {
-            let d = distance(xz, view.world_position.xz);
-            let min_l = mix(14.0, 30.0, smoothstep(PV_HEIGHT_NEAR, PV_HEIGHT_FAR, d));
-            let h = wgt * os_wave(xz, min_l, 0.0).x;
+            let h = wgt * os_lattice_height(xz, y_flat);
             out.height = out.height + h;
             out.world_position.y = out.world_position.y + h;
             out.clip_position = position_world_to_clip(out.world_position.xyz);
@@ -9710,7 +9764,16 @@ fn swatch_at(shallow: vec4<f32>, deep: vec4<f32>, v: f32, ocean: bool) -> vec4<f
 // The glow store is a side effect: without the forced early test, water behind a hill would add.
 @early_depth_test(force)
 #endif
-fn fragment(in: LiquidVsOut) -> @location(0) vec4<f32> {
+fn fragment(in: LiquidVsOut, @builtin(front_facing) os_face: bool) -> @location(0) vec4<f32> {
+#ifdef WATER_PREVIEW
+    // benilla-gamepad fork: from over the sea, a facet of the swell seen from underneath is a
+    // crest's far side and stands behind its near one; water blends without a depth write, so it
+    // would show through.
+    if (OS_FACE_UP != os_face && in.height != 0.0 && os_on()
+        && view.world_position.y > in.world_position.y - in.height + 0.25) {
+        discard;
+    }
+#endif
     // The far-clip wall, as terrain and models: discard beyond `fog_params.w` (0 disables it).
     if (wow_light.fog_params.w > 0.0) {
         let clip_z = -(view.view_from_world * vec4<f32>(in.world_position.xyz, 1.0)).z;
@@ -9793,6 +9856,9 @@ fn fragment(in: LiquidVsOut) -> @location(0) vec4<f32> {
         // silhouette the risen points jump, and every footprint the terms take from screen
         // derivatives would flash along the crest; the ray's point on the level moves smoothly.
         var wp_mean = in.world_position.xyz;
+#ifdef WATER_PREVIEW
+        os_at = in.world_position.xyz - vec3<f32>(0.0, in.height, 0.0);
+#endif
         if (in.height != 0.0) {
             let eye = view.world_position.xyz;
             let ray = in.world_position.xyz - eye;
