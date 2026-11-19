@@ -16,10 +16,13 @@ pub struct ChainEntry {
     pub size: u64,
 }
 
-/// A priority-ordered patch chain of MPQ archives (`Send + Sync`; reads are `&self` and lock-free).
+/// A priority-ordered patch chain of MPQ archives (`Send + Sync`; reads are `&self`).
 pub struct Chain {
     /// Ascending priority: later archives win.
     archives: Vec<Archive>,
+    /// benilla-gamepad fork: per overridden model name, the archive index [`Chain::resolve`]
+    /// settled on ([`Chain::loadable_model`]).
+    model_pick: std::sync::Mutex<std::collections::HashMap<String, usize>>,
     /// The locale the chain's `Wow.ini` names, read once at open as start-up reads it once.
     locale: Locale,
 }
@@ -109,6 +112,7 @@ impl Chain {
         }
         let mut chain = Self {
             archives,
+            model_pick: Default::default(),
             locale: Locale::default(),
         };
         chain.locale = crate::wow_ini::client_locale(&chain);
@@ -145,8 +149,59 @@ impl Chain {
 
     /// The highest-priority archive with an entry for `name`, a delete marker included, as a
     /// tombstone shadows every lower copy: check [`Archive::is_delete_marker`] for a readable file.
+    ///
+    /// Deviation (benilla-gamepad fork): a `.m2` that an archive overrides with a model this
+    /// client cannot load (not `MD20`, or not version 256 to 263: an HD pack's later-format file,
+    /// which 1.12 refuses too) reads from the highest archive below it whose copy loads, so the
+    /// creature draws its original model instead of nothing. A name held by one archive, and
+    /// every stock install, resolves as before.
     fn resolve(&self, name: &str) -> Option<&Archive> {
-        self.archives.iter().rev().find(|a| a.contains(name))
+        let top = self.archives.iter().rposition(|a| a.contains(name))?;
+        let is_model = name
+            .len()
+            .checked_sub(3)
+            .and_then(|i| name.get(i..))
+            .is_some_and(|ext| ext.eq_ignore_ascii_case(".m2"));
+        if !is_model
+            || self.archives[top].is_delete_marker(name)
+            || !self.archives[..top].iter().any(|a| a.contains(name))
+        {
+            return Some(&self.archives[top]);
+        }
+        let key = name.replace('/', "\\").to_ascii_lowercase();
+        if let Some(i) = self
+            .model_pick
+            .lock()
+            .ok()
+            .and_then(|m| m.get(&key).copied())
+        {
+            return self.archives.get(i);
+        }
+        let pick = (0..=top)
+            .rev()
+            .filter(|&i| self.archives[i].contains(name))
+            .take_while(|&i| !self.archives[i].is_delete_marker(name))
+            .find(|&i| Self::loadable_model(&self.archives[i], name))
+            .unwrap_or(top);
+        if let Ok(mut m) = self.model_pick.lock() {
+            m.insert(key, pick);
+        }
+        self.archives.get(pick)
+    }
+
+    /// Whether `archive`'s copy of the model `name` opens with the header this client parses:
+    /// `MD20`, version 256 to 263 (`benilla_m2::parse_m2`'s gate).
+    fn loadable_model(archive: &Archive, name: &str) -> bool {
+        use std::io::Read;
+        let mut head = [0u8; 8];
+        let Ok(mut file) = archive.open_file(name) else {
+            return false;
+        };
+        if file.read_exact(&mut head).is_err() {
+            return false;
+        }
+        let version = u32::from_le_bytes([head[4], head[5], head[6], head[7]]);
+        &head[..4] == b"MD20" && (256..=263).contains(&version)
     }
 
     /// Whether `name` (`/` or `\`, any case) is a readable file, not a delete marker.

@@ -99,6 +99,20 @@ struct ModelRow {
     death_thud_shake: u32,
 }
 
+impl ModelRow {
+    /// `modelScale` as a factor. Deviation (benilla-gamepad fork): a row whose `modelScale` is 0
+    /// counts as 1. No stock row is 0; an HD pack's added rows are, and the reference draws their
+    /// units all the same, since `OBJECT_FIELD_SCALE_X` alone scales a unit (`0x613ef0`). Read
+    /// as 0 the display resolved to no model at all.
+    fn world_scale(&self) -> f32 {
+        if self.scale == 0.0 {
+            1.0
+        } else {
+            self.scale
+        }
+    }
+}
+
 /// A footprint decal: the `FootprintTextures.dbc` key and the print size in yards (length along
 /// the facing, width across), before the unit's scale.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -262,7 +276,7 @@ impl CreatureCatalog {
     pub fn model_scale(&self, display_id: u32) -> Option<f32> {
         let row = self.display.get(&display_id)?;
         let model = self.models.get(&row.model_id)?;
-        Some(model.scale * row.scale)
+        Some(model.world_scale() * row.scale)
     }
 
     /// `CreatureModelAlpha / 255`, the first factor of the unit alpha product.
@@ -322,7 +336,7 @@ impl CreatureCatalog {
             .flatten();
         Some(CreatureModel {
             model_path: model.path.clone(),
-            scale: model.scale * row.scale,
+            scale: model.world_scale() * row.scale,
             textures: row.textures.clone(),
             npc_appearance,
             blood_display: row.blood_level as i32,
