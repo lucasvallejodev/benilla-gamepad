@@ -2378,7 +2378,6 @@ fn every_row_tooltip_key_resolves_in_the_real_global_strings() {
             ("BENILLA_TOOLTIP_AUTO_EXPOSURE", "GraphicsRowAutoExposure"),
             ("BENILLA_TOOLTIP_GRASS_DISTANCE", "GraphicsRowGrassDistance"),
             ("BENILLA_TOOLTIP_LOOK_QUALITY", "GraphicsRowLookQuality"),
-            ("BENILLA_TOOLTIP_SUN_SHADOWS", "GraphicsRowSunShadows"),
             (
                 "BENILLA_TOOLTIP_AMBIENT_OCCLUSION",
                 "GraphicsRowAmbientOcclusion",
@@ -2406,10 +2405,10 @@ fn every_row_tooltip_key_resolves_in_the_real_global_strings() {
         );
         checked += 1;
     }
-    // 91 rows less the three untipped below; eleven of the 88 carry a `BENILLA_` key (two of them
+    // 90 rows less the three untipped below; ten of the 87 carry a `BENILLA_` key (two of them
     // the benilla-gamepad fork's Modern look rows), and a dropdown row is checked on the key it
     // wears at rest.
-    assert_eq!(checked, 88, "every tipped row carries a live key");
+    assert_eq!(checked, 87, "every tipped row carries a live key");
     assert_eq!(
         untipped,
         vec![
@@ -2506,7 +2505,7 @@ fn every_flavor_of_row_raises_its_plate_from_the_page_it_lives_on() {
         );
     }
     // Every tipped row: the same 86 the key census counts.
-    assert_eq!(raised, 88, "every row but Auto Loot raises a description");
+    assert_eq!(raised, 87, "every row but Auto Loot raises a description");
 }
 
 /// 1.12's AdvancedOptionsCombatText box as saved-global rows: a click writes the global, never a

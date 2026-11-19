@@ -1649,10 +1649,6 @@ mod tests {
             benilla_world::modern::look::AutoExposure::default().0
         );
         assert_eq!(
-            d["sunShadows"] != 0.0,
-            benilla_world::modern::sun_shadow::SunShadows::default().0
-        );
-        assert_eq!(
             d["ambientOcclusion"] != 0.0,
             benilla_world::modern::look::CreaseShade::default().0
         );
@@ -1892,11 +1888,6 @@ mod tests {
             for (value, want) in [("0", false), ("1", true)] {
                 apply(&mut app, "autoExposure", value);
                 assert_eq!(res::<AutoExposure>(&app).0, want);
-                apply(&mut app, "sunShadows", value);
-                assert_eq!(
-                    res::<benilla_world::modern::sun_shadow::SunShadows>(&app).0,
-                    want
-                );
                 apply(&mut app, "ambientOcclusion", value);
                 assert_eq!(
                     res::<benilla_world::modern::look::CreaseShade>(&app).0,
@@ -2964,7 +2955,6 @@ mod tests {
             .insert_resource(benilla_world::modern::LookModel::Modern)
             .init_resource::<benilla_world::modern::LookQuality>()
             .init_resource::<benilla_world::modern::look::AutoExposure>()
-            .init_resource::<benilla_world::modern::sun_shadow::SunShadows>()
             .init_resource::<benilla_world::modern::look::CreaseShade>()
             .init_resource::<benilla_world::particles::ParticleTuning>()
             .init_resource::<crate::video::SpellEffectLevel>()

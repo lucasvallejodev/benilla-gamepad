@@ -909,14 +909,6 @@ pub(crate) const REGISTERED: &[Registered] = &[
         "1",
         "the fork's own — the reference's exposure never moves",
     ),
-    // benilla-gamepad fork: the Modern look's sun shadows, a shadow map drawn from the visible sun
-    // (`benilla_world::modern::sun_shadow::SunShadows`). `$WOW_SUN_SHADOWS` overrides it for the
-    // session.
-    ours(
-        "sunShadows",
-        "1",
-        "the fork's own — the reference shadows a unit with a blob and the ground with baked maps",
-    ),
     // benilla-gamepad fork: the Modern look's ambient occlusion, the darkening of creases and
     // contact corners (`benilla_world::modern::look::CreaseShade`). `$WOW_LOOK_AO` overrides it.
     ours(

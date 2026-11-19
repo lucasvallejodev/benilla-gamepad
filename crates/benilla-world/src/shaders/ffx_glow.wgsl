@@ -1302,23 +1302,12 @@ struct FfxUwBlock {
 // benilla-gamepad fork: the crease shade's half-size image (`fs_mfx_ao`): r the open share, g the
 // view Z it was taken at. The depth stands in, unread, while `ffx.look.w` is under 2.
 @group(0) @binding(10) var mfx_ao_tex: texture_2d<f32>;
-// benilla-gamepad fork: the sun's shadow map (`modern::sun_shadow`): the depth a camera at the
-// lighting sun drew (reverse Z), its compare sampler and its block.
-struct SunLanes {
-    clip_from_world: mat4x4<f32>,
-    // xyz the direction to the sun, w the strength (0 while the map does not run).
+// benilla-gamepad fork: the sun in the air (`modern::sun_air`): xyz the direction to the visible
+// sun, w the hour's share of its haze and shafts (0 at night and in a frame without the block).
+struct SunAir {
     sun: vec4<f32>,
-    // rgb the ambient colour (gamma, as the lighting adds it), w the map's texel in yards.
-    ambient: vec4<f32>,
-    // rgb the sun's diffuse colour, w the visible sun's true height (its direction's y).
-    diffuse: vec4<f32>,
-    // xyz the direction to the lighting sun, whose share of the light a shadow takes; w the
-    // hour's share of the sun's haze and shafts (0 at night and in a frame without the block).
-    light: vec4<f32>,
 };
-@group(0) @binding(11) var sun_map: texture_depth_2d;
-@group(0) @binding(12) var sun_samp: sampler_comparison;
-@group(0) @binding(13) var<uniform> sun_lanes: SunLanes;
+@group(0) @binding(11) var<uniform> sun_air: SunAir;
 #endif
 #endif
 
@@ -1554,10 +1543,6 @@ const MFX_DOF_SKY: f32 = 0.25;
 const MFX_HAZE: vec2<f32> = vec2<f32>(0.34, 300.0);
 /// Toward the sun the haze takes this much of the sun's colour and grows by this much.
 const MFX_HAZE_SUN: vec2<f32> = vec2<f32>(0.6, 0.9);
-/// The shadow camera's near plane in yards (`modern::sun_shadow`), and what a far caster's shade
-/// keeps of its strength.
-const MFX_SUN_NEAR: f32 = 20.0;
-const MFX_SUN_FAR_KEEP: f32 = 0.55;
 /// The light shafts: their strength and their taps toward the sun.
 const MFX_SHAFT: f32 = 0.3;
 const MFX_SHAFT_TAPS: i32 = 20;
@@ -1693,156 +1678,10 @@ fn mfx_dof(uv: vec2<f32>, p: vec2<f32>, sg: vec3<f32>, z: f32) -> vec3<f32> {
     return sum / w;
 }
 
-/// The contact shadow: its reach toward the sun in yards (growing with the view distance), its
-/// steps, its strength at full daylight, and the view distances it fades out over.
-const MFX_SUN_ON: bool = false;
-const MFX_SUN_REACH_YD: f32 = 2.4;
-const MFX_SUN_STEPS: i32 = 28;
-const MFX_SUN_STRENGTH: f32 = 0.38;
-const MFX_SUN_FADE_YD: vec2<f32> = vec2<f32>(70.0, 130.0);
-
-/// Interleaved gradient noise in [0, 1) at pixel `p`: the march's start offset, so its steps do
-/// not band.
+/// Interleaved gradient noise in [0, 1) at pixel `p`: the shaft taps' offset, so they do not
+/// band.
 fn mfx_noise(p: vec2<f32>) -> f32 {
     return fract(52.9829189 * fract(dot(p, vec2<f32>(0.06711056, 0.00583715))));
-}
-
-/// The lighting sun's contact shadow at the world point `pw` behind the pixel at view Z `z`
-/// (1 lit, lower shadowed): a short march toward the sun through the depth image, each step
-/// projected back to the screen; a step behind something not much nearer than itself is in its
-/// shadow. Short-range only (a character's feet, grass, a fence, a wall's foot): what is off the
-/// screen or far from the receiver casts nothing. `frag` is the pixel, for the noise.
-fn mfx_sun_shadow(pw: vec3<f32>, z: f32, frag: vec2<f32>) -> f32 {
-    let u = uwb.u;
-    let day = smoothstep(0.08, 0.6, u.cam_up.w);
-    let fade = (1.0 - smoothstep(MFX_SUN_FADE_YD.x, MFX_SUN_FADE_YD.y, z)) * day;
-    if (z <= 0.0 || fade <= 0.0) {
-        return 1.0;
-    }
-    let sxz = u.sun_refr.xz * WU_ETA;
-    let sun = normalize(vec3<f32>(sxz.x, sqrt(max(1.0 - dot(sxz, sxz), 1e-6)), sxz.y));
-    let tan_h = length(u.cam_right.xyz);
-    let tan_v = length(u.cam_up.xyz);
-    let right = u.cam_right.xyz / max(tan_h, 1e-5);
-    let up = u.cam_up.xyz / max(tan_v, 1e-5);
-    let dd = vec2<f32>(textureDimensions(uw_depth));
-    let reach = MFX_SUN_REACH_YD * (1.0 + z / 40.0);
-    let step = reach / f32(MFX_SUN_STEPS);
-    let bias = 0.03 + 0.012 * z;
-    var shade = 0.0;
-    // A step is finer than a limb (under 0.15 yd near the eye), or the march lays the caster's
-    // outline down once a step: a row of copies. The start is jittered by a whole step.
-    var q = pw + sun * (step * (0.4 + mfx_noise(frag)));
-    for (var k = 0; k < MFX_SUN_STEPS; k = k + 1) {
-        let v = q - u.cam_pos.xyz;
-        let zc = dot(v, u.cam_fwd.xyz);
-        if (zc <= u.cam_pos.w) {
-            break;
-        }
-        let ndc = vec2<f32>(dot(v, right) / (zc * tan_h), dot(v, up) / (zc * tan_v));
-        if (any(abs(ndc) >= vec2<f32>(1.0))) {
-            break;
-        }
-        let zs = mfx_depth((vec2<f32>(ndc.x, -ndc.y) * 0.5 + 0.5) * dd);
-        let behind = zc - zs;
-        // Behind the depth by more than the bias, but not by so much that the occluder is some
-        // far thing in front of the whole scene.
-        if (zs > 0.0 && behind > bias && behind < 0.6 + 0.6 * reach) {
-            shade = 1.0 - f32(k) / f32(MFX_SUN_STEPS) * 0.6;
-            break;
-        }
-        q = q + sun * step;
-    }
-    return 1.0 - MFX_SUN_STRENGTH * fade * shade;
-}
-
-/// The world-space normal of the surface under depth pixel `p` at view Z `z`, from the depth's
-/// nearer neighbour on each axis (so it does not lean across a silhouette).
-fn mfx_normal(p: vec2<f32>, z: f32, dd: vec2<f32>) -> vec3<f32> {
-    let u = uwb.u;
-    let tan_hv = vec2<f32>(length(u.cam_right.xyz), length(u.cam_up.xyz));
-    let pc = floor(p) + vec2<f32>(0.5);
-    let p0 = mfx_view_pos(pc, z, dd, tan_hv);
-    let zl = mfx_depth(pc - vec2<f32>(1.0, 0.0));
-    let zr = mfx_depth(pc + vec2<f32>(1.0, 0.0));
-    let zu = mfx_depth(pc - vec2<f32>(0.0, 1.0));
-    let zd = mfx_depth(pc + vec2<f32>(0.0, 1.0));
-    var dx = mfx_view_pos(pc + vec2<f32>(1.0, 0.0), zr, dd, tan_hv) - p0;
-    if (zr <= 0.0 || (zl > 0.0 && abs(zl - z) < abs(zr - z))) {
-        dx = p0 - mfx_view_pos(pc - vec2<f32>(1.0, 0.0), zl, dd, tan_hv);
-    }
-    var dy = mfx_view_pos(pc + vec2<f32>(0.0, 1.0), zd, dd, tan_hv) - p0;
-    if (zd <= 0.0 || (zu > 0.0 && abs(zu - z) < abs(zd - z))) {
-        dy = p0 - mfx_view_pos(pc - vec2<f32>(0.0, 1.0), zu, dd, tan_hv);
-    }
-    var n = normalize(cross(dy, dx) + vec3<f32>(0.0, 0.0, -1e-9));
-    if (dot(n, p0) > 0.0) {
-        n = -n;
-    }
-    return normalize(
-        u.cam_right.xyz / max(tan_hv.x, 1e-5) * n.x + u.cam_up.xyz / max(tan_hv.y, 1e-5) * n.y
-            + u.cam_fwd.xyz * n.z,
-    );
-}
-
-/// The sun's shadow on the world point `pw` whose surface faces `n` (what to multiply the picture
-/// by; 1 lit): nine compares of the shadow map round the point's place in it. The reference lights
-/// a surface `ambient + diffuse * n.l` from the lighting sun, so where the sun does not reach, the
-/// ambient's share of that is what stays: a surface turned from the lighting sun loses nothing,
-/// and a weak diffuse casts next to nothing. The point is pushed off its surface by a few texels,
-/// more at a grazing sun, so a surface does not shadow itself.
-fn mfx_sun_map(pw: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
-    let s = sun_lanes;
-    // A card of grass or leaves is lit by its authored normal, not the face the depth shows:
-    // never less than a share of what level ground takes.
-    let ndl = max(dot(n, s.light.xyz), 0.45 * s.light.y);
-    if (s.sun.w <= 0.0 || ndl <= 0.0) {
-        return vec3<f32>(1.0);
-    }
-    let texel = s.ambient.w;
-    let graze = 1.0 - saturate(dot(n, s.sun.xyz));
-    let q = pw + n * texel * (2.0 + 4.0 * graze) + s.sun.xyz * texel * 2.0;
-    let c4 = s.clip_from_world * vec4<f32>(q, 1.0);
-    if (c4.w <= 0.0) {
-        return vec3<f32>(1.0);
-    }
-    let c = c4.xyz / c4.w;
-    let edge = max(abs(c.x), abs(c.y));
-    let fade = (1.0 - smoothstep(0.84, 0.98, edge)) * s.sun.w;
-    if (fade <= 0.0 || c.z <= 0.0 || c.z >= 1.0) {
-        return vec3<f32>(1.0);
-    }
-    let uv = vec2<f32>(c.x, -c.y) * 0.5 + vec2<f32>(0.5);
-    let px = 1.0 / vec2<f32>(textureDimensions(sun_map));
-    var lit = 0.0;
-    for (var j = -1; j <= 1; j = j + 1) {
-        for (var i = -1; i <= 1; i = i + 1) {
-            lit = lit + textureSampleCompareLevel(sun_map, sun_samp, uv + vec2<f32>(f32(i), f32(j)) * px * 1.25, c.z);
-        }
-    }
-    // A caster far up the ray (a tree's crown, a tower) shades less than one close by (a
-    // character, a fence, an eave): its light is scattered and leaks through, and a wood or a
-    // street under full shade would otherwise go dull. The camera is a reverse-Z long lens whose
-    // near plane is `MFX_SUN_NEAR`, so a depth is that over the view distance.
-    let md = vec2<i32>(textureDimensions(sun_map));
-    let stored = textureLoad(sun_map, clamp(vec2<i32>(uv * vec2<f32>(md)), vec2<i32>(0), md - vec2<i32>(1)), 0);
-    let gap = MFX_SUN_NEAR / max(c.z, 1e-5) - MFX_SUN_NEAR / max(stored, 1e-5);
-    let far_caster = mix(1.0, MFX_SUN_FAR_KEEP, smoothstep(6.0, 30.0, gap));
-    let shade = (1.0 - lit / 9.0) * fade * far_caster;
-    var keep = s.ambient.rgb / max(s.ambient.rgb + s.diffuse.rgb * ndl, vec3<f32>(1e-3));
-    // Half the hue shift: the whole of it reads as a blue wash under a warm sun.
-    keep = mix(keep, vec3<f32>(dot(keep, vec3<f32>(0.299, 0.587, 0.114))), 0.5);
-    return mix(vec3<f32>(1.0), keep, shade);
-}
-
-/// The direction to the visible sun, at its true height on the casting sun's bearing. Only while
-/// `sun_lanes.light.w` is set.
-fn mfx_to_sun() -> vec3<f32> {
-    let s = sun_lanes;
-    let level = normalize(s.sun.xz + vec2<f32>(1e-6, 0.0));
-    let y = clamp(s.diffuse.w, -1.0, 1.0);
-    let c = sqrt(max(1.0 - y * y, 0.0));
-    return vec3<f32>(level.x * c, y, level.y * c);
 }
 
 /// The light shafts at `uv` along the view ray `rd` (0 none): how much open sky lies between the
@@ -1851,11 +1690,11 @@ fn mfx_to_sun() -> vec3<f32> {
 /// far off the screen there are none. `frag` is the pixel, for the taps' offset.
 fn mfx_shafts(uv: vec2<f32>, rd: vec3<f32>, frag: vec2<f32>, dd: vec2<f32>) -> f32 {
     let u = uwb.u;
-    let k = sun_lanes.light.w;
+    let k = sun_air.sun.w;
     if (k <= 0.0) {
         return 0.0;
     }
-    let sun = mfx_to_sun();
+    let sun = sun_air.sun.xyz;
     let zc = dot(sun, u.cam_fwd.xyz);
     let toward = saturate(dot(rd, sun));
     if (zc <= 0.03 || toward <= 0.0) {
@@ -1895,20 +1734,12 @@ fn mfx_apply(uv: vec2<f32>, sg: vec3<f32>, z: f32, t_d: f32, rd: vec3<f32>) -> v
         let lum = dot(c, vec3<f32>(0.299, 0.587, 0.114));
         c = c * mix(ao, 1.0, 0.35 * smoothstep(0.55, 0.95, lum));
     }
-    // The sun contact shadows are off: on characters they read worse than the reference's own
-    // blob shadow (the owner's call). `mfx_sun_shadow` stays for a later, better pass.
-    if (MFX_SUN_ON) {
-        c = c * mfx_sun_shadow(u.cam_pos.xyz + rd * t_d, z, p);
-    }
-    if (z > 0.0 && sun_lanes.sun.w > 0.0) {
-        c = c * mfx_sun_map(u.cam_pos.xyz + rd * t_d, mfx_normal(p, z, dd));
-    }
     if (z > 0.0) {
         var haze = MFX_HAZE.x * (1.0 - exp(-t_d / MFX_HAZE.y));
         var haze_c = mix(u.fog_dry.rgb, u.sky_horizon.rgb, 0.4);
-        if (sun_lanes.light.w > 0.0) {
+        if (sun_air.sun.w > 0.0) {
             // Toward the sun the air glows with its colour, and there is more of it.
-            let toward = pow(saturate(dot(rd, mfx_to_sun())), 4.0) * sun_lanes.light.w;
+            let toward = pow(saturate(dot(rd, sun_air.sun.xyz)), 4.0) * sun_air.sun.w;
             haze_c = mix(haze_c, max(haze_c, u.sun_dry.rgb), MFX_HAZE_SUN.x * toward);
             haze = haze * (1.0 + MFX_HAZE_SUN.y * toward);
         }

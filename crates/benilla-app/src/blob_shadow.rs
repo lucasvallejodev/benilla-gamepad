@@ -233,7 +233,6 @@ fn update_shadows(
     images: Res<Assets<Image>>,
     decals: WorldDecal,
     unit_alpha: benilla_world::model_fade::UnitRenderAlpha,
-    sun: Option<Res<benilla_world::modern::sun_shadow::SunShadowLanes>>,
     owners: Query<
         (
             &Transform,
@@ -309,14 +308,7 @@ fn update_shadows(
         }
         // The unit's render alpha from the root, which also tells a pending appear fade (zero)
         // from a settled unit, and carries the first-person fade.
-        // Deviation (benilla-gamepad fork): under the Modern look's sun shadows the unit casts a
-        // real one, and the blob beside it reads as a second shadow; it keeps a third of itself
-        // as the contact shade. The reference draws the blob at the model's alpha alone.
-        let cast = sun
-            .as_deref()
-            .and_then(|l| l.0)
-            .map_or(0.0, |l| l[19].clamp(0.0, 1.0));
-        let alpha = unit_alpha.get(shadow.owner) * (1.0 - 0.67 * cast / 0.8_f32.max(cast));
+        let alpha = unit_alpha.get(shadow.owner);
         if alpha <= 0.0 {
             hide(&mut key, &mut verts);
             continue;
