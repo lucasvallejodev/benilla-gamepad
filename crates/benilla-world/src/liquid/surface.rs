@@ -8,7 +8,6 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use bevy::asset::RenderAssetUsages;
-use bevy::camera::primitives::MeshAabb;
 use bevy::camera::visibility::RenderLayers;
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::pbr::ExtendedMaterial;
@@ -228,10 +227,6 @@ pub(crate) fn prepare_liquids<'a>(
     }
 }
 
-/// How far the open sea's swell can lift or drop a surface, yards (the shader's four raised
-/// trains at their sum, under a full storm).
-const SWELL_BOX_YD: f32 = 8.0;
-
 /// Spawn a tile's prepared surfaces: the cheap half, on the main thread.
 pub(crate) fn spawn_prepared_liquids(
     commands: &mut Commands,
@@ -264,17 +259,6 @@ pub(crate) fn spawn_prepared_liquids(
             continue; // this kind's frames failed to load (warned at setup)
         };
         let foam = !lq.kind.is_fullbright(); // white surf is a water thing
-
-        // benilla-gamepad fork: the shader raises the open sea by its swell (`os_*` in
-        // `liquid.wgsl`), so the box the frustum cull tests is the flat mesh's, taller by the
-        // swell's reach, and held across the fine ring's mesh swaps.
-        let swell_box = (!lq.kind.is_fullbright())
-            .then(|| mesh.compute_aabb())
-            .flatten()
-            .map(|mut b| {
-                b.half_extents.y += SWELL_BOX_YD;
-                b
-            });
         let coarse = meshes.add(mesh);
         let fine = (!lq.kind.is_fullbright())
             .then(|| LiquidFine::new(lq, coarse.clone(), &lattice, &shoreline, planar));
@@ -303,11 +287,6 @@ pub(crate) fn spawn_prepared_liquids(
             commands
                 .entity(*entities.last().expect("just pushed"))
                 .insert(FoamPatch);
-        }
-        if let Some(b) = swell_box {
-            commands
-                .entity(*entities.last().expect("just pushed"))
-                .insert((b, bevy::camera::visibility::NoAutoAabb));
         }
         if let Some(fine) = fine.flatten() {
             commands
