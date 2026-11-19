@@ -190,6 +190,16 @@ impl Default for CreaseShade {
     }
 }
 
+/// How much the bloom grows at full night.
+const NIGHT_GLOW: f32 = 1.5;
+
+/// How much of the night it is, 0 by day to 1 with the visible sun `to_sun` well under the
+/// horizon.
+fn night(to_sun: Vec3) -> f32 {
+    let y = to_sun.normalize_or_zero().y;
+    ((0.02 - y) / 0.14).clamp(0.0, 1.0)
+}
+
 /// The lanes this frame asks for: none in a Classic frame. The first Modern frame takes the lift
 /// whole, so entering the world at night opens on the adapted picture; after it the lift eases.
 fn update_lanes(
@@ -243,7 +253,13 @@ fn update_lanes(
             _ if crease.0 => 2.0,
             _ => 1.0,
         };
-        LookLanes(Some(look.0.lanes(*eye, depth_fx)))
+        let mut out = look.0.lanes(*eye, depth_fx);
+        // At night the lit things (a lamp, a window, a clock's face, a torch) glow wider: the
+        // bloom grows as the visible sun goes under the horizon.
+        if let Some(l) = lighting.as_deref() {
+            out[1] *= 1.0 + NIGHT_GLOW * night(l.celestial_dir);
+        }
+        LookLanes(Some(out))
     } else {
         *adapted = None;
         LookLanes(None)

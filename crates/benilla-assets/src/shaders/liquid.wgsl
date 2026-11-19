@@ -5272,7 +5272,13 @@ fn water_body_optics(
     // leaves it at the authored depth, in its own colours, so a coral bank the artists drew
     // through 15 yd of sea stays readable where the clear water's absorption alone would close
     // over it; the in-scatter gives up what the bed takes back.
-    o.t_bed = select(o.t_bed, max(o.t_bed, vec3<f32>(bi.auth_t)), o.known);
+    // benilla-gamepad fork: that floor lets go between 18 and 40 yd of real column, and past 30
+    // to 50 yd the bed is gone whatever the water's clarity. Held at any depth it showed the fog
+    // on a bed 40 yd down as a pale sheet, cut off along a straight line where the terrain (and
+    // so the known bed) ends out at sea.
+    let auth_keep = 1.0 - smoothstep(18.0, 40.0, o.z);
+    o.t_bed = select(o.t_bed, max(o.t_bed, vec3<f32>(bi.auth_t * auth_keep)), o.known)
+        * (1.0 - smoothstep(30.0, 50.0, o.z));
     o.w_in = min(o.w_in, 1.0 - max(o.t_bed.r, max(o.t_bed.g, o.t_bed.b)));
     // The ramp reads the swatch at the depth the artists coloured, by the swatch's own turbidity,
     // and never deeper than the row 1.12 colours the authored depth with: the sea's byte runs to

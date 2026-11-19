@@ -584,7 +584,7 @@ fn init_pipelines(
                 // benilla-gamepad fork: the sun in the air's block (`modern::sun_air`).
                 (
                     11,
-                    uniform_buffer_sized(false, Some(std::num::NonZero::new(16).unwrap())),
+                    uniform_buffer_sized(false, Some(std::num::NonZero::new(32).unwrap())),
                 ),
             ),
         ),
@@ -768,7 +768,7 @@ struct FfxGlowTextures {
     uw_buf: Buffer,
     /// benilla-gamepad fork: the crease shade's half-size image ([`AO_FORMAT`]).
     ao: CachedTexture,
-    /// benilla-gamepad fork: the sun in the air's 16-byte block (`modern::sun_air`).
+    /// benilla-gamepad fork: the sun in the air's 32-byte block (`modern::sun_air`).
     sun_buf: Buffer,
 }
 
@@ -1001,7 +1001,7 @@ fn prepare_textures(
         });
         let sun_buf = render_device.create_buffer(&BufferDescriptor {
             label: Some("ffx_sun_air"),
-            size: 16,
+            size: 32,
             usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -1412,7 +1412,7 @@ fn uw_bind_group(
     let sun_lanes = world
         .get_resource::<crate::modern::sun_air::SunAirLanes>()
         .and_then(|l| l.0)
-        .unwrap_or([0.0; 4]);
+        .unwrap_or([0.0; 8]);
     world.resource::<RenderQueue>().write_buffer(
         &textures.sun_buf,
         0,

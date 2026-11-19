@@ -1306,6 +1306,8 @@ struct FfxUwBlock {
 // sun, w the hour's share of its haze and shafts (0 at night and in a frame without the block).
 struct SunAir {
     sun: vec4<f32>,
+    // x the mist over the land, 0 clear to 1 thick; yzw spare.
+    air: vec4<f32>,
 };
 @group(0) @binding(11) var<uniform> sun_air: SunAir;
 #endif
@@ -1543,6 +1545,9 @@ const MFX_DOF_SKY: f32 = 0.25;
 const MFX_HAZE: vec2<f32> = vec2<f32>(0.34, 300.0);
 /// Toward the sun the haze takes this much of the sun's colour and grows by this much.
 const MFX_HAZE_SUN: vec2<f32> = vec2<f32>(0.6, 0.9);
+/// The mist: the most of the picture it takes, and its distance scale in yards at full and at
+/// faint mist.
+const MFX_MIST: vec3<f32> = vec3<f32>(1.0, 26.0, 140.0);
 /// The light shafts: their strength and their taps toward the sun.
 const MFX_SHAFT: f32 = 0.3;
 const MFX_SHAFT_TAPS: i32 = 20;
@@ -1726,7 +1731,19 @@ fn mfx_apply(uv: vec2<f32>, sg: vec3<f32>, z: f32, t_d: f32, rd: vec3<f32>) -> v
     let u = uwb.u;
     let dd = vec2<f32>(textureDimensions(uw_depth));
     let p = uv * dd;
-    var c = mfx_dof(uv, p, sg, z);
+    // The sea lies at world height 0 on every map, and the depth under it is the bed's, or none
+    // where the terrain ends: the focus and the haze take the sea's surface there, so open water
+    // is one sheet and not two along the last tile's edge.
+    var z_air = z;
+    var t_air = t_d;
+    if (rd.y < -1e-3 && u.cam_pos.y > 0.0) {
+        let t_sea = u.cam_pos.y / -rd.y;
+        if (t_sea < 4000.0 && (z <= 0.0 || t_sea < t_d - 0.5)) {
+            t_air = t_sea;
+            z_air = t_sea * max(dot(rd, u.cam_fwd.xyz), 1e-3);
+        }
+    }
+    var c = mfx_dof(uv, p, sg, z_air);
     // The crease shade, from its own half-size pass (`fs_mfx_ao`), while `look.w` is 2.
     if (ffx.look.w > 1.5) {
         // Less on what is lit bright: the shade is the sky's light missing, not the sun's.
@@ -1734,8 +1751,8 @@ fn mfx_apply(uv: vec2<f32>, sg: vec3<f32>, z: f32, t_d: f32, rd: vec3<f32>) -> v
         let lum = dot(c, vec3<f32>(0.299, 0.587, 0.114));
         c = c * mix(ao, 1.0, 0.35 * smoothstep(0.55, 0.95, lum));
     }
-    if (z > 0.0) {
-        var haze = MFX_HAZE.x * (1.0 - exp(-t_d / MFX_HAZE.y));
+    if (z_air > 0.0) {
+        var haze = MFX_HAZE.x * (1.0 - exp(-t_air / MFX_HAZE.y));
         var haze_c = mix(u.fog_dry.rgb, u.sky_horizon.rgb, 0.4);
         if (sun_air.sun.w > 0.0) {
             // Toward the sun the air glows with its colour, and there is more of it.
@@ -1745,7 +1762,19 @@ fn mfx_apply(uv: vec2<f32>, sg: vec3<f32>, z: f32, t_d: f32, rd: vec3<f32>) -> v
         }
         c = mix(c, haze_c, min(haze, 0.8));
     }
-    let shaft = mfx_shafts(uv, rd, p, dd);
+    // The mist: a grey veil that takes the middle distance and most of the sky, thinner overhead.
+    let mist = sun_air.air.x;
+    if (mist > 0.0) {
+        let base = mix(u.fog_dry.rgb, u.sky_horizon.rgb, 0.5);
+        let grey = dot(base, vec3<f32>(0.299, 0.587, 0.114));
+        let mist_c = mix(base, vec3<f32>(grey), 0.75) * 1.08;
+        var veil = mist * mix(0.92, 0.55, saturate(rd.y * 1.6));
+        if (z_air > 0.0) {
+            veil = mist * MFX_MIST.x * (1.0 - exp(-t_air / mix(MFX_MIST.z, MFX_MIST.y, mist)));
+        }
+        c = mix(c, mist_c, veil);
+    }
+    let shaft = mfx_shafts(uv, rd, p, dd) * (1.0 - 0.6 * mist);
     if (shaft > 0.0) {
         c = c + u.sun_dry.rgb * (shaft * MFX_SHAFT);
     }
