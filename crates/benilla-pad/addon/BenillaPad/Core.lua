@@ -73,7 +73,12 @@ P.DEFAULTS = {
     followCam = "always",
     -- Interact (X) on a target out of reach walks up to it (the game's Click-to-Move).
     walkToInteract = true,
+    -- Controller vibration on game events (Vibration.lua): "off", "light" or "full".
+    vibration = "full",
 }
+
+-- The vibration setting's strength.
+P.VIBRATION_SCALE = { off = 0, light = 0.5, full = 1 }
 
 local FACES = { A = true, B = true, X = true, Y = true }
 
@@ -482,14 +487,42 @@ function BenillaPad_Resolve(btn, layer)
     return nil
 end
 
--- The pad's mode ("world", "wheel", "menu", "keyboard", "cursor") and the settings generation.
--- This addon's own windows set P.mode; otherwise an open stock window asks for the cursor.
+-- The pad's mode ("world", "wheel", "menu", "keyboard", "cursor"), the settings generation, the
+-- windows' primary-button serial and the rumble serial. This addon's own windows set P.mode;
+-- otherwise an open stock window asks for the cursor.
 function BenillaPad_Mode()
     if P.mode == "world" and P.Cursor and P.Cursor.Wanted() then
         -- The third answer steps when the windows' primary button changes (Cursor.Serial).
-        return "cursor", P.settingsGen, P.Cursor.Serial()
+        return "cursor", P.settingsGen, P.Cursor.Serial(), P.rumbleSerial
     end
-    return P.mode, P.settingsGen, 0
+    return P.mode, P.settingsGen, 0, P.rumbleSerial
+end
+
+-- ── Vibration ──
+-- Lua cannot call into the Rust side: a step waits here and the serial (BenillaPad_Mode's fourth
+-- answer) moves; the Rust side sees it next frame and takes the step with BenillaPad_RumbleTake.
+-- A step replaces the one playing; 0, 0 (or no seconds) stops the motors.
+P.rumbleSerial = 0
+local rumbleLow, rumbleHigh, rumbleSecs = 0, 0, 0
+
+-- low: the strong (left, low-frequency) motor, high: the weak (right) one, each 0..1, for
+-- `seconds`; scaled by the Vibration setting.
+function BenillaPad_Rumble(low, high, seconds)
+    local scale = P.VIBRATION_SCALE[P.Setting("vibration")] or 1
+    low = (tonumber(low) or 0) * scale
+    high = (tonumber(high) or 0) * scale
+    seconds = tonumber(seconds) or 0
+    rumbleLow = math.max(0, math.min(1, low))
+    rumbleHigh = math.max(0, math.min(1, high))
+    rumbleSecs = math.max(0, math.min(5, seconds))
+    P.rumbleSerial = P.rumbleSerial + 1
+    if P.rumbleSerial > 1000000 then
+        P.rumbleSerial = 1
+    end
+end
+
+function BenillaPad_RumbleTake()
+    return rumbleLow, rumbleHigh, rumbleSecs
 end
 
 -- The settings the Rust side applies: deadzone, look speed, invert Y, shoulder zoom, cursor speed.

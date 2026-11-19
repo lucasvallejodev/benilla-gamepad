@@ -194,6 +194,73 @@ fn every_art_reference_is_shipped() {
     }
 }
 
+/// A rumble step is clamped to the motors' 0..1 and a bounded length; silence stops.
+#[test]
+fn a_rumble_step_is_clamped_and_silence_stops() {
+    use bevy::input::gamepad::GamepadRumbleIntensity;
+    use std::time::Duration;
+    let (intensity, length) = crate::rumble_step(0.5, 2.0, 0.25).expect("a step");
+    assert_eq!(
+        intensity,
+        GamepadRumbleIntensity {
+            strong_motor: 0.5,
+            weak_motor: 1.0,
+        }
+    );
+    assert_eq!(length, Duration::from_secs_f32(0.25));
+    let (intensity, length) = crate::rumble_step(-1.0, 0.3, 60.0).expect("a long step");
+    assert_eq!(
+        intensity,
+        GamepadRumbleIntensity {
+            strong_motor: 0.0,
+            weak_motor: 0.3,
+        }
+    );
+    assert_eq!(length, Duration::from_secs_f32(crate::RUMBLE_MAX_SECS));
+    assert!(crate::rumble_step(0.0, 0.0, 1.0).is_none(), "no motor");
+    assert!(crate::rumble_step(1.0, 1.0, 0.0).is_none(), "no length");
+    assert!(
+        crate::rumble_step(1.0, 1.0, -3.0).is_none(),
+        "a negative length"
+    );
+    assert!(
+        crate::rumble_step(f32::NAN, f32::INFINITY, 1.0).is_none(),
+        "not numbers"
+    );
+    assert!(crate::rumble_step(1.0, 1.0, f32::NAN).is_none());
+}
+
+/// `BenillaPad_Rumble` keeps a step scaled by the Vibration setting and moves the serial that
+/// `BenillaPad_Mode` answers fourth; `BenillaPad_RumbleTake` hands the step over.
+#[test]
+fn the_addon_rumble_reaches_the_poll() {
+    let script = loaded();
+    let serial = || {
+        script
+            .eval::<(String, u32, u32, u32)>("return BenillaPad_Mode()")
+            .expect("mode answers")
+            .3
+    };
+    assert_eq!(serial(), 0);
+    let take = |chunk: &str| {
+        script.run(chunk).expect("rumble");
+        script
+            .eval::<(f32, f32, f32)>("return BenillaPad_RumbleTake()")
+            .expect("take answers")
+    };
+    assert_eq!(take("BenillaPad_Rumble(0.8, 2, 0.3)"), (0.8, 1.0, 0.3));
+    assert_eq!(serial(), 1);
+    assert_eq!(
+        take("BenillaPad.SetSetting('vibration', 'light') BenillaPad_Rumble(0.8, 0.4, 9)"),
+        (0.4, 0.2, 5.0)
+    );
+    assert_eq!(
+        take("BenillaPad.SetSetting('vibration', 'off') BenillaPad_Rumble(1, 1, 1)"),
+        (0.0, 0.0, 1.0)
+    );
+    assert_eq!(serial(), 3);
+}
+
 /// The boot VM of the login and character screens has no stock UI, which is how the pad tells
 /// those screens from the world.
 #[test]

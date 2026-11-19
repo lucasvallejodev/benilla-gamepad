@@ -1,22 +1,36 @@
--- The wheels: a ring of round buttons the sticks point at. The window wheel (Start, LT+RT+A)
--- opens game windows and has an emote page; the consumables wheel (LT+RT+X) uses a potion, food,
--- bandage, scroll or weapon oil from the bags. While a wheel is up the Rust side is in "wheel"
--- mode: the sticks arrive as BENILLAPAD_STICK, the buttons as BENILLAPAD_NAV, and the body stays.
+-- The wheels, in the Forever radial's layout: eight wedges round a hub, slot 1 at the top and
+-- clockwise every 45 degrees, pages of eight on LB / RB. The window wheel (Start, LT+RT+A) opens
+-- game windows and has an emote page; the consumables wheel (LT+RT+X) uses a potion, food,
+-- bandage, scroll or weapon oil from the bags; the bot wheel (LT+RT+Y) sends a bot command. While
+-- a wheel is up the Rust side is in "wheel" mode: the sticks arrive as BENILLAPAD_STICK, the
+-- buttons as BENILLAPAD_NAV, and the body stays. The pick is sticky: it stays on the wedge last
+-- pointed at when the stick springs back, and A uses it.
 -- The quest item (LT+RT+B) uses the bags' usable quest item straight away.
+--
+-- 1.12 cannot turn a texture, so the wedge art (Art/Wheel_Fill, _Rim, _Glow) is three wedges in
+-- one 512x512 atlas per kind (top, right, top-right diagonal); the other five slots are mirror
+-- flips of those through SetTexCoord.
 
 local P = BenillaPad
 local Wheel = {}
 P.Wheel = Wheel
 
-local SIZE = 600
-local RADIUS = 175
-local SLOT = 58
-local LABEL_RADIUS = 238
--- Stick lengths: past PICK a direction selects, under RELEASE the stick is at rest.
+local SIZE = 540
+local SLOTS = 8
+-- The wedges' art: 256 px cells, one texel a UI px, centred this far from the wheel's centre.
+local CELL = 256
+local CELL_AXIS = 152
+local CELL_DIAGONAL = 123
+-- The icon's and the label's distance from the centre (the wedges run from 75 to 235).
+local ICON_RADIUS = 128
+local LABEL_RADIUS = 182
+local ICON = 40
+local BUTTON = 60
+local HUB = 136
+-- Stick lengths: past PICK a direction selects; under it the pick stays where it was.
 local PICK = 0.5
-local RELEASE = 0.25
-local MAX_ENTRIES = 12
-local ICON = "Interface\\Icons\\"
+local MAX_ENTRIES = 24
+local MAX_DOTS = 5
 
 -- ── The entries ──
 
@@ -45,6 +59,7 @@ local function professionIndex()
     return nil
 end
 
+-- The window wheel's groups; a group of more than eight runs over several pages.
 local WINDOW_PAGES = {
     {
         title = "Windows",
@@ -81,15 +96,16 @@ local WINDOW_PAGES = {
     },
     {
         title = "Emotes",
+        -- ImprovedForever's line icons (MIT, THIRD-PARTY-NOTICES.md), drawn whole, not cropped round.
         entries = {
-            { label = "Sit / Stand", icon = P.ART .. "Sit", run = function() SitOrStand() end },
-            { label = "Wave", icon = P.ART .. "Emote", run = emote("WAVE") },
-            { label = "Dance", icon = P.ART .. "Emote", run = emote("DANCE") },
-            { label = "Cheer", icon = P.ART .. "Emote", run = emote("CHEER") },
-            { label = "Bow", icon = P.ART .. "Emote", run = emote("BOW") },
-            { label = "Thank", icon = P.ART .. "Emote", run = emote("THANK") },
-            { label = "Laugh", icon = P.ART .. "Emote", run = emote("LAUGH") },
-            { label = "Point", icon = P.ART .. "Emote", run = emote("POINT") },
+            { label = "Sit / Stand", icon = P.ART .. "Emote_Sit", line = true, run = function() SitOrStand() end },
+            { label = "Wave", icon = P.ART .. "Emote_Wave", line = true, run = emote("WAVE") },
+            { label = "Dance", icon = P.ART .. "Emote_Dance", line = true, run = emote("DANCE") },
+            { label = "Cheer", icon = P.ART .. "Emote_Cheer", line = true, run = emote("CHEER") },
+            { label = "Bow", icon = P.ART .. "Emote_Bow", line = true, run = emote("BOW") },
+            { label = "Thank", icon = P.ART .. "Emote_Thank", line = true, run = emote("THANK") },
+            { label = "Laugh", icon = P.ART .. "Emote_Laugh", line = true, run = emote("LAUGH") },
+            { label = "Point", icon = P.ART .. "Emote_Point", line = true, run = emote("POINT") },
         },
     },
 }
@@ -105,6 +121,104 @@ local function isImbue(name)
         end
     end
     return false
+end
+
+-- ── A consumable's values, read off its tooltip's "Use:" line ──
+-- ("Restores 455 to 585 health." -> "+455-585 HP"; "Restores 1344 mana over 27 sec." ->
+-- "+1344 Mana"; "Heals 400 damage over 8 sec." -> "+400 HP"; an elixir's "Increases your
+-- Agility by 25" -> "+25 Agi"). After ImprovedForever's RingContent.lua (MIT), for 1.12: the
+-- tooltip is the hidden scanner BenillaPadScanTip (Keybinds.lua), read line by line.
+
+local STAT_SHORT = {
+    stamina = "Sta", spirit = "Spi", strength = "Str", agility = "Agi", intellect = "Int",
+    armor = "Armor", ["attack power"] = "AP", ["spell damage"] = "Spell", healing = "Heal",
+    defense = "Def",
+}
+local HP_COLOR = "|cff40ff40"
+local MANA_COLOR = "|cff59b3ff"
+local BUFF_COLOR = "|cffff9933"
+
+-- "455-585" or "2148" before a word ("health"), or nil.
+local function amountOf(text, word)
+    local _, _, low, high = string.find(text, "(%d+) to (%d+) " .. word)
+    if low then
+        return low .. "-" .. high
+    end
+    local _, _, n = string.find(text, "(%d+) " .. word)
+    return n
+end
+
+local function statName(subject)
+    local _, _, rest = string.find(subject, "^your (.*)$")
+    subject = rest or subject
+    if STAT_SHORT[subject] then
+        return STAT_SHORT[subject]
+    end
+    return string.upper(string.sub(subject, 1, 1)) .. string.sub(subject, 2)
+end
+
+-- The short values of a "Use:" text (lower-cased here), at most two, or nil.
+local function parseStat(text)
+    text = string.lower(text)
+    local parts = {}
+    local hp = amountOf(text, "health")
+    if not hp then
+        local _, _, n = string.find(text, "heals (%d+) damage")
+        hp = n
+    end
+    if hp and not string.find(text, "increases [%a' ]-health by") then
+        table.insert(parts, HP_COLOR .. "+" .. hp .. " HP|r")
+    end
+    local mana = amountOf(text, "mana")
+    if mana and not string.find(text, "increases [%a' ]-mana by") then
+        table.insert(parts, MANA_COLOR .. "+" .. mana .. " Mana|r")
+    end
+    if table.getn(parts) == 0 then
+        local _, _, subject, n = string.find(text, "increases ([%a' ]-) by [upto ]*(%d+)")
+        if subject then
+            table.insert(parts, BUFF_COLOR .. "+" .. n .. " " .. statName(subject) .. "|r")
+        end
+    end
+    if table.getn(parts) == 0 then
+        return nil
+    end
+    if table.getn(parts) > 2 then
+        parts = { parts[1], parts[2] }
+    end
+    return table.concat(parts, " ")
+end
+
+-- By item id: the text, or false once read with nothing to show (not kept while the tooltip
+-- has not loaded the item yet).
+local statCache = {}
+
+local function consumableStat(id, bag, slot)
+    if statCache[id] ~= nil then
+        return statCache[id] or nil
+    end
+    local tip = BenillaPadScanTip
+    if not tip then
+        return nil
+    end
+    tip:SetOwner(UIParent, "ANCHOR_NONE")
+    tip:SetBagItem(bag, slot)
+    local lines = tip:NumLines() or 0
+    local use = ""
+    local trigger = ITEM_SPELL_TRIGGER_ONUSE or "Use:"
+    for line = 1, lines do
+        local left = getglobal("BenillaPadScanTipTextLeft" .. line)
+        local text = left and left:GetText() or ""
+        if string.find(text, trigger, 1, true) == 1 then
+            use = use .. " " .. string.sub(text, string.len(trigger) + 1)
+        end
+    end
+    tip:Hide()
+    if lines < 2 then
+        return nil
+    end
+    local stat = parseStat(use)
+    statCache[id] = stat or false
+    return stat
 end
 
 -- The bags' consumables, one entry per item, with the stack counts summed.
@@ -125,7 +239,8 @@ local function consumableEntries()
                         e.count = e.count + (count or 1)
                     else
                         e = { label = name, icon = texture, count = count or 1, bag = bag, slot = slot,
-                            kind = subType or "", imbue = isImbue(name) }
+                            kind = subType or "", imbue = isImbue(name),
+                            stat = consumableStat(id, bag, slot) }
                         byId[id] = e
                         table.insert(list, e)
                     end
@@ -142,8 +257,9 @@ local function consumableEntries()
     end
     for i = 1, table.getn(list) do
         local e = list[i]
-        local count = e.count
-        e.sub = function() return "x" .. count end
+        local stat = e.stat
+        e.sub = function() return stat end
+        e.countText = e.count
         e.cooldown = function() return GetContainerItemCooldown(e.bag, e.slot) end
         e.run = function()
             UseContainerItem(e.bag, e.slot)
@@ -184,122 +300,147 @@ end
 local win = CreateFrame("Frame", "BenillaPadWheel", UIParent)
 win:SetWidth(SIZE)
 win:SetHeight(SIZE)
-win:SetPoint("CENTER", UIParent, "CENTER", 0, 30)
+win:SetPoint("CENTER", UIParent, "CENTER", 0, 40)
 win:SetFrameStrata("DIALOG")
 win:EnableMouse(true)
 win:Hide()
 tinsert(UISpecialFrames, "BenillaPadWheel")
 Wheel.frame = win
 
-local disc = win:CreateTexture(nil, "BACKGROUND")
-disc:SetTexture(P.ART .. "Disc")
-disc:SetVertexColor(0, 0, 0, 0.55)
-disc:SetWidth(RADIUS * 2 + SLOT + 30)
-disc:SetHeight(RADIUS * 2 + SLOT + 30)
-disc:SetPoint("CENTER", win, "CENTER", 0, 0)
+-- Each slot's wedge: its atlas cell as SetTexCoord(left, right, top, bottom), a mirror flip
+-- swapping a pair, and where the cell's centre sits from the wheel's centre.
+local WEDGE = {
+    { 0, 0.5, 0, 0.5, 0, CELL_AXIS },                           -- 1 top
+    { 0, 0.5, 0.5, 1, CELL_DIAGONAL, CELL_DIAGONAL },           -- 2 top right
+    { 0.5, 1, 0, 0.5, CELL_AXIS, 0 },                           -- 3 right
+    { 0, 0.5, 1, 0.5, CELL_DIAGONAL, -CELL_DIAGONAL },          -- 4 bottom right
+    { 0, 0.5, 0.5, 0, 0, -CELL_AXIS },                          -- 5 bottom
+    { 0.5, 0, 1, 0.5, -CELL_DIAGONAL, -CELL_DIAGONAL },         -- 6 bottom left
+    { 1, 0.5, 0, 0.5, -CELL_AXIS, 0 },                          -- 7 left
+    { 0.5, 0, 0.5, 1, -CELL_DIAGONAL, CELL_DIAGONAL },          -- 8 top left
+}
 
-local hub = win:CreateTexture(nil, "BORDER")
-hub:SetTexture(P.ART .. "Disc")
-hub:SetVertexColor(0.08, 0.06, 0.02, 0.85)
-hub:SetWidth(RADIUS * 2 - SLOT - 20)
-hub:SetHeight(RADIUS * 2 - SLOT - 20)
+local function wedgeTexture(i, art, layer)
+    local w = WEDGE[i]
+    local t = win:CreateTexture(nil, layer)
+    t:SetTexture(art)
+    t:SetWidth(CELL)
+    t:SetHeight(CELL)
+    t:SetTexCoord(w[1], w[2], w[3], w[4])
+    t:SetPoint("CENTER", win, "CENTER", w[5], w[6])
+    return t
+end
+
+local wedges = {}
+for i = 1, SLOTS do
+    local fill = wedgeTexture(i, P.ART .. "Wheel_Fill", "BACKGROUND")
+    local rim = wedgeTexture(i, P.ART .. "Wheel_Rim", "BORDER")
+    local glow = wedgeTexture(i, P.ART .. "Wheel_Glow", "ARTWORK")
+    glow:SetBlendMode("ADD")
+    glow:SetVertexColor(1, 0.78, 0.3)
+    glow:Hide()
+    wedges[i] = { fill = fill, rim = rim, glow = glow }
+end
+
+-- The hub: the wheel's title, the picked entry's name, the page dots.
+local hub = win:CreateTexture(nil, "ARTWORK")
+hub:SetTexture(P.ART .. "Wheel_Hub")
+hub:SetWidth(HUB)
+hub:SetHeight(HUB)
 hub:SetPoint("CENTER", win, "CENTER", 0, 0)
 
 local pageTitle = win:CreateFontString(nil, "OVERLAY")
-pageTitle:SetFont("Fonts\\FRIZQT__.TTF", 18, "OUTLINE")
-pageTitle:SetPoint("CENTER", win, "CENTER", 0, 54)
+pageTitle:SetFont("Fonts\\FRIZQT__.TTF", 15, "OUTLINE")
+pageTitle:SetPoint("CENTER", win, "CENTER", 0, 22)
 pageTitle:SetTextColor(1, 0.82, 0)
 
 local chosen = win:CreateFontString(nil, "OVERLAY")
-chosen:SetFont("Fonts\\FRIZQT__.TTF", 16, "OUTLINE")
-chosen:SetPoint("CENTER", win, "CENTER", 0, -30)
-
--- The prompts as glyphs and gold verbs (Glyphs.lua), inside the hub.
-local hint = P.NewHints(win, { size = 18, pad = 0, spacing = 10, font = "GameFontNormalSmall", maxWidth = 250 })
-hint:SetPoint("CENTER", win, "CENTER", 0, -56)
-
--- The pointer: the minimap's player arrow, turned toward the stick with an 8-point texcoord.
-local arrow = win:CreateTexture(nil, "OVERLAY")
-arrow:SetTexture("Interface\\Minimap\\MinimapArrow")
-arrow:SetWidth(44)
-arrow:SetHeight(44)
-arrow:Hide()
-
-local function pointArrow(degrees)
-    local a = math.rad(degrees)
-    local c, s = math.cos(a), math.sin(a)
-    -- The texel shown at screen offset (x, y) comes from (x, y) turned back by the angle; the
-    -- 0.707 keeps every corner inside the texture.
-    local function uv(x, y)
-        local k = 0.7071
-        local sx = (x * c - y * s) * k
-        local sy = (x * s + y * c) * k
-        return 0.5 + sx, 0.5 - sy
-    end
-    local ulx, uly = uv(-0.5, 0.5)
-    local llx, lly = uv(-0.5, -0.5)
-    local urx, ury = uv(0.5, 0.5)
-    local lrx, lry = uv(0.5, -0.5)
-    arrow:SetTexCoord(ulx, uly, llx, lly, urx, ury, lrx, lry)
-    arrow:ClearAllPoints()
-    arrow:SetPoint("CENTER", win, "CENTER", math.sin(a) * 70, math.cos(a) * 70)
-    arrow:Show()
-end
+chosen:SetFont("Fonts\\FRIZQT__.TTF", 12, "OUTLINE")
+chosen:SetWidth(HUB - 24)
+chosen:SetPoint("CENTER", win, "CENTER", 0, 0)
 
 local dots = {}
-for i = 1, 4 do
+for i = 1, MAX_DOTS do
     local d = win:CreateTexture(nil, "OVERLAY")
     d:SetTexture(P.ART .. "Disc")
-    d:SetWidth(12)
-    d:SetHeight(12)
-    d:SetPoint("CENTER", win, "CENTER", (i - 1) * 20 - 10, 84)
+    d:SetWidth(10)
+    d:SetHeight(10)
     d:Hide()
     dots[i] = d
 end
 
+-- The footer: the prompts as glyphs and gold verbs on a plate (Glyphs.lua).
+local hint = P.NewHints(win, { size = 22, pad = 8, spacing = 14, font = "GameFontNormalSmall",
+    maxWidth = SIZE, plate = true })
+hint:SetPoint("TOP", win, "BOTTOM", 0, 2)
+
 local slots = {}
-for i = 1, MAX_ENTRIES do
+for i = 1, SLOTS do
+    local a = math.rad(90 - (i - 1) * 45)
+    local x, y = math.cos(a), math.sin(a)
     local b = CreateFrame("Button", nil, win)
-    b:SetWidth(SLOT)
-    b:SetHeight(SLOT)
-    local shadow = b:CreateTexture(nil, "BACKGROUND")
-    shadow:SetTexture(P.ART .. "Disc")
-    shadow:SetVertexColor(0, 0, 0, 0.7)
-    shadow:SetAllPoints(b)
-    b.strips = P.NewRoundIcon(b, SLOT * 0.9)
+    b:SetWidth(BUTTON)
+    b:SetHeight(BUTTON)
+    b:SetPoint("CENTER", win, "CENTER", x * ICON_RADIUS, y * ICON_RADIUS)
+    local disc = b:CreateTexture(nil, "BACKGROUND")
+    disc:SetTexture(P.ART .. "Wheel_Slot")
+    disc:SetWidth(ICON + 10)
+    disc:SetHeight(ICON + 10)
+    disc:SetPoint("CENTER", b, "CENTER", 0, 0)
+    b.disc = disc
+    b.strips = P.NewRoundIcon(b, ICON)
+    local plain = b:CreateTexture(nil, "ARTWORK")
+    plain:SetWidth(ICON - 2)
+    plain:SetHeight(ICON - 2)
+    plain:SetPoint("CENTER", b, "CENTER", 0, 0)
+    plain:Hide()
+    b.plain = plain
     local ring = b:CreateTexture(nil, "OVERLAY")
     ring:SetTexture(P.ART .. "Ring")
     ring:SetVertexColor(0.85, 0.72, 0.5)
-    ring:SetWidth(SLOT * 1.3)
-    ring:SetHeight(SLOT * 1.3)
+    ring:SetWidth(ICON * 1.45)
+    ring:SetHeight(ICON * 1.45)
     ring:SetPoint("CENTER", b, "CENTER", 0, 0)
-    local hi = b:CreateTexture(nil, "OVERLAY")
-    hi:SetTexture(P.ART .. "RingSelect")
-    hi:SetWidth(SLOT * 1.3)
-    hi:SetHeight(SLOT * 1.3)
-    hi:SetPoint("CENTER", b, "CENTER", 0, 0)
-    hi:Hide()
-    b.hi = hi
+    b.ring = ring
+    local glow = b:CreateTexture(nil, "OVERLAY")
+    glow:SetTexture(P.ART .. "Wheel_IconGlow")
+    glow:SetBlendMode("ADD")
+    glow:SetVertexColor(1, 0.82, 0.35)
+    glow:SetWidth(ICON * 1.95)
+    glow:SetHeight(ICON * 1.95)
+    glow:SetPoint("CENTER", b, "CENTER", 0, 0)
+    glow:Hide()
+    b.glow = glow
     local timer = b:CreateFontString(nil, "OVERLAY")
-    timer:SetFont("Fonts\\FRIZQT__.TTF", 20, "OUTLINE")
+    timer:SetFont("Fonts\\FRIZQT__.TTF", 18, "OUTLINE")
     timer:SetPoint("CENTER", b, "CENTER", 0, 0)
     b.timer = timer
+    local count = b:CreateFontString(nil, "OVERLAY")
+    count:SetFont("Fonts\\FRIZQT__.TTF", 11, "OUTLINE")
+    count:SetPoint("BOTTOMRIGHT", b, "CENTER", ICON / 2 + 4, -ICON / 2 + 1)
+    b.count = count
     local label = win:CreateFontString(nil, "OVERLAY")
-    label:SetFont("Fonts\\FRIZQT__.TTF", 13, "OUTLINE")
+    label:SetFont("Fonts\\FRIZQT__.TTF", 12, "OUTLINE")
+    label:SetWidth(124)
+    label:SetPoint("CENTER", win, "CENTER", x * LABEL_RADIUS, y * LABEL_RADIUS)
     b.label = label
     local sub = win:CreateFontString(nil, "OVERLAY")
-    sub:SetFont("Fonts\\FRIZQT__.TTF", 11, "OUTLINE")
-    sub:SetTextColor(1, 0.82, 0)
+    sub:SetFont("Fonts\\FRIZQT__.TTF", 10, "OUTLINE")
+    sub:SetTextColor(0.85, 0.85, 0.85)
     sub:SetPoint("TOP", label, "BOTTOM", 0, -1)
     b.sub = sub
     b.index = i
     b:SetScript("OnClick", function()
-        Wheel.selected = this.index
-        Wheel.Activate()
+        if Wheel.entries[this.index] then
+            Wheel.selected = this.index
+            Wheel.Activate()
+        end
     end)
     b:SetScript("OnEnter", function()
-        Wheel.selected = this.index
-        Wheel.Refresh()
+        if Wheel.entries[this.index] then
+            Wheel.selected = this.index
+            Wheel.Refresh()
+        end
     end)
     slots[i] = b
 end
@@ -308,6 +449,7 @@ end
 
 Wheel.set = nil
 Wheel.page = 1
+Wheel.pages = {}
 Wheel.selected = nil
 Wheel.entries = {}
 
@@ -318,28 +460,44 @@ local function entryText(value)
     return value
 end
 
--- Lay the current entries round the ring, clockwise from the top.
+-- Groups of entries as pages of eight; an empty group is one empty page.
+local function paginate(groups)
+    local pages = {}
+    for g = 1, table.getn(groups) do
+        local group = groups[g]
+        local n = table.getn(group.entries)
+        local count = math.max(1, math.ceil(n / SLOTS))
+        for p = 1, count do
+            local entries = {}
+            for i = (p - 1) * SLOTS + 1, math.min(n, p * SLOTS) do
+                table.insert(entries, group.entries[i])
+            end
+            table.insert(pages, { title = group.title, entries = entries })
+        end
+    end
+    return pages
+end
+
+-- Put the current page's entries in their slots.
 function Wheel.Layout()
-    local n = table.getn(Wheel.entries)
-    for i = 1, MAX_ENTRIES do
+    for i = 1, SLOTS do
         local b = slots[i]
         local e = Wheel.entries[i]
         if e then
-            local a = math.rad((i - 1) * 360 / n)
-            local x, y = math.sin(a), math.cos(a)
-            b:ClearAllPoints()
-            b:SetPoint("CENTER", win, "CENTER", x * RADIUS, y * RADIUS)
-            P.SetIcon(b.strips, e.icon)
-            b.label:ClearAllPoints()
-            local lx, ly = x * LABEL_RADIUS, y * LABEL_RADIUS
-            if x > 0.3 then
-                b.label:SetPoint("LEFT", win, "CENTER", lx - 14, ly)
-            elseif x < -0.3 then
-                b.label:SetPoint("RIGHT", win, "CENTER", lx + 14, ly)
+            if e.line then
+                P.SetIcon(b.strips, nil)
+                b.plain:SetTexture(e.icon)
+                b.plain:Show()
             else
-                b.label:SetPoint("CENTER", win, "CENTER", lx, ly)
+                b.plain:Hide()
+                P.SetIcon(b.strips, e.icon)
             end
             b.label:SetText(e.label)
+            if e.countText then
+                b.count:SetText(e.countText)
+            else
+                b.count:SetText("")
+            end
             b:Show()
             b.label:Show()
             b.sub:Show()
@@ -349,6 +507,22 @@ function Wheel.Layout()
             b.sub:Hide()
         end
     end
+    local n = table.getn(Wheel.pages)
+    for i = 1, MAX_DOTS do
+        local d = dots[i]
+        if n > 1 and i <= n then
+            d:ClearAllPoints()
+            d:SetPoint("CENTER", win, "CENTER", (i - (n + 1) / 2) * 16, -30)
+            if i == Wheel.page then
+                d:SetVertexColor(1, 0.78, 0.1)
+            else
+                d:SetVertexColor(0.3, 0.3, 0.3)
+            end
+            d:Show()
+        else
+            d:Hide()
+        end
+    end
 end
 
 -- What changes as the selection or the clock moves.
@@ -356,72 +530,81 @@ function Wheel.Refresh()
     if not win:IsVisible() then
         return
     end
-    for i = 1, table.getn(Wheel.entries) do
-        local b, e = slots[i], Wheel.entries[i]
-        if i == Wheel.selected then
-            b.hi:Show()
-            b.label:SetTextColor(1, 0.82, 0)
+    for i = 1, SLOTS do
+        local b, e, w = slots[i], Wheel.entries[i], wedges[i]
+        if not e then
+            -- An empty wedge, dimmed.
+            w.fill:SetVertexColor(0.7, 0.7, 0.7, 0.55)
+            w.rim:SetVertexColor(1, 1, 1, 0.55)
+            w.glow:Hide()
         else
-            b.hi:Hide()
-            b.label:SetTextColor(1, 1, 1)
-        end
-        b.sub:SetText(entryText(e.sub) or "")
-        local left = 0
-        if e.cooldown then
-            local start, duration, enable = e.cooldown()
-            if enable == 1 and duration and duration > 1.5 then
-                left = start + duration - GetTime()
+            w.fill:SetVertexColor(1, 1, 1, 1)
+            w.rim:SetVertexColor(1, 1, 1, 1)
+            if i == Wheel.selected then
+                w.glow:Show()
+                b.glow:Show()
+                b.label:SetTextColor(1, 1, 1)
+            else
+                w.glow:Hide()
+                b.glow:Hide()
+                b.label:SetTextColor(1, 0.82, 0)
             end
-        end
-        if left > 0 then
-            b.timer:SetText(math.ceil(left))
-            P.TintIcon(b.strips, 0.45, 0.45, 0.45)
-        else
-            b.timer:SetText("")
-            P.TintIcon(b.strips, 1, 1, 1)
+            b.sub:SetText(entryText(e.sub) or "")
+            local left = 0
+            if e.cooldown then
+                local start, duration, enable = e.cooldown()
+                if enable == 1 and duration and duration > 1.5 then
+                    left = start + duration - GetTime()
+                end
+            end
+            if left > 0 then
+                b.timer:SetText(math.ceil(left))
+                P.TintIcon(b.strips, 0.45, 0.45, 0.45)
+            else
+                b.timer:SetText("")
+                P.TintIcon(b.strips, 1, 1, 1)
+            end
         end
     end
     local e = Wheel.selected and Wheel.entries[Wheel.selected]
     chosen:SetText(e and e.label or "")
 end
 
-function Wheel.Fill()
+-- The footer's prompts for the open wheel.
+local function setHint()
+    local paged = table.getn(Wheel.pages) > 1
+    local page = paged and "   LB / RB: page" or ""
     if Wheel.set == "windows" then
-        local page = WINDOW_PAGES[Wheel.page]
-        Wheel.entries = page.entries
-        pageTitle:SetText(page.title)
-        P.SetHintText(hint, "Stick: point   A: open   LB / RB: page   B: close")
-        for i = 1, table.getn(dots) do
-            if i <= table.getn(WINDOW_PAGES) then
-                dots[i]:Show()
-                if i == Wheel.page then
-                    dots[i]:SetVertexColor(1, 0.78, 0.1)
-                else
-                    dots[i]:SetVertexColor(0.3, 0.3, 0.3)
-                end
-            else
-                dots[i]:Hide()
-            end
-        end
+        P.SetHintText(hint, "Stick: point   A: open" .. page .. "   B: close")
     elseif Wheel.set == "bots" then
-        Wheel.entries = botEntries()
-        pageTitle:SetText("Bots")
-        P.SetHintText(hint, "To: " .. P.Bots.TargetLabel() .. "   Y: change   A: send   B: close")
-        for i = 1, table.getn(dots) do
-            dots[i]:Hide()
-        end
+        P.SetHintText(hint, "To: " .. P.Bots.TargetLabel() .. "   Y: change   A: send" .. page .. "   B: close")
+    elseif table.getn(Wheel.entries) == 0 then
+        P.SetHintText(hint, "Nothing to use in your bags   B: close")
     else
-        Wheel.entries = consumableEntries()
-        pageTitle:SetText("Consumables")
-        if table.getn(Wheel.entries) == 0 then
-            P.SetHintText(hint, "Nothing to use in your bags   B: close")
-        else
-            P.SetHintText(hint, "Stick: point   A: use   B: close")
-        end
-        for i = 1, table.getn(dots) do
-            dots[i]:Hide()
-        end
+        P.SetHintText(hint, "Stick: point   A: use" .. page .. "   B: close")
     end
+end
+
+function Wheel.Fill()
+    local groups
+    if Wheel.set == "windows" then
+        groups = WINDOW_PAGES
+    elseif Wheel.set == "bots" then
+        groups = { { title = "Bots", entries = botEntries() } }
+    else
+        groups = { { title = "Consumables", entries = consumableEntries() } }
+    end
+    Wheel.pages = paginate(groups)
+    local n = table.getn(Wheel.pages)
+    if Wheel.page > n then Wheel.page = n end
+    if Wheel.page < 1 then Wheel.page = 1 end
+    local page = Wheel.pages[Wheel.page]
+    Wheel.entries = page.entries
+    pageTitle:SetText(page.title)
+    if Wheel.selected and not Wheel.entries[Wheel.selected] then
+        Wheel.selected = nil
+    end
+    setHint()
     Wheel.Layout()
     Wheel.Refresh()
 end
@@ -432,7 +615,6 @@ function Wheel.Open(set)
     Wheel.set = set
     Wheel.page = 1
     Wheel.selected = nil
-    arrow:Hide()
     win:Show()
     Wheel.Fill()
 end
@@ -459,29 +641,20 @@ function Wheel.Activate()
     e.run()
 end
 
--- The selection from a stick: the slot whose angle is nearest the stick's.
+-- The selection from a stick: the wedge whose middle is nearest the stick's angle, slot 1 at
+-- the top and clockwise; an empty wedge or a stick at rest leaves the pick where it is.
 function Wheel.Aim(x, y)
     local n = table.getn(Wheel.entries)
-    if n == 0 then
+    if n == 0 or math.sqrt(x * x + y * y) < PICK then
         return
     end
-    local len = math.sqrt(x * x + y * y)
-    if len < PICK then
-        if len < RELEASE then
-            arrow:Hide()
-        end
-        return
-    end
-    -- Clockwise from the top, in degrees.
     local degrees = math.deg(math.atan2(x, y))
     if degrees < 0 then
         degrees = degrees + 360
     end
-    local step = 360 / n
-    local index = math.floor((degrees + step / 2) / step)
-    index = index - n * math.floor(index / n) + 1
-    pointArrow(degrees)
-    if index ~= Wheel.selected then
+    local index = math.floor((degrees + 22.5) / 45)
+    index = index - SLOTS * math.floor(index / SLOTS) + 1
+    if index <= n and index ~= Wheel.selected then
         Wheel.selected = index
         Wheel.Refresh()
     end
@@ -496,8 +669,20 @@ function Wheel.Step(dir)
     if i < 1 then i = n end
     if i > n then i = 1 end
     Wheel.selected = i
-    arrow:Hide()
     Wheel.Refresh()
+end
+
+-- LB / RB: the previous or next page of eight, round.
+function Wheel.Page(dir)
+    local n = table.getn(Wheel.pages)
+    if n < 2 then
+        return
+    end
+    Wheel.page = Wheel.page + dir
+    if Wheel.page < 1 then Wheel.page = n end
+    if Wheel.page > n then Wheel.page = 1 end
+    Wheel.selected = nil
+    Wheel.Fill()
 end
 
 function Wheel.Nav(btn)
@@ -507,19 +692,15 @@ function Wheel.Nav(btn)
         Wheel.Close()
     elseif btn == "Y" and Wheel.set == "bots" then
         P.Bots.CycleTarget(1)
-        P.SetHintText(hint, "To: " .. P.Bots.TargetLabel() .. "   Y: change   A: send   B: close")
+        setHint()
     elseif btn == "DRIGHT" or btn == "DDOWN" then
         Wheel.Step(1)
     elseif btn == "DLEFT" or btn == "DUP" then
         Wheel.Step(-1)
-    elseif (btn == "LB" or btn == "RB") and Wheel.set == "windows" then
-        local n = table.getn(WINDOW_PAGES)
-        if btn == "LB" then Wheel.page = Wheel.page - 1 else Wheel.page = Wheel.page + 1 end
-        if Wheel.page < 1 then Wheel.page = n end
-        if Wheel.page > n then Wheel.page = 1 end
-        Wheel.selected = nil
-        arrow:Hide()
-        Wheel.Fill()
+    elseif btn == "LB" then
+        Wheel.Page(-1)
+    elseif btn == "RB" then
+        Wheel.Page(1)
     end
 end
 
@@ -554,10 +735,12 @@ local watcher = CreateFrame("Frame", nil, win)
 watcher:RegisterEvent("BAG_UPDATE")
 watcher:RegisterEvent("BAG_UPDATE_COOLDOWN")
 watcher:SetScript("OnEvent", function()
-    if Wheel.set == "consumables" then
+    if Wheel.set == "consumables" and win:IsVisible() then
         local keep = Wheel.selected
         Wheel.Fill()
-        Wheel.selected = keep
+        if keep and Wheel.entries[keep] then
+            Wheel.selected = keep
+        end
         Wheel.Refresh()
     end
 end)

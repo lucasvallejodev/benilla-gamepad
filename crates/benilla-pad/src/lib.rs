@@ -15,6 +15,10 @@
 //! `BENILLAPAD_NAV(button, down)` and `BENILLAPAD_STICK(lx, ly, rx, ry)`. Without the addon the
 //! pad still plays on the stock commands ([`map::fallback_command`]).
 //!
+//! Vibration goes the other way by polling: the addon's `BenillaPad_Rumble(low, high, seconds)`
+//! keeps a step and steps a serial that `BenillaPad_Mode` answers each frame; a new serial is
+//! taken with `BenillaPad_RumbleTake()` and sent as bevy's `GamepadRumbleRequest`.
+//!
 //! Before the world (login, realm list, character select) the stock UI and the addon are not
 //! loaded: the pad presses the keys those screens read and drives the mouse cursor
 //! ([`drive_glue`]).
@@ -25,7 +29,10 @@ pub mod map;
 #[cfg(feature = "dev")]
 mod script;
 
+use std::time::Duration;
+
 use bevy::ecs::system::SystemParam;
+use bevy::input::gamepad::{GamepadRumbleIntensity, GamepadRumbleRequest};
 use bevy::input::keyboard::{Key, KeyboardInput};
 use bevy::input::mouse::MouseButtonInput;
 use bevy::input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll, MouseScrollUnit};
@@ -188,6 +195,47 @@ struct PadState {
     /// The soft target itself, and where the prompt was last told to sit (absolute UI units).
     soft_guid: Option<u64>,
     anchor: Option<(f32, f32)>,
+    /// The addon's rumble serial last frame (`BenillaPad_Mode`'s fourth answer).
+    rumble: u32,
+}
+
+/// The longest rumble step the addon may ask for, in seconds, so a lost stop cannot hum on.
+const RUMBLE_MAX_SECS: f32 = 5.0;
+
+/// The scripted pad's name (`WOW_PAD_SCRIPT`, `script.rs`): it is no gilrs device, and
+/// bevy_gilrs unwraps the device of every pad it is asked to rumble, so it is never rumbled.
+pub(crate) const SCRIPTED_PAD: &str = "benilla scripted pad";
+
+/// A motor strength from the addon, 0..1; a value that is no finite number is 0.
+fn rumble_unit(value: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+/// One `BenillaPad_Rumble(low, high, seconds)` step, clamped: the strong (left, low-frequency)
+/// and weak (right) motors 0..1 and the length up to [`RUMBLE_MAX_SECS`]. `None` is silence: the
+/// step stops what plays and starts nothing.
+fn rumble_step(low: f32, high: f32, secs: f32) -> Option<(GamepadRumbleIntensity, Duration)> {
+    let strong = rumble_unit(low);
+    let weak = rumble_unit(high);
+    let secs = if secs.is_finite() {
+        secs.clamp(0.0, RUMBLE_MAX_SECS)
+    } else {
+        0.0
+    };
+    if secs <= 0.0 || (strong <= 0.0 && weak <= 0.0) {
+        return None;
+    }
+    Some((
+        GamepadRumbleIntensity {
+            strong_motor: strong,
+            weak_motor: weak,
+        },
+        Duration::from_secs_f32(secs),
+    ))
 }
 
 /// How often the soft Interact prompt is recomputed, in seconds.
@@ -334,16 +382,16 @@ fn drive(
     // stock UI loaded (`UIParent` is FrameXML's): nothing of the world's survives, and the pad
     // drives those screens' own keys and the cursor.
     // One Lua call a frame answers it, with the addon's mode and settings generation.
-    let (in_world, mode, gen, primary) = script
+    let (in_world, mode, gen, primary, rumble) = script
         .as_ref()
         .and_then(|s| {
-            s.eval::<(bool, Option<String>, Option<u32>, Option<u32>)>(
+            s.eval::<(bool, Option<String>, Option<u32>, Option<u32>, Option<u32>)>(
                 "if BenillaPad_Mode then return UIParent ~= nil, BenillaPad_Mode() end \
                  return UIParent ~= nil",
             )
             .ok()
         })
-        .unwrap_or((false, None, None, None));
+        .unwrap_or((false, None, None, None, None));
     #[cfg(feature = "dev")]
     if in_world {
         script::mark_world(time.elapsed_secs());
@@ -405,6 +453,22 @@ fn drive(
             state.announced = None;
         }
         _ => {}
+    }
+
+    // ── Rumble ── the addon asks with `BenillaPad_Rumble(low, high, seconds)`, which keeps the
+    // step and steps the serial `BenillaPad_Mode` answers; a new serial takes the step, and
+    // `apply_pad_writes` sends it (Lua has no call into Rust: the pad polls, as for the mode).
+    let rumble = rumble.unwrap_or(0);
+    if rumble != state.rumble {
+        state.rumble = rumble;
+        match script.eval::<(f32, f32, f32)>("return BenillaPad_RumbleTake()") {
+            Ok((low, high, secs)) => {
+                if let Some((entity, _)) = pad {
+                    input.writes.rumble = Some((entity, rumble_step(low, high, secs)));
+                }
+            }
+            Err(e) => warn!("pad: BenillaPad_RumbleTake failed: {e}"),
+        }
     }
     let pad = pad.map(|(_, g)| g);
 
@@ -780,6 +844,8 @@ impl SynthInput<'_> {
 struct PadWrites {
     keys: Vec<(KeyCode, bool)>,
     motion: Vec2,
+    /// A rumble step for a pad: what plays stops, then the step (if any) starts.
+    rumble: Option<(Entity, Option<(GamepadRumbleIntensity, Duration)>)>,
 }
 
 /// Where the hosted pass moved the cursor, for [`apply_pad_writes`]: the call host reads the window.
@@ -822,7 +888,23 @@ fn apply_pad_writes(
     mut keys: ResMut<ButtonInput<KeyCode>>,
     mut motion: ResMut<AccumulatedMouseMotion>,
     mut windows: Query<&mut Window, With<PrimaryWindow>>,
+    mut rumble: MessageWriter<GamepadRumbleRequest>,
+    names: Query<&Name, With<Gamepad>>,
 ) {
+    if let Some((gamepad, step)) = writes.rumble.take() {
+        // Rumbles add up in bevy_gilrs, so a step replaces the one playing: stop, then add.
+        let scripted = names.get(gamepad).is_ok_and(|n| n.as_str() == SCRIPTED_PAD);
+        if !scripted {
+            rumble.write(GamepadRumbleRequest::Stop { gamepad });
+            if let Some((intensity, duration)) = step {
+                rumble.write(GamepadRumbleRequest::Add {
+                    duration,
+                    intensity,
+                    gamepad,
+                });
+            }
+        }
+    }
     for (key, down) in writes.keys.drain(..) {
         if down {
             keys.press(key);

@@ -19,3 +19,4 @@ Prompt.lua
 Legend.lua
 Bots.lua
 Chat.lua
+Vibration.lua

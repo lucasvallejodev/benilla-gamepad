@@ -138,7 +138,7 @@ fn run_script(
         connections.write(GamepadConnectionEvent::new(
             pad,
             GamepadConnection::Connected {
-                name: "benilla scripted pad".into(),
+                name: crate::SCRIPTED_PAD.into(),
                 vendor_id: None,
                 product_id: None,
             },

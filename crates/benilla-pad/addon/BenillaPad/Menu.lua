@@ -20,6 +20,7 @@ local BACKDROP = {
 -- toggle: { label, desc, key }
 -- choice: { label, desc, key, values = { {value, text}, ... } }
 -- number: { label, desc, key, min, max, step, fmt }
+-- A setting row may also have changed = function, called after its value changes.
 
 local function percent(v) return math.floor(v * 100 + 0.5) .. "%" end
 local function plain(v) return string.format("%.1f", v) end
@@ -34,7 +35,7 @@ Menu.pages = {
             { label = "Quick Chat", desc = "Phrases for every channel, the on-screen keyboard, and your bots: log them in, command them, build the bot wheel (LT+RT+Y).",
                 run = function() Menu.Close() P.Chat.Open() end },
             { label = "Camera & sticks", desc = "Look speed, camera direction, stick dead zone, zoom.", open = "camera" },
-            { label = "Buttons", desc = "When spells cast, and what A / B / X / Y do with no trigger held.", open = "buttons" },
+            { label = "Buttons", desc = "When spells cast, what A / B / X / Y do with no trigger held, and vibration.", open = "buttons" },
             { label = "Look", desc = "Size and place of the gamepad bar, button symbols, the stock action bar.", open = "look" },
             { label = "Reset all settings", desc = "Every setting on this menu back to its default. Your binds are kept.",
                 run = function()
@@ -79,6 +80,10 @@ Menu.pages = {
             { label = "A / B / X / Y with no trigger",
                 desc = "Game actions: Jump, Interact, Back, Inspect. Spells: their own action slots, like the D-pad.",
                 key = "faceSpells", values = { { false, "Game actions" }, { true, "Spells" } } },
+            { label = "Vibration",
+                desc = "The controller rumbles when you are hit, land a critical hit, cast, level up, hand in a quest, loot, fall or die, and beats like a heart below a quarter of your health. Light is half strength.",
+                key = "vibration", values = { { "off", "Off" }, { "light", "Light" }, { "full", "Full" } },
+                changed = function() if P.Vibe then P.Vibe.Play("sample") end end },
         },
     },
     look = {
@@ -264,6 +269,9 @@ function Menu.Adjust(dir)
         P.SetSetting(row.key, nv)
     else
         P.SetSetting(row.key, not v)
+    end
+    if row.changed then
+        row.changed()
     end
 end
 
