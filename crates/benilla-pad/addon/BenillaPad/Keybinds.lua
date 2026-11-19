@@ -25,12 +25,9 @@ local CELL_LABEL = {
     DUP = "Up", DDOWN = "Down", DLEFT = "Left", DRIGHT = "Right",
     A = "A", B = "B", X = "X", Y = "Y", LB = "LB", RB = "RB", L3 = "L3", R3 = "R3",
 }
-local BACKDROP = {
-    bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
-    edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
-    tile = true, tileSize = 32, edgeSize = 32,
-    insets = { left = 11, right = 12, top = 12, bottom = 11 },
-}
+-- Drawn as the legend, the wheel and the menu: the dark plate with its bronze edge (Glyphs.lua),
+-- headings gold, labels cream, the selection in a gold stroke.
+local C = P.COLOR
 
 Binds.tab = "bare"
 Binds.selected = "DUP"
@@ -180,7 +177,7 @@ local win = CreateFrame("Frame", "BenillaPadBinds", UIParent)
 win:SetWidth(620)
 win:SetHeight(500)
 win:SetPoint("CENTER", UIParent, "CENTER", -150, 40)
-win:SetBackdrop(BACKDROP)
+P.AddPlate(win)
 win:SetFrameStrata("DIALOG")
 win:EnableMouse(true)
 win:SetMovable(true)
@@ -192,16 +189,20 @@ tinsert(UISpecialFrames, "BenillaPadBinds")
 Binds.frame = win
 
 local title = win:CreateFontString(nil, "ARTWORK", "GameFontNormalLarge")
-title:SetPoint("TOP", win, "TOP", 0, -18)
+title:SetPoint("TOP", win, "TOP", 0, -16)
 title:SetText("Controller keybinds")
+P.Paint(title, C.title)
+P.AddRule(win, 580, 40)
 
 local close = CreateFrame("Button", nil, win, "UIPanelCloseButton")
 close:SetPoint("TOPRIGHT", win, "TOPRIGHT", -6, -6)
 
 local layerText = win:CreateFontString(nil, "ARTWORK", "GameFontNormalLarge")
 layerText:SetPoint("CENTER", win, "CENTER", 0, -4)
+P.Paint(layerText, C.title)
 
 local described = win:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
+P.Paint(described, C.cream)
 -- The prompts as glyphs and gold verbs (Glyphs.lua); the description sits over them, however
 -- many lines they wrap to.
 local hints = P.NewHints(win, { size = 16, pad = 0, spacing = 12, font = "GameFontNormalSmall", maxWidth = 580 })
@@ -219,6 +220,7 @@ for i = 1, table.getn(P.LAYERS) do
     local bg = t:CreateTexture(nil, "BACKGROUND")
     bg:SetAllPoints(t)
     t.bg = bg
+    t.select = P.AddSelect(t, { corner = 8 })
     local text = t:CreateFontString(nil, "ARTWORK", "GameFontNormal")
     text:SetPoint("CENTER", t, "CENTER", 0, 0)
     text:SetText(LAYER_TITLE[layer])
@@ -248,13 +250,7 @@ local function newCell(btn)
     icon:SetPoint("CENTER", c, "CENTER", 0, 0)
     icon:SetTexCoord(0.07, 0.93, 0.07, 0.93)
     c.icon = icon
-    local sel = c:CreateTexture(nil, "OVERLAY")
-    sel:SetTexture("Interface\\Buttons\\CheckButtonHilight")
-    sel:SetBlendMode("ADD")
-    sel:SetWidth(CELL + 14)
-    sel:SetHeight(CELL + 14)
-    sel:SetPoint("CENTER", c, "CENTER", 0, 0)
-    c.sel = sel
+    c.sel = P.AddSelect(c, { corner = 10, out = 6, hollow = true, layer = "OVERLAY" })
     local glyph = c:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
     glyph:SetPoint("BOTTOM", c, "TOP", 0, 3)
     glyph:SetText(CELL_LABEL[btn])
@@ -304,11 +300,13 @@ function Binds.Refresh()
     for i = 1, table.getn(tabs) do
         local t = tabs[i]
         if t.layer == layer then
-            t.bg:SetTexture(1, 0.75, 0.1, 0.9)
-            t.text:SetTextColor(0, 0, 0)
+            t.bg:SetTexture(0.16, 0.12, 0.06, 0.95)
+            P.ShowSelect(t.select, true)
+            P.Paint(t.text, C.focus)
         else
-            t.bg:SetTexture(0.1, 0.1, 0.15, 0.9)
-            t.text:SetTextColor(1, 0.82, 0)
+            t.bg:SetTexture(0.09, 0.07, 0.05, 0.9)
+            P.ShowSelect(t.select, false)
+            P.Paint(t.text, C.cream)
         end
     end
     layerText:SetText(LAYER_TITLE[layer])
@@ -316,7 +314,7 @@ function Binds.Refresh()
         local icon = Binds.Describe(btn, layer)
         c.icon:SetTexture(icon)
         if icon then c.icon:Show() else c.icon:Hide() end
-        if btn == Binds.selected then c.sel:Show() else c.sel:Hide() end
+        P.ShowSelect(c.sel, btn == Binds.selected)
         if Binds.picked and Binds.picked.btn == btn and Binds.picked.layer == layer then
             c.icon:SetVertexColor(0.4, 0.4, 0.4)
         else
@@ -483,13 +481,14 @@ P.Picker = Picker
 local pick = CreateFrame("Frame", "BenillaPadPicker", win)
 pick:SetWidth(300)
 pick:SetHeight(500)
-pick:SetPoint("TOPLEFT", win, "TOPRIGHT", -4, 0)
-pick:SetBackdrop(BACKDROP)
+pick:SetPoint("TOPLEFT", win, "TOPRIGHT", 4, 0)
+P.AddPlate(pick)
 pick:EnableMouse(true)
 pick:Hide()
 
 local pickTitle = pick:CreateFontString(nil, "ARTWORK", "GameFontNormal")
-pickTitle:SetPoint("TOP", pick, "TOP", 0, -20)
+pickTitle:SetPoint("TOP", pick, "TOP", 0, -18)
+P.Paint(pickTitle, C.title)
 
 local pickHint = P.NewHints(pick, { size = 16, pad = 0, spacing = 12, font = "GameFontNormalSmall", maxWidth = 270 })
 pickHint:SetPoint("BOTTOM", pick, "BOTTOM", 0, 20)
@@ -559,10 +558,7 @@ for i = 1, ROWS do
     r:SetWidth(264)
     r:SetHeight(28)
     r:SetPoint("TOPLEFT", pick, "TOPLEFT", 18, -44 - (i - 1) * 30)
-    local hi = r:CreateTexture(nil, "BACKGROUND")
-    hi:SetAllPoints(r)
-    hi:SetTexture(1, 0.75, 0.1, 0.25)
-    r.hi = hi
+    r.select = P.AddSelect(r, { corner = 8 })
     local icon = r:CreateTexture(nil, "ARTWORK")
     icon:SetWidth(24)
     icon:SetHeight(24)
@@ -574,6 +570,7 @@ for i = 1, ROWS do
     r.text = text
     local sub = r:CreateFontString(nil, "ARTWORK", "GameFontDisableSmall")
     sub:SetPoint("RIGHT", r, "RIGHT", -4, 0)
+    P.Paint(sub, C.grey)
     r.sub = sub
     r.index = i
     r:SetScript("OnClick", function()
@@ -601,7 +598,9 @@ function Picker.Refresh()
             r.icon:SetTexture(e.icon)
             r.text:SetText(e.label)
             r.sub:SetText(e.sub or "")
-            if Picker.top + i - 1 == Picker.row then r.hi:Show() else r.hi:Hide() end
+            local lit = Picker.top + i - 1 == Picker.row
+            P.ShowSelect(r.select, lit)
+            if lit then r.text:SetTextColor(1, 1, 1) else P.Paint(r.text, C.cream) end
             r:Show()
         else
             r:Hide()

@@ -57,8 +57,12 @@ function BenillaPad_Inspect()
     InspectUnit("target")
 end
 
--- Select: the controller menu.
+-- Select: the controller menu. A press of the pad's Select waits for its release (Peek.lua): a
+-- short press opens the menu, a hold shows the zone map.
 function BenillaPad_Menu()
+    if P.Peek and P.Peek.Defer() then
+        return
+    end
     P.Menu.Toggle()
 end
 

@@ -204,6 +204,7 @@ function BenillaPad_Snap(dir, x, y)
     if dir == "enter" then
         local button = Cursor.Primary()
         if button and button:GetLeft() then
+            Cursor.Snapped(button)
             local s = button:GetEffectiveScale()
             return (button:GetLeft() + button:GetWidth() / 2) * s,
                 (button:GetBottom() + button:GetHeight() / 2) * s
@@ -228,6 +229,7 @@ function BenillaPad_Snap(dir, x, y)
         end
     end
     if best then
+        Cursor.Snapped(best.frame)
         return best.x, best.y
     end
     return nil
@@ -235,8 +237,12 @@ end
 
 -- ── The focus glow ──
 -- A gold outline round the button under the pad cursor (a console UI's frame focus), so the
--- pointer is never lost: the OS cursor is small, the outline follows whatever it is over, snapped
--- by the D-pad or moved by the stick. Drawn in the DIALOG strata over the windows it outlines.
+-- pointer is never lost: the OS cursor is small, the outline follows whatever it is over. Two
+-- looks: a button the D-pad snapped to (BenillaPad_Snap) gets Forever's SmartNav focus, a gold
+-- arrow bobbing at its left edge and a thin gold stroke round it (Art/Focus_Arrow and
+-- Art/Focus_Select, ImprovedForever's ic_tri and ic_select, MIT); once the stick moves the
+-- pointer off it, the plainer outline and faint fill follow the pointer. Drawn in the TOOLTIP
+-- strata over the windows it outlines.
 
 local glow = CreateFrame("Frame", "BenillaPadFocusGlow", UIParent)
 glow:SetFrameStrata("TOOLTIP")
@@ -263,6 +269,33 @@ right:SetWidth(TH)
 local fill = glow:CreateTexture(nil, "ARTWORK")
 fill:SetAllPoints(glow)
 fill:SetTexture(1, 0.82, 0.2, 0.12)
+local plain = { top, bottom, left, right, fill }
+
+-- The snapped look: the stroke just outside the button, the arrow left of it. ic_tri points
+-- down; the 8-value texcoord turns it a quarter left, to point right.
+local stroke = P.AddSelect(glow, { corner = 6, out = 0, hollow = true, layer = "OVERLAY" })
+local arrow = glow:CreateTexture(nil, "OVERLAY")
+arrow:SetTexture(P.ART .. "Focus_Arrow")
+arrow:SetTexCoord(1, 0, 0, 0, 1, 1, 0, 1)
+arrow:SetVertexColor(1, 0.82, 0.2)
+arrow:SetWidth(18)
+arrow:SetHeight(18)
+arrow:Hide()
+
+-- The button the last D-pad snap landed on, and when.
+local snapped, snapAt = nil, 0
+function Cursor.Snapped(f)
+    snapped = f
+    snapAt = GetTime()
+end
+
+local function look(isSnapped)
+    for i = 1, table.getn(plain) do
+        if isSnapped then plain[i]:Hide() else plain[i]:Show() end
+    end
+    P.ShowSelect(stroke, isSnapped)
+    if isSnapped then arrow:Show() else arrow:Hide() end
+end
 
 local glowElapsed = 0
 local poll = CreateFrame("Frame", nil, UIParent)
@@ -272,7 +305,19 @@ poll:SetScript("OnUpdate", function()
         return
     end
     glowElapsed = 0
-    local f = P.connected and P.mode == "world" and Cursor.Wanted() and GetMouseFocus()
+    if not (P.connected and P.mode == "world" and Cursor.Wanted()) then
+        snapped = nil
+        glow:Hide()
+        return
+    end
+    local f = GetMouseFocus()
+    -- A snap holds while the pointer is on its button, and for a moment while it gets there.
+    if snapped and (not snapped:IsVisible() or (f ~= snapped and GetTime() - snapAt > 0.3)) then
+        snapped = nil
+    end
+    if snapped then
+        f = snapped
+    end
     local kind = f and f.GetObjectType and f:GetObjectType()
     if not (f and (kind == "Button" or kind == "CheckButton") and f:IsVisible() and f:GetLeft()) then
         glow:Hide()
@@ -284,6 +329,13 @@ poll:SetScript("OnUpdate", function()
     glow:SetPoint("BOTTOMLEFT", UIParent, "BOTTOMLEFT", f:GetLeft() * s - 3, f:GetBottom() * s - 3)
     glow:SetWidth(f:GetWidth() * s + 6)
     glow:SetHeight(f:GetHeight() * s + 6)
+    look(snapped ~= nil)
+    if snapped then
+        -- Forever's bob: 3 px in and out over 0.8 s.
+        local bob = 3 * math.sin(GetTime() * 2 * math.pi / 0.8)
+        arrow:ClearAllPoints()
+        arrow:SetPoint("RIGHT", glow, "LEFT", bob - 1, 0)
+    end
     glow:Show()
 end)
 

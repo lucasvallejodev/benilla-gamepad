@@ -112,6 +112,93 @@ function P.AddPlate(f)
     edge("TOPRIGHT", "BOTTOMRIGHT", 1, nil)
 end
 
+-- The bronze and gold palette of ImprovedForever's ConfigKit (K.C): titles and headings gold,
+-- labels cream, help text sand, lines bronze.
+P.COLOR = {
+    title = { 0.95, 0.77, 0.24 },   -- F2C43C
+    focus = { 1, 0.82, 0.29 },      -- FFD24A
+    gold = { 1, 0.82, 0 },
+    cream = { 0.94, 0.89, 0.78 },   -- EFE4C8
+    help = { 0.73, 0.67, 0.55 },    -- B9AB8C
+    grey = { 0.62, 0.57, 0.48 },    -- 9D917A
+    line = { 0.35, 0.27, 0.19 },    -- 5A4630
+    danger = { 1, 0.48, 0.36 },     -- FF7A5C
+}
+
+function P.Paint(fs, color)
+    fs:SetTextColor(color[1], color[2], color[3])
+end
+
+-- A thin bronze rule under a heading, `width` wide, its top `y` below `parent`'s top.
+function P.AddRule(parent, width, y)
+    local t = parent:CreateTexture(nil, "BORDER")
+    t:SetTexture(P.COLOR.line[1], P.COLOR.line[2], P.COLOR.line[3], 1)
+    t:SetWidth(width)
+    t:SetHeight(1)
+    t:SetPoint("TOP", parent, "TOP", 0, -y)
+    return t
+end
+
+-- The gold focus stroke (Art/Focus_Select, ImprovedForever's ic_select: 128x32, 10 px corners)
+-- as a nine-slice on `f`, `out` px outside its edges; `hollow` leaves out the faint gold
+-- middle. Drawn in `layer` (BORDER: under the row's text). P.ShowSelect turns it on and off.
+local SLICE_U = { 0, 10 / 128, 118 / 128, 1 }
+local SLICE_V = { 0, 10 / 32, 22 / 32, 1 }
+
+function P.AddSelect(f, opts)
+    opts = opts or {}
+    local d = opts.corner or 8
+    local o = opts.out or 0
+    local c = opts.color or { 1, 0.9, 0.4 }
+    -- Each piece: its column and row in the texture, then one or two anchors (point, x, y),
+    -- and whether it is d wide and d high (corners both, edges one, the middle neither).
+    local spec = {
+        { 1, 1, { "TOPLEFT", -o, o }, nil, true, true },
+        { 2, 1, { "TOPLEFT", d - o, o }, { "TOPRIGHT", o - d, o }, false, true },
+        { 3, 1, { "TOPRIGHT", o, o }, nil, true, true },
+        { 1, 2, { "TOPLEFT", -o, o - d }, { "BOTTOMLEFT", -o, d - o }, true, false },
+        { 2, 2, { "TOPLEFT", d - o, o - d }, { "BOTTOMRIGHT", o - d, d - o }, false, false },
+        { 3, 2, { "TOPRIGHT", o, o - d }, { "BOTTOMRIGHT", o, d - o }, true, false },
+        { 1, 3, { "BOTTOMLEFT", -o, -o }, nil, true, true },
+        { 2, 3, { "BOTTOMLEFT", d - o, -o }, { "BOTTOMRIGHT", o - d, -o }, false, true },
+        { 3, 3, { "BOTTOMRIGHT", o, -o }, nil, true, true },
+    }
+    local pieces = {}
+    for i = 1, table.getn(spec) do
+        local s = spec[i]
+        local col, row = s[1], s[2]
+        if not (opts.hollow and col == 2 and row == 2) then
+            local t = f:CreateTexture(nil, opts.layer or "BORDER")
+            t:SetTexture(P.ART .. "Focus_Select")
+            t:SetTexCoord(SLICE_U[col], SLICE_U[col + 1], SLICE_V[row], SLICE_V[row + 1])
+            t:SetPoint(s[3][1], f, s[3][1], s[3][2], s[3][3])
+            if s[4] then
+                t:SetPoint(s[4][1], f, s[4][1], s[4][2], s[4][3])
+            end
+            if s[5] then
+                t:SetWidth(d)
+            end
+            if s[6] then
+                t:SetHeight(d)
+            end
+            t:SetVertexColor(c[1], c[2], c[3], opts.alpha or 1)
+            t:Hide()
+            table.insert(pieces, t)
+        end
+    end
+    return pieces
+end
+
+function P.ShowSelect(pieces, on)
+    for i = 1, table.getn(pieces) do
+        if on then
+            pieces[i]:Show()
+        else
+            pieces[i]:Hide()
+        end
+    end
+end
+
 -- A row of hints on `parent`. opts: size (glyph, 24), font (the verb's, "GameFontNormal"),
 -- pad (10), spacing between hints (15), maxWidth (wraps whole hints onto more lines), plate.
 function P.NewHints(parent, opts)

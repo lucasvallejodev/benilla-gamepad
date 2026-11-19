@@ -25,7 +25,7 @@ local function worldRows()
         { keys = { "LB", "+", "DPAD" }, text = "Party targets" },
         { keys = "X", text = "Interact / loot" },
         { keys = "START", text = "Window wheel" },
-        { keys = "SELECT", text = "Controller menu" },
+        { keys = "SELECT", text = "Menu  (hold: map)" },
     }
 end
 

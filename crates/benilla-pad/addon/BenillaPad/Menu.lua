@@ -8,12 +8,11 @@ P.Menu = Menu
 
 local WIDTH = 440
 local ROW = 28
-local BACKDROP = {
-    bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
-    edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
-    tile = true, tileSize = 32, edgeSize = 32,
-    insets = { left = 11, right = 12, top = 12, bottom = 11 },
-}
+-- The most rows a page has (the Look page's eleven, and room to grow).
+local MAX_ROWS = 12
+-- Drawn as the legend and the wheel: the dark plate with its bronze edge (Glyphs.lua), headings
+-- in gold, labels cream, values white, the lit row in a gold stroke.
+local C = P.COLOR
 
 -- ── Row kinds ──
 -- link:   { label, desc, open = page } or { label, desc, run = function }
@@ -84,6 +83,9 @@ Menu.pages = {
                 desc = "The controller rumbles when you are hit, land a critical hit, cast, level up, hand in a quest, loot, fall or die, and beats like a heart below a quarter of your health. Light is half strength.",
                 key = "vibration", values = { { "off", "Off" }, { "light", "Light" }, { "full", "Full" } },
                 changed = function() if P.Vibe then P.Vibe.Play("sample") end end },
+            { label = "NPC dialogue",
+                desc = "Subtitles: talking to an NPC shows its words low on the screen, with its answers, quests and rewards under them, driven by the D-pad, A and B. Classic windows: the game's own gossip and quest windows under the pad cursor.",
+                key = "npcDialog", values = { { "subtitles", "Subtitles" }, { "classic", "Classic windows" } } },
         },
     },
     look = {
@@ -122,7 +124,7 @@ Menu.history = {}
 local win = CreateFrame("Frame", "BenillaPadMenu", UIParent)
 win:SetWidth(WIDTH)
 win:SetFrameStrata("DIALOG")
-win:SetBackdrop(BACKDROP)
+P.AddPlate(win)
 win:SetPoint("LEFT", UIParent, "LEFT", 40, 60)
 win:EnableMouse(true)
 win:Hide()
@@ -130,11 +132,14 @@ tinsert(UISpecialFrames, "BenillaPadMenu")
 Menu.frame = win
 
 local title = win:CreateFontString(nil, "ARTWORK", "GameFontNormalLarge")
-title:SetPoint("TOP", win, "TOP", 0, -20)
+title:SetPoint("TOP", win, "TOP", 0, -18)
+P.Paint(title, C.title)
+P.AddRule(win, WIDTH - 40, 42)
 
 local desc = win:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
 desc:SetWidth(WIDTH - 50)
 desc:SetJustifyH("LEFT")
+P.Paint(desc, C.help)
 
 -- The prompts as glyphs and gold verbs (Glyphs.lua).
 local hint = P.NewHints(win, { size = 16, pad = 0, spacing = 12, font = "GameFontNormalSmall", maxWidth = WIDTH - 40 })
@@ -142,21 +147,12 @@ hint:SetPoint("BOTTOM", win, "BOTTOM", 0, 20)
 P.SetHintText(hint, "D-pad: move    Left / Right: change    A: choose    B: back")
 
 local rows = {}
-for i = 1, 10 do
+for i = 1, MAX_ROWS do
     local r = CreateFrame("Button", nil, win)
     r:SetWidth(WIDTH - 40)
     r:SetHeight(ROW - 2)
     r:SetPoint("TOPLEFT", win, "TOPLEFT", 20, -50 - (i - 1) * ROW)
-    local hi = r:CreateTexture(nil, "BACKGROUND")
-    hi:SetAllPoints(r)
-    hi:SetTexture(1, 0.75, 0.1, 0.22)
-    r.hi = hi
-    local bar = r:CreateTexture(nil, "ARTWORK")
-    bar:SetWidth(3)
-    bar:SetPoint("TOPLEFT", r, "TOPLEFT", 0, 0)
-    bar:SetPoint("BOTTOMLEFT", r, "BOTTOMLEFT", 0, 0)
-    bar:SetTexture(1, 0.82, 0)
-    r.bar = bar
+    r.select = P.AddSelect(r, { corner = 8 })
     local label = r:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
     label:SetPoint("LEFT", r, "LEFT", 12, 0)
     r.label = label
@@ -181,13 +177,14 @@ for i = 1, 10 do
     rows[i] = r
 end
 
+-- Values white between gold arrows; Off in the palette's grey.
 local function valueText(row)
     if row.open then
-        return "|cffffd100>|r"
+        return "|cffffd24a>|r"
     end
     if row.run then
         if row.label == "Reset all settings" and Menu.confirm then
-            return "|cffff4040Press A again|r"
+            return "|cffff7a5cPress A again|r"
         end
         return ""
     end
@@ -195,18 +192,18 @@ local function valueText(row)
     if row.values then
         for i = 1, table.getn(row.values) do
             if row.values[i][1] == v then
-                return "|cffffd100< " .. row.values[i][2] .. " >|r"
+                return "|cffffd24a<|r  " .. row.values[i][2] .. "  |cffffd24a>|r"
             end
         end
         return "?"
     end
     if row.min then
-        return "|cffffd100< " .. row.fmt(v) .. " >|r"
+        return "|cffffd24a<|r  " .. row.fmt(v) .. "  |cffffd24a>|r"
     end
     if v then
-        return "|cff40ff40On|r"
+        return "On"
     end
-    return "|cffff4040Off|r"
+    return "|cff9d917aOff|r"
 end
 
 function Menu.Refresh()
@@ -224,12 +221,13 @@ function Menu.Refresh()
         if row then
             r.label:SetText(row.label)
             r.value:SetText(valueText(row))
+            r.value:SetTextColor(1, 1, 1)
             if i == Menu.row then
-                r.hi:Show()
-                r.bar:Show()
+                P.ShowSelect(r.select, true)
+                r.label:SetTextColor(1, 1, 1)
             else
-                r.hi:Hide()
-                r.bar:Hide()
+                P.ShowSelect(r.select, false)
+                P.Paint(r.label, C.cream)
             end
             r:Show()
         else

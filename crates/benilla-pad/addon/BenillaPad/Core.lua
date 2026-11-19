@@ -75,6 +75,9 @@ P.DEFAULTS = {
     walkToInteract = true,
     -- Controller vibration on game events (Vibration.lua): "off", "light" or "full".
     vibration = "full",
+    -- Gossip and quest windows with a pad (Dialog.lua): "subtitles" (our panel low on the
+    -- screen) or "classic" (the stock windows under the pad cursor).
+    npcDialog = "subtitles",
 }
 
 -- The vibration setting's strength.
@@ -487,7 +490,7 @@ function BenillaPad_Resolve(btn, layer)
     return nil
 end
 
--- The pad's mode ("world", "wheel", "menu", "keyboard", "cursor"), the settings generation, the
+-- The pad's mode ("world", "wheel", "menu", "keyboard", "dialog", "cursor"), the settings generation, the
 -- windows' primary-button serial and the rumble serial. This addon's own windows set P.mode;
 -- otherwise an open stock window asks for the cursor.
 function BenillaPad_Mode()

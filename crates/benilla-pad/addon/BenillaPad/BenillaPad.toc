@@ -20,3 +20,5 @@ Legend.lua
 Bots.lua
 Chat.lua
 Vibration.lua
+Dialog.lua
+Peek.lua
