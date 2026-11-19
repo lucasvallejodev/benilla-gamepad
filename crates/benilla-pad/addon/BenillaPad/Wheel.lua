@@ -214,7 +214,8 @@ local chosen = win:CreateFontString(nil, "OVERLAY")
 chosen:SetFont("Fonts\\FRIZQT__.TTF", 16, "OUTLINE")
 chosen:SetPoint("CENTER", win, "CENTER", 0, -30)
 
-local hint = win:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+-- The prompts as glyphs and gold verbs (Glyphs.lua), inside the hub.
+local hint = P.NewHints(win, { size = 18, pad = 0, spacing = 10, font = "GameFontNormalSmall", maxWidth = 250 })
 hint:SetPoint("CENTER", win, "CENTER", 0, -56)
 
 -- The pointer: the minimap's player arrow, turned toward the stick with an 8-point texcoord.
@@ -389,7 +390,7 @@ function Wheel.Fill()
         local page = WINDOW_PAGES[Wheel.page]
         Wheel.entries = page.entries
         pageTitle:SetText(page.title)
-        hint:SetText("Stick: point   A: open   LB / RB: page   B: close")
+        P.SetHintText(hint, "Stick: point   A: open   LB / RB: page   B: close")
         for i = 1, table.getn(dots) do
             if i <= table.getn(WINDOW_PAGES) then
                 dots[i]:Show()
@@ -405,7 +406,7 @@ function Wheel.Fill()
     elseif Wheel.set == "bots" then
         Wheel.entries = botEntries()
         pageTitle:SetText("Bots")
-        hint:SetText("To: " .. P.Bots.TargetLabel() .. "   Y: change   A: send   B: close")
+        P.SetHintText(hint, "To: " .. P.Bots.TargetLabel() .. "   Y: change   A: send   B: close")
         for i = 1, table.getn(dots) do
             dots[i]:Hide()
         end
@@ -413,9 +414,9 @@ function Wheel.Fill()
         Wheel.entries = consumableEntries()
         pageTitle:SetText("Consumables")
         if table.getn(Wheel.entries) == 0 then
-            hint:SetText("Nothing to use in your bags   B: close")
+            P.SetHintText(hint, "Nothing to use in your bags   B: close")
         else
-            hint:SetText("Stick: point   A: use   B: close")
+            P.SetHintText(hint, "Stick: point   A: use   B: close")
         end
         for i = 1, table.getn(dots) do
             dots[i]:Hide()
@@ -506,7 +507,7 @@ function Wheel.Nav(btn)
         Wheel.Close()
     elseif btn == "Y" and Wheel.set == "bots" then
         P.Bots.CycleTarget(1)
-        hint:SetText("To: " .. P.Bots.TargetLabel() .. "   Y: change   A: send   B: close")
+        P.SetHintText(hint, "To: " .. P.Bots.TargetLabel() .. "   Y: change   A: send   B: close")
     elseif btn == "DRIGHT" or btn == "DDOWN" then
         Wheel.Step(1)
     elseif btn == "DLEFT" or btn == "DUP" then

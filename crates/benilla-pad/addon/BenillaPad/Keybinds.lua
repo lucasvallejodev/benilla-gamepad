@@ -202,11 +202,11 @@ local layerText = win:CreateFontString(nil, "ARTWORK", "GameFontNormalLarge")
 layerText:SetPoint("CENTER", win, "CENTER", 0, -4)
 
 local described = win:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
-described:SetPoint("BOTTOM", win, "BOTTOM", 0, 52)
-
-local hints = win:CreateFontString(nil, "ARTWORK", "GameFontDisableSmall")
+-- The prompts as glyphs and gold verbs (Glyphs.lua); the description sits over them, however
+-- many lines they wrap to.
+local hints = P.NewHints(win, { size = 16, pad = 0, spacing = 12, font = "GameFontNormalSmall", maxWidth = 580 })
 hints:SetPoint("BOTTOM", win, "BOTTOM", 0, 22)
-hints:SetWidth(580)
+described:SetPoint("BOTTOM", hints, "TOP", 0, 10)
 
 -- The layer tabs; LB / RB step them, holding a trigger shows that layer.
 local tabs = {}
@@ -334,12 +334,12 @@ function Binds.Refresh()
     end
     described:SetText(prefix .. BUTTON_TITLE[Binds.selected] .. ":  " .. (name or "Empty") .. formNote)
     if Binds.capture then
-        hints:SetText("|cffffd100Press the combo|r to bind " .. Binds.capture.label
+        P.SetHintText(hints, "|cffffd100Press the combo|r to bind " .. Binds.capture.label
             .. " (hold LT / RT for their layers).   Select: cancel")
     elseif Binds.picked then
-        hints:SetText("A: put it here (swaps)   B: cancel   D-pad: move")
+        P.SetHintText(hints, "A: put it here (swaps)   B: cancel   D-pad: move")
     else
-        hints:SetText("D-pad: move   A: pick up / put down   X: clear   Y: spell list   Start: default"
+        P.SetHintText(hints, "D-pad: move   A: pick up / put down   X: clear   Y: spell list   Start: default"
             .. "   LB / RB: layer   Hold LT / RT: that layer   B: close")
     end
 end
@@ -491,10 +491,9 @@ pick:Hide()
 local pickTitle = pick:CreateFontString(nil, "ARTWORK", "GameFontNormal")
 pickTitle:SetPoint("TOP", pick, "TOP", 0, -20)
 
-local pickHint = pick:CreateFontString(nil, "ARTWORK", "GameFontDisableSmall")
+local pickHint = P.NewHints(pick, { size = 16, pad = 0, spacing = 12, font = "GameFontNormalSmall", maxWidth = 270 })
 pickHint:SetPoint("BOTTOM", pick, "BOTTOM", 0, 20)
-pickHint:SetWidth(270)
-pickHint:SetText("A: bind to the selected button   X: bind to a combo   D-pad: move / list   B: back")
+P.SetHintText(pickHint, "A: bind to the selected button   X: bind to a combo   D-pad: move / list   B: back")
 
 Picker.lists = {}
 Picker.list = 1

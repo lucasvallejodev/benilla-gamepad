@@ -6,6 +6,7 @@
 ## SavedVariables: BenillaPadDB
 ## SavedVariablesPerCharacter: BenillaPadCharDB
 Core.lua
+Glyphs.lua
 Actions.lua
 Bar.lua
 XpBar.lua

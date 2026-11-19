@@ -46,9 +46,10 @@ edit:SetMaxLetters(255)
 edit:SetScript("OnEnterPressed", function() Keyboard.Done() end)
 edit:SetScript("OnEscapePressed", function() Keyboard.Cancel() end)
 
-local hint = win:CreateFontString(nil, "ARTWORK", "GameFontDisableSmall")
+-- The prompts as glyphs and gold verbs (Glyphs.lua).
+local hint = P.NewHints(win, { size = 14, pad = 0, spacing = 10, font = "GameFontNormalSmall", maxWidth = 10 * (KEY + GAP) + 20 })
 hint:SetPoint("BOTTOM", win, "BOTTOM", 0, 18)
-hint:SetText("A: type   X: delete   Y: space   LB: shift   RB: 123   Start: send   B: cancel")
+P.SetHintText(hint, "A: type   X: delete   Y: space   LB: shift   RB: 123   Start: send   B: cancel")
 
 Keyboard.page = 1
 Keyboard.shift = false

@@ -1,58 +1,31 @@
--- The button legend: a small panel at the top left, under the player frame, listing what the
--- buttons do right now (a console UI's input legend). It follows the pad's mode: the world, a game
--- window under the pad cursor, the triggers' layers. The wheel, the menu and the keyboard print
--- their own hints, so it steps aside for them.
+-- The button legend: what the buttons do right now (a console UI's input legend), drawn as
+-- Forever's footer (Glyphs.lua): a dark plate with a bronze edge, each hint a glyph and a gold
+-- verb, bottom centre above the gamepad bar. It follows the pad's mode: the world, a game window
+-- under the pad cursor, the triggers' layers. The wheel, the menu and the keyboard print their
+-- own hints, so it steps aside for them.
 
 local P = BenillaPad
 local Legend = {}
 P.Legend = Legend
 
-local ROWS = 7
-local f = CreateFrame("Frame", "BenillaPadLegend", UIParent)
-f:SetWidth(210)
-f:SetHeight(ROWS * 16 + 12)
-f:SetPoint("TOPLEFT", UIParent, "TOPLEFT", 14, -92)
+-- Wider than this the hints wrap onto a second line.
+local MAX_WIDTH = 470
+
+local f = P.NewHints(UIParent, { name = "BenillaPadLegend", plate = true, size = 24, pad = 10,
+    spacing = 15, font = "GameFontNormal", maxWidth = MAX_WIDTH })
 f:SetFrameStrata("LOW")
 f:Hide()
-
-local back = f:CreateTexture(nil, "BACKGROUND")
-back:SetAllPoints(f)
-back:SetTexture(0, 0, 0, 0.35)
-
-local lines = {}
-for i = 1, ROWS do
-    local key = f:CreateFontString(nil, "OVERLAY")
-    key:SetFont("Fonts\\FRIZQT__.TTF", 11, "OUTLINE")
-    key:SetPoint("TOPLEFT", f, "TOPLEFT", 8, -6 - (i - 1) * 16)
-    key:SetWidth(70)
-    key:SetJustifyH("RIGHT")
-    key:SetTextColor(1, 0.82, 0)
-    local what = f:CreateFontString(nil, "OVERLAY")
-    what:SetFont("Fonts\\FRIZQT__.TTF", 11, "OUTLINE")
-    what:SetPoint("LEFT", key, "RIGHT", 8, 0)
-    what:SetJustifyH("LEFT")
-    what:SetTextColor(0.92, 0.92, 0.92)
-    lines[i] = { key = key, what = what }
-end
-
--- The face buttons as the connected pad names them.
-local function face(b)
-    if P.Symbols() == "playstation" then
-        local ps = { A = "Cross", B = "Circle", X = "Square", Y = "Triangle" }
-        return ps[b] or b
-    end
-    return b
-end
+Legend.frame = f
 
 local function worldRows()
     return {
-        { "L stick", "Move" },
-        { "R stick", "Camera  (LB/RB: zoom)" },
-        { "LT / RT", "Action sets" },
-        { "LB + D-pad", "Party targets" },
-        { face("X"), "Interact / loot" },
-        { "Start", "Window wheel" },
-        { "Select", "Controller menu" },
+        { keys = "LS", text = "Move" },
+        { keys = "RS", text = "Camera  (LB/RB: zoom)" },
+        { keys = { "LT", "/", "RT" }, text = "Action sets" },
+        { keys = { "LB", "+", "DPAD" }, text = "Party targets" },
+        { keys = "X", text = "Interact / loot" },
+        { keys = "START", text = "Window wheel" },
+        { keys = "SELECT", text = "Controller menu" },
     }
 end
 
@@ -71,14 +44,29 @@ end
 
 local function cursorRows()
     return {
-        { "R stick", "Pointer" },
-        { "D-pad", "Jump to button" },
-        { face("A"), primaryLabel() },
-        { face("X"), "Right-click" },
-        { "LB / RB", "Scroll" },
-        { face("B"), "Close" },
-        { "L stick", "Keep walking" },
+        { keys = "RS", text = "Pointer" },
+        { keys = "DPAD", text = "Jump to button" },
+        { keys = "A", text = primaryLabel() },
+        { keys = "X", text = "Right-click" },
+        { keys = { "LB", "/", "RB" }, text = "Scroll" },
+        { keys = "B", text = "Close" },
+        { keys = "LS", text = "Keep walking" },
     }
+end
+
+-- The screen's bottom right corner, clear of the bar in the middle and the chat on the left.
+local function place()
+    f:ClearAllPoints()
+    f:SetPoint("BOTTOMRIGHT", UIParent, "BOTTOMRIGHT", -14, 26)
+end
+
+-- A key for what is drawn, so an unchanged legend is not laid out again.
+local function signature(rows)
+    local s = P.GlyphStyle()
+    for i = 1, table.getn(rows) do
+        s = s .. "|" .. rows[i].text
+    end
+    return s
 end
 
 function Legend.Refresh()
@@ -87,27 +75,17 @@ function Legend.Refresh()
         return
     end
     local rows
-    f:ClearAllPoints()
     if P.Cursor and P.Cursor.Wanted() then
         rows = cursorRows()
-        -- The game's windows open at the top left: the legend steps to the right edge, under
-        -- the minimap, while one is up.
-        -- At the right edge's middle: the quest tracker hangs under the minimap above it.
-        f:SetPoint("RIGHT", UIParent, "RIGHT", -14, -60)
     else
         rows = worldRows()
-        f:SetPoint("TOPLEFT", UIParent, "TOPLEFT", 14, -92)
     end
-    for i = 1, ROWS do
-        local r = rows[i]
-        if r then
-            lines[i].key:SetText(r[1])
-            lines[i].what:SetText(r[2])
-        else
-            lines[i].key:SetText("")
-            lines[i].what:SetText("")
-        end
+    local sig = signature(rows)
+    if sig ~= f.shown then
+        f.shown = sig
+        P.SetHints(f, rows)
     end
+    place()
     f:Show()
 end
 

@@ -131,9 +131,10 @@ local desc = win:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
 desc:SetWidth(WIDTH - 50)
 desc:SetJustifyH("LEFT")
 
-local hint = win:CreateFontString(nil, "ARTWORK", "GameFontDisableSmall")
+-- The prompts as glyphs and gold verbs (Glyphs.lua).
+local hint = P.NewHints(win, { size = 16, pad = 0, spacing = 12, font = "GameFontNormalSmall", maxWidth = WIDTH - 40 })
 hint:SetPoint("BOTTOM", win, "BOTTOM", 0, 20)
-hint:SetText("D-pad: move    Left / Right: change    A: choose    B: back")
+P.SetHintText(hint, "D-pad: move    Left / Right: change    A: choose    B: back")
 
 local rows = {}
 for i = 1, 10 do

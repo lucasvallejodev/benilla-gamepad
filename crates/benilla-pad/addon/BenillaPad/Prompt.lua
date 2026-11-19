@@ -6,30 +6,11 @@ local P = BenillaPad
 local Prompt = {}
 P.Prompt = Prompt
 
-local f = CreateFrame("Frame", "BenillaPadPrompt", UIParent)
-f:SetWidth(160)
-f:SetHeight(30)
+-- The Forever footer's look (Glyphs.lua): a dark plate with a bronze edge, X's glyph, a gold verb.
+local f = P.NewHints(UIParent, { name = "BenillaPadPrompt", plate = true, size = 24, pad = 6 })
 f:SetFrameStrata("MEDIUM")
 f:Hide()
-
-local back = f:CreateTexture(nil, "BACKGROUND")
-back:SetAllPoints(f)
-back:SetTexture(0, 0, 0, 0.45)
-
-local badge = f:CreateTexture(nil, "ARTWORK")
-badge:SetTexture(P.ART .. "Disc")
-badge:SetWidth(24)
-badge:SetHeight(24)
-badge:SetPoint("LEFT", f, "LEFT", 4, 0)
-
-local glyph = f:CreateFontString(nil, "OVERLAY")
-glyph:SetFont("Fonts\\FRIZQT__.TTF", 13, "OUTLINE")
-glyph:SetPoint("CENTER", badge, "CENTER", 0, 0)
-
-local label = f:CreateFontString(nil, "OVERLAY")
-label:SetFont("Fonts\\FRIZQT__.TTF", 15, "OUTLINE")
-label:SetPoint("LEFT", badge, "RIGHT", 6, 0)
-label:SetTextColor(1, 1, 1)
+Prompt.frame = f
 
 local soft
 
@@ -59,18 +40,15 @@ function Prompt.Refresh()
         f:Hide()
         return
     end
-    if P.Symbols() == "playstation" then
-        glyph:SetText("[]")
-        badge:SetVertexColor(0.85, 0.45, 0.75)
-    else
-        glyph:SetText("X")
-        badge:SetVertexColor(0.20, 0.45, 0.90)
-    end
-    label:SetText(verb)
+    local text = verb
     if UnitExists("target") and UnitName("target") then
-        label:SetText(verb .. "  |cffd0d0d0" .. UnitName("target") .. "|r")
+        text = verb .. "  |cffd0d0d0" .. UnitName("target") .. "|r"
     end
-    f:SetWidth(label:GetStringWidth() + 46)
+    local shown = P.GlyphStyle() .. text
+    if shown ~= f.shown then
+        f.shown = shown
+        P.SetHints(f, { { keys = "X", text = text } })
+    end
     Prompt.Place()
     f:Show()
 end

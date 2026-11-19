@@ -122,9 +122,9 @@ close:SetPoint("TOPRIGHT", win, "TOPRIGHT", -6, -6)
 local sendTo = win:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
 sendTo:SetPoint("TOPLEFT", win, "TOPLEFT", GRID_X, -84)
 
-local hint = win:CreateFontString(nil, "ARTWORK", "GameFontDisableSmall")
+-- The prompts as glyphs and gold verbs (Glyphs.lua).
+local hint = P.NewHints(win, { size = 16, pad = 0, spacing = 12, font = "GameFontNormalSmall", maxWidth = WIDTH - 40 })
 hint:SetPoint("BOTTOM", win, "BOTTOM", 0, 18)
-hint:SetWidth(WIDTH - 40)
 
 local tabs = {}
 for i = 1, table.getn(TABS) do
@@ -352,15 +352,15 @@ function Chat.Refresh()
         sendTo:SetText("Commands go to: |cffffd100" .. Bots.TargetLabel() .. "|r   (Y: change)")
         sendTo:Show()
         if Chat.focus == "list" then
-            hint:SetText("D-pad: choose a category   A / Right: open it   LB / RB: tab   B: close")
+            P.SetHintText(hint, "D-pad: choose a category   A / Right: open it   LB / RB: tab   B: close")
         elseif botCategories()[Chat.category].roster then
-            hint:SetText("A: log in / out (or run)   X: invite   Y: send to   LB / RB: tab   B: back")
+            P.SetHintText(hint, "A: log in / out (or run)   X: invite   Y: send to   LB / RB: tab   B: back")
         else
-            hint:SetText("A: send   X: add to / remove from the bot wheel (LT+RT+Y)   Y: send to   Start: type a command   B: back")
+            P.SetHintText(hint, "A: send   X: add to / remove from the bot wheel (LT+RT+Y)   Y: send to   Start: type a command   B: back")
         end
     else
         sendTo:Hide()
-        hint:SetText("A: send   X: edit tile   Y: type a message   LB / RB: tab   B: close")
+        P.SetHintText(hint, "A: send   X: edit tile   Y: type a message   LB / RB: tab   B: close")
     end
 end
 

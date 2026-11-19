@@ -16,11 +16,14 @@ local TRIM = 0.07
 -- edge.
 local RING_SCALE = 1.3
 
-local BADGE_COLOR = {
-    A = { 0.37, 0.75, 0.22 }, B = { 0.86, 0.20, 0.18 },
-    X = { 0.20, 0.45, 0.90 }, Y = { 0.95, 0.75, 0.10 },
-}
-local PS_GLYPH = { A = "X", B = "O", X = "[]", Y = "/\\" }
+-- The button's glyph (Glyphs.lua) at a corner of the slot.
+local BADGE = 22
+-- The ring and the square's border at rest; while cooling they take the colour of the share left.
+local RING_COLOR = { 0.85, 0.72, 0.5 }
+-- The global cooldown and shorter are not shown (GamepadBar's GCD_MAX).
+local GCD_MAX = 1.6
+-- The "ready" flash when a cooldown ends, seconds.
+local FLASH_TIME = 0.6
 
 -- Where each button sits, from the bar's centre.
 local DPAD_X, FACE_X, STEP = -150, 150, 46
@@ -85,6 +88,36 @@ local function paintTabs()
     end
     local c = LAYER_COLOR[P.layer] or LAYER_COLOR.bare
     layerText:SetTextColor(c[1], c[2], c[3])
+    Bar.PaintPips()
+end
+
+-- Set pips (GamepadBar's): four dots between the clusters, one per set in P.LAYERS order (none,
+-- LT, RT, LT+RT); the held set's is lit gold and larger.
+local PIP_LIT, PIP_DIM, PIP_STEP, PIP_Y = 11, 8, 16, 34
+local pips = {}
+for i = 1, table.getn(P.LAYERS) do
+    local d = frame:CreateTexture(nil, "OVERLAY")
+    d:SetTexture(ART .. "Disc")
+    d:SetWidth(PIP_DIM)
+    d:SetHeight(PIP_DIM)
+    d:SetVertexColor(0.45, 0.45, 0.45, 0.7)
+    d:SetPoint("CENTER", frame, "CENTER", (i - (table.getn(P.LAYERS) + 1) / 2) * PIP_STEP, PIP_Y)
+    pips[i] = d
+end
+
+function Bar.PaintPips()
+    for i = 1, table.getn(pips) do
+        local d = pips[i]
+        if P.LAYERS[i] == P.layer then
+            d:SetWidth(PIP_LIT)
+            d:SetHeight(PIP_LIT)
+            d:SetVertexColor(1, 0.82, 0, 1)
+        else
+            d:SetWidth(PIP_DIM)
+            d:SetHeight(PIP_DIM)
+            d:SetVertexColor(0.45, 0.45, 0.45, 0.7)
+        end
+    end
 end
 
 -- The buttons that carry the other sets' previews, and a preview's size.
@@ -131,11 +164,12 @@ local function newButton(key)
         newIconRound(b, size)
         local ring = b:CreateTexture(nil, "OVERLAY")
         ring:SetTexture(ART .. "Ring")
-        ring:SetVertexColor(0.85, 0.72, 0.5)
+        ring:SetVertexColor(RING_COLOR[1], RING_COLOR[2], RING_COLOR[3])
         ring:SetWidth(size * RING_SCALE)
         ring:SetHeight(size * RING_SCALE)
         ring:SetPoint("CENTER", b, "CENTER", 0, 0)
         b.ring = ring
+        b.ringRest = RING_COLOR
         local hi = b:CreateTexture(nil, "OVERLAY")
         hi:SetTexture(ART .. "RingSelect")
         hi:SetWidth(size * RING_SCALE)
@@ -155,6 +189,8 @@ local function newButton(key)
         border:SetWidth(size * 66 / 36)
         border:SetHeight(size * 66 / 36)
         border:SetPoint("CENTER", b, "CENTER", 0, -1)
+        b.ring = border
+        b.ringRest = { 1, 1, 1 }
         local hi = b:CreateTexture(nil, "OVERLAY")
         hi:SetTexture("Interface\\Buttons\\CheckButtonHilight")
         hi:SetBlendMode("ADD")
@@ -190,17 +226,24 @@ local function newButton(key)
     count:SetPoint("BOTTOMRIGHT", b, "BOTTOMRIGHT", -2, 2)
     b.count = count
 
-    local badge = over:CreateTexture(nil, "OVERLAY")
-    badge:SetTexture(ART .. "Disc")
-    badge:SetWidth(20)
-    badge:SetHeight(20)
-    badge:SetVertexColor(0.05, 0.05, 0.05, 0.9)
+    -- The "ready" flash: a light over the slot that fades when a cooldown ends.
+    local flash = over:CreateTexture(nil, "ARTWORK")
+    if round then
+        flash:SetTexture(ART .. "RingSelect")
+        flash:SetWidth(size * RING_SCALE)
+        flash:SetHeight(size * RING_SCALE)
+        flash:SetPoint("CENTER", b, "CENTER", 0, 0)
+    else
+        flash:SetTexture("Interface\\Buttons\\CheckButtonHilight")
+        flash:SetAllPoints(b)
+    end
+    flash:SetBlendMode("ADD")
+    flash:Hide()
+    b.flash = flash
+
+    local badge = P.NewGlyph(over, BADGE, "OVERLAY")
     badge:SetPoint("CENTER", b, "TOPRIGHT", -3, -3)
     b.badge = badge
-    local glyph = over:CreateFontString(nil, "OVERLAY")
-    glyph:SetFont("Fonts\\FRIZQT__.TTF", 11, "OUTLINE")
-    glyph:SetPoint("CENTER", badge, "CENTER", 0, 0)
-    b.glyph = glyph
     if PLACE[key][1] < 0 and (key == "LB" or key == "L3") then
         badge:ClearAllPoints()
         badge:SetPoint("CENTER", b, "TOPLEFT", 3, -3)
@@ -208,7 +251,7 @@ local function newButton(key)
     -- The D-pad reads by its diamond; no badge.
     if string.sub(key, 1, 1) == "D" then
         badge:Hide()
-        glyph:Hide()
+        b.noBadge = true
     end
 
     -- Two small previews at the bottom corners (a crossbar's satellites): what the button
@@ -287,18 +330,81 @@ local function setCooldown(b, start, duration, enable)
 end
 
 local function setGlyph(b)
-    local key = b.key
-    local color = BADGE_COLOR[key]
-    if color then
-        local text = key
-        if P.Symbols() == "playstation" then
-            text = PS_GLYPH[key]
-        end
-        b.glyph:SetText(text)
-        b.glyph:SetTextColor(color[1], color[2], color[3])
+    if not b.noBadge then
+        P.SetGlyph(b.badge, b.key)
+    end
+end
+
+-- GamepadBar's cooldown colour by the share left: red, orange, yellow, then green.
+local function shareColor(share)
+    if share > 0.75 then
+        return 1, 0.25, 0.2
+    elseif share > 0.5 then
+        return 1, 0.55, 0.1
+    elseif share > 0.25 then
+        return 1, 0.9, 0.2
+    end
+    return 0.35, 1, 0.35
+end
+
+-- Short countdown text: "2h", "2m", "45".
+local function shortTime(left)
+    if left >= 3600 then
+        return math.ceil(left / 3600) .. "h"
+    elseif left >= 60 then
+        return math.ceil(left / 60) .. "m"
+    end
+    return tostring(math.ceil(left))
+end
+
+-- The countdown, its colour, and the flash when it ends. `what` names the slot or spell the
+-- cooldown belongs to, so a layer change is not taken for a cooldown ending.
+local function showCooldown(b, what, start, duration, enable)
+    local left = 0
+    if enable == 1 and duration and duration > GCD_MAX then
+        left = start + duration - GetTime()
+    end
+    local rest = b.ringRest
+    if left > 0 then
+        local r, g, bl = shareColor(left / duration)
+        b.timer:SetText(shortTime(left))
+        b.timer:SetTextColor(r, g, bl)
+        b.ring:SetVertexColor(r, g, bl)
+        b.cooling = what
     else
-        b.glyph:SetText(key)
-        b.glyph:SetTextColor(0.9, 0.9, 0.9)
+        b.timer:SetText("")
+        if b.cooling then
+            b.ring:SetVertexColor(rest[1], rest[2], rest[3])
+            if b.cooling == what then
+                b.flashStart = GetTime()
+                b.flash:SetVertexColor(1, 1, 1, 1)
+                b.flash:Show()
+            end
+            b.cooling = nil
+        end
+    end
+end
+
+local function clearCooldown(b)
+    b.timer:SetText("")
+    if b.cooling then
+        local rest = b.ringRest
+        b.ring:SetVertexColor(rest[1], rest[2], rest[3])
+        b.cooling = nil
+    end
+end
+
+-- The flash's fade, every frame while one shows.
+local function fadeFlash(b)
+    if not b.flashStart then
+        return
+    end
+    local t = (GetTime() - b.flashStart) / FLASH_TIME
+    if t >= 1 then
+        b.flashStart = nil
+        b.flash:Hide()
+    else
+        b.flash:SetVertexColor(1, 1, 1, 1 - t)
     end
 end
 
@@ -386,21 +492,17 @@ function Bar.UpdateState(b)
     if b.spellIndex then
         tintIcon(b, 1, 1, 1)
         local start, duration, enable = GetSpellCooldown(b.spellIndex, "spell")
-        local left = 0
-        if enable == 1 and duration and duration > 1.5 then
-            left = start + duration - GetTime()
-        end
-        if left > 0 then b.timer:SetText(math.ceil(left)) else b.timer:SetText("") end
+        showCooldown(b, "spell" .. b.spellIndex, start, duration, enable)
         return
     end
     if not slot or not HasAction(slot) then
         tintIcon(b, 1, 1, 1)
-        b.timer:SetText("")
+        clearCooldown(b)
         return
     end
     local usable, noMana = IsUsableAction(slot)
     if IsActionInRange(slot) == 0 then
-        tintIcon(b, 0.85, 0.15, 0.15)
+        tintIcon(b, 1, 0.5, 0.5)
     elseif usable then
         tintIcon(b, 1, 1, 1)
     elseif noMana then
@@ -409,19 +511,7 @@ function Bar.UpdateState(b)
         tintIcon(b, 0.4, 0.4, 0.4)
     end
     local start, duration, enable = GetActionCooldown(slot)
-    local left = 0
-    if enable == 1 and duration and duration > 1.5 then
-        left = start + duration - GetTime()
-    end
-    if left > 0 then
-        if left >= 60 then
-            b.timer:SetText(math.ceil(left / 60) .. "m")
-        else
-            b.timer:SetText(math.ceil(left))
-        end
-    else
-        b.timer:SetText("")
-    end
+    showCooldown(b, "slot" .. slot, start, duration, enable)
 end
 
 -- The stock bars, gone while the gamepad bar shows: each is hidden and moved under a hidden frame,
@@ -559,6 +649,11 @@ frame:SetScript("OnUpdate", function()
     local alpha = (P.mode == "wheel") and 0 or 1
     if frame:GetAlpha() ~= alpha then
         frame:SetAlpha(alpha)
+    end
+    for key, b in pairs(Bar.buttons) do
+        if b.flashStart then
+            fadeFlash(b)
+        end
     end
     elapsedSince = elapsedSince + arg1
     if elapsedSince < 0.1 then
