@@ -5258,6 +5258,11 @@ fn water_body_optics(
     z_bed = max(world_pos.y - mix(sb.bed.y, p_rr.y, o.accept), 0.0);
 #endif
     o.z = select(bi.fallback_z, z_bed, o.known);
+    // benilla-gamepad fork: a seabed deeper than 25 to 45 yd is water with no bed behind it, as
+    // the sea past the terrain's last tile is: read at the authored column, all in-scatter. The
+    // two otherwise differ in colour along that tile's straight edge.
+    let os_deep = select(0.0, smoothstep(25.0, 45.0, z_bed), o.known && bi.adt);
+    o.z = mix(o.z, bi.fallback_z, os_deep);
     // On ADT water the light crosses at most the authored column, the MCLQ depth byte in yards:
     // 1.12 draws a bed through as much water as the byte says, so a bed the artists left visible
     // under a deep lake stays visible. A WMO's byte is an opacity, not a depth.
@@ -5280,6 +5285,7 @@ fn water_body_optics(
     o.t_bed = select(o.t_bed, max(o.t_bed, vec3<f32>(bi.auth_t * auth_keep)), o.known)
         * (1.0 - smoothstep(30.0, 50.0, o.z));
     o.w_in = min(o.w_in, 1.0 - max(o.t_bed.r, max(o.t_bed.g, o.t_bed.b)));
+    o.w_in = mix(o.w_in, 1.0, os_deep);
     // The ramp reads the swatch at the depth the artists coloured, by the swatch's own turbidity,
     // and never deeper than the row 1.12 colours the authored depth with: the sea's byte runs to
     // 148 yd, so a bank under 15 yd keeps the shallow rows the reference draws it with.
@@ -8340,6 +8346,15 @@ fn stylised_water(
     }
     // The river's churn, then rain and snow ([`nwg_weather_surface`]), on the final roughness.
     surf = nwg_weather_surface(surface_roughen(surf, rf.add2), xz, pv_fr);
+    // benilla-gamepad fork: the open sea's swell on the normals (all five trains; the mesh
+    // carries the longer ones' height).
+    if (os_on()) {
+        let os_w = os_weight(xz, bi.fallback_z, world_pos.y);
+        if (os_w > 0.0) {
+            let os = os_wave(xz, 0.0, pv_fr.major);
+            surf = os_surface(surf, os.yz * os_w, saturate(os.x * os_w / 1.2));
+        }
+    }
     // Held across the tiers to the composite in five words.
     let rf_held = rf_hold(rf);
     let wk_held = pack2x16float(vec2<f32>(wk_foam, wk_aer));
@@ -9423,6 +9438,93 @@ fn pv_surface_height(xz: vec2<f32>, flow: vec2<f32>, shore: f32, depth_yd: f32, 
 }
 #endif
 
+#ifdef WATER_PREVIEW
+// ---- benilla-gamepad fork: the open sea's rolling swell ------------------------------------------
+//
+// Five long trains from a far storm, on stylised ADT sea only (no lake, river, WMO pool, magma or
+// slime): the vertex stage raises the surface by their height, the fragment stage tilts the normal
+// by the same trains' slope, so the light follows the water that moves. Vertical only, with a
+// second harmonic for sharp crests and round troughs. Zero over a shallow column, so the waterline
+// stays where the reference draws it; calm round the eye when it is low over the water and round
+// the swimmer, whose game height is the flat sea's; gone by `OS_FAR` from the eye. The reference's
+// sea is a flat sheet.
+
+/// The trains: wavelength in yards, slope amplitude a·k, the second harmonic's share, and whole
+/// turns an hour (so nothing jumps when `globals.time` wraps): the deep-water periods
+/// `√(2πλ/g)` with g = 10.73 yd/s², 8.4, 6.8, 5.5, 4.5 and 3.6 s.
+const OS_N: i32 = 5;
+const OS_FAR: vec2<f32> = vec2<f32>(350.0, 700.0);
+/// The authored column, yards, over which the swell grows from nothing to whole.
+const OS_DEPTH_YD: vec2<f32> = vec2<f32>(1.5, 12.0);
+/// What the swimmer keeps of it, and the lever on the whole.
+const OS_AVATAR_KEEP: f32 = 0.35;
+const OS_GAIN: f32 = 1.0;
+/// The reflections' lookup takes at most this much of the swell's slope, so a mirror is bent and
+/// not torn.
+const OS_RF_MAX: f32 = 0.12;
+
+fn os_on() -> bool {
+    return pv_on(PV_WAVES) && w.kind.y > 0.5 && w.path.x < 0.5 && w.kind.x < 0.5 && w.path.y > 0.5;
+}
+
+/// How much of the swell stands at `xz`, over an authored column of `column_yd`, on a sea whose
+/// flat level is `y_flat`: every factor is the world's or the column's, so the two stages agree.
+fn os_weight(xz: vec2<f32>, column_yd: f32, y_flat: f32) -> f32 {
+    let eye = view.world_position.xyz;
+    let d = distance(xz, eye.xz);
+    var k = OS_GAIN * (0.8 + 0.5 * pv_sea())
+        * smoothstep(OS_DEPTH_YD.x, OS_DEPTH_YD.y, column_yd)
+        * (1.0 - smoothstep(OS_FAR.x, OS_FAR.y, d));
+    if (water_reflect.sim.z > 0.0) {
+        let avatar = water_reflect.sim.xy + vec2<f32>(0.5 / water_reflect.sim.z);
+        k = k * mix(OS_AVATAR_KEEP, 1.0, smoothstep(4.0, 30.0, distance(xz, avatar)));
+    }
+    let low = 1.0 - smoothstep(0.75, 3.0, abs(eye.y - y_flat));
+    return k * (1.0 - low * (1.0 - smoothstep(6.0, 18.0, d)));
+}
+
+/// The trains at `xz`: x the height in yards, yz the slope as the fragment carries it (the normal
+/// is `(s.x, 1, s.y)`, the height `-∫s`). A train shorter than `min_l` yards gives no height (the
+/// mesh there cannot carry it), one whose wave spans under `fp` yards times a few pixels no slope.
+fn os_wave(xz: vec2<f32>, min_l: f32, fp: f32) -> vec3<f32> {
+    var lambda = array<f32, 5>(120.0, 78.0, 52.0, 34.0, 22.0);
+    var dir = array<vec2<f32>, 5>(
+        vec2<f32>(0.6, 0.8),
+        vec2<f32>(0.3399, 0.9405),
+        vec2<f32>(0.8649, 0.5019),
+        vec2<f32>(-0.0197, 0.9998),
+        vec2<f32>(0.9899, 0.1414),
+    );
+    var slope = array<f32, 5>(0.055, 0.060, 0.062, 0.062, 0.058);
+    var stokes = array<f32, 5>(0.30, 0.26, 0.22, 0.18, 0.15);
+    var turns = array<f32, 5>(430.0, 533.0, 652.0, 807.0, 1003.0);
+    var o = vec3<f32>(0.0);
+    for (var i = 0; i < OS_N; i = i + 1) {
+        let l = lambda[i];
+        let th = TAU * fract(dot(xz, dir[i]) / l - fract(globals.time * turns[i] / 3600.0));
+        let tall = smoothstep(min_l, 1.25 * min_l, l);
+        o.x = o.x + tall * slope[i] * l / TAU * (cos(th) + 0.5 * stokes[i] * cos(2.0 * th));
+        let keep = smoothstep(2.0, 6.0, l / max(fp, 1e-4));
+        let sl = slope[i] * keep * (sin(th) + stokes[i] * sin(2.0 * th));
+        o.y = o.y + dir[i].x * sl;
+        o.z = o.z + dir[i].y * sl;
+    }
+    return o;
+}
+
+/// `s` with the swell's slope `sl` on its normals: whole on the lit normal, half on the lookup's
+/// slide, clamped on the reflections' ([`OS_RF_MAX`]); and its crest on the crest factor.
+fn os_surface(s: WaterSurface, sl: vec2<f32>, crest: f32) -> WaterSurface {
+    var o = s;
+    o.n = normalize(vec3<f32>(s.n.x / s.n.y + sl.x, 1.0, s.n.z / s.n.y + sl.y));
+    o.n_lo = normalize(vec3<f32>(s.n_lo.x / s.n_lo.y + 0.5 * sl.x, 1.0, s.n_lo.z / s.n_lo.y + 0.5 * sl.y));
+    let rf = clamp(sl, vec2<f32>(-OS_RF_MAX), vec2<f32>(OS_RF_MAX));
+    o.n_rf = normalize(vec3<f32>(s.n_rf.x / s.n_rf.y + rf.x, 1.0, s.n_rf.z / s.n_rf.y + rf.y));
+    o.crest = s.crest + crest;
+    return o;
+}
+#endif
+
 // The vertex input — bevy 0.18's `forward_io::Vertex` fields at bevy's own shader locations, plus
 // the shore offset at 10 under `LIQUID_SHORE_OFFSET` (`LiquidExt::specialize` sets the def and
 // appends the attribute to the buffer layout when the mesh carries it). Declared here rather than
@@ -9545,6 +9647,24 @@ fn vertex(in: LiquidVertex) -> LiquidVsOut {
             out.clip_position = position_world_to_clip(out.world_position.xyz);
         }
     }
+#ifndef WATER_TIER_LOW
+    // benilla-gamepad fork: the open sea's swell, whatever the distance. Past the fine ring only
+    // the trains the coarse grid can carry (30 yd and longer) raise it.
+    if (os_on()) {
+        let xz = out.world_position.xz;
+        let y_flat = out.world_position.y - out.height;
+        let column = clamp(out.depth, 0.0, 1.0) * REF_OCEAN_V_YD;
+        let wgt = os_weight(xz, column, y_flat);
+        if (wgt > 0.0) {
+            let d = distance(xz, view.world_position.xz);
+            let min_l = mix(14.0, 30.0, smoothstep(PV_HEIGHT_NEAR, PV_HEIGHT_FAR, d));
+            let h = wgt * os_wave(xz, min_l, 0.0).x;
+            out.height = out.height + h;
+            out.world_position.y = out.world_position.y + h;
+            out.clip_position = position_world_to_clip(out.world_position.xyz);
+        }
+    }
+#endif
 #endif
     out.secondary_vtx = sun_sheen(out.world_normal, out.world_position.xyz);
     // ADT surfaces carry no `MeshTag`, so they take the scene fog.

@@ -1717,7 +1717,9 @@ fn mfx_shafts(uv: vec2<f32>, rd: vec3<f32>, frag: vec2<f32>, dd: vec2<f32>) -> f
     var open = 0.0;
     for (var i = 0; i < MFX_SHAFT_TAPS; i = i + 1) {
         let q = clamp(mix(uv, suv, (f32(i) + jit) / f32(MFX_SHAFT_TAPS)), vec2<f32>(0.0), vec2<f32>(1.0));
-        open = open + select(0.0, 1.0, mfx_depth(q * dd) <= 0.0);
+        // Open sky: nothing drawn there, and above the horizon (the sea past the terrain's end
+        // has no depth either).
+        open = open + select(0.0, 1.0, mfx_depth(q * dd) <= 0.0 && wu_post_ray(q, u).y > 0.0);
     }
     return open / f32(MFX_SHAFT_TAPS) * pow(toward, 5.0) * on * k;
 }
