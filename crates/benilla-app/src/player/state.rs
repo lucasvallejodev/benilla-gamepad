@@ -123,6 +123,14 @@ pub(super) const SKIN_WIDTH: f32 = 0.02;
 /// body for good.
 pub(crate) const SETTLE_TIMEOUT: f32 = 6.0;
 
+/// Seconds from a far teleport's snap at which its reload hold gives up whatever the stream is
+/// doing. Deviation (benilla-gamepad fork): 20 s, where the hold used [`SETTLE_TIMEOUT`]. The
+/// reference's blocking load (`0x694920`) waits its reads out however long they take; a town's
+/// load runs about 4 s off a warm disk and past 6 s off a cold one or under an HD pack, and the
+/// frame was then shown with its buildings still arriving. A stream that stops for
+/// [`SETTLE_TIMEOUT`] still ends the hold at once.
+pub(crate) const RELOAD_CEILING: f32 = 20.0;
+
 /// The player body's collision capsule, swept by avian's `MoveAndSlide`: origin at its centre, the
 /// player's `pos` at its feet. Every player body sweeps it, remote ones too, as the reference runs
 /// every mover through one controller (`0x616620`); the reference sizes each from its model.
@@ -400,8 +408,9 @@ pub(crate) struct Player {
     /// How many far reloads the body's snaps have asked for ([`Self::world_reload`]'s marks), which
     /// the stream's focus carries so it re-arms its load on each.
     pub(crate) reloads: u32,
-    /// When the reload hold gives up (`Time::elapsed_secs`): the stall budget from its snap, never
-    /// extended, as the reference's wait-all ends once every read has, failed or not (`0x443d30`).
+    /// When the reload hold gives up (`Time::elapsed_secs`): [`RELOAD_CEILING`] from its snap,
+    /// never extended, as the reference's wait-all ends once every read has, failed or not
+    /// (`0x443d30`).
     pub(crate) reload_ceiling: f32,
     /// The camera pitch the login seize seats: the saved pose's `cameraPitch` when
     /// [`super::camera_saved`] restored one, else the stock opening pitch.

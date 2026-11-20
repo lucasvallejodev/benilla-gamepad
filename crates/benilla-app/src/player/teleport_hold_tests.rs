@@ -9,7 +9,7 @@ use bevy::time::TimeUpdateStrategy;
 
 use super::camera::FlyCam;
 use super::wire_in::apply_server_moves;
-use super::{OwnControlLost, Player, SETTLE_TIMEOUT};
+use super::{OwnControlLost, Player, RELOAD_CEILING};
 use crate::loading_screen::hold::PresentHold;
 use crate::loading_screen::LoadingScreen;
 use crate::net::{
@@ -242,7 +242,7 @@ fn a_worldport_under_the_hold_ends_it_and_shows_its_screen() {
 }
 
 /// The reference's wait-all returns once every read ends, failed or not (`0x443d30`), so the hold
-/// is bounded: the stall budget from the snap, which nothing extends.
+/// is bounded: the reload's ceiling from the snap, which nothing extends.
 #[test]
 fn the_hold_ends_at_its_stall_budget_from_the_snap() {
     let mut app = on_gm_island();
@@ -251,7 +251,7 @@ fn the_hold_ends_at_its_stall_budget_from_the_snap() {
     // the settle deadline.
     stream(&mut app, GM_ISLAND, false);
     let frames = |secs: f32| (secs * 10.0).round() as usize;
-    for _ in 0..frames(SETTLE_TIMEOUT - 0.5) {
+    for _ in 0..frames(RELOAD_CEILING - 0.5) {
         app.update();
     }
     assert!(held(&app), "inside the budget the frame holds");

@@ -474,7 +474,7 @@ fn mark_world_reload(player: &mut Player, from: Vec3, to: Vec3, now: f32) -> boo
     if far {
         player.world_reload = true;
         player.reloads = player.reloads.wrapping_add(1);
-        player.reload_ceiling = now + SETTLE_TIMEOUT;
+        player.reload_ceiling = now + super::RELOAD_CEILING;
     }
     far
 }
