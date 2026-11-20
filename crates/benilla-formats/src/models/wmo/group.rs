@@ -429,6 +429,9 @@ fn fix_color_vertex_alpha(
     }
 }
 
+/// `MOGP.flags` bits only a later client's files set (see [`wmo_group_submeshes`]).
+const LATER_CLIENT_GROUP_BITS: u32 = 0x0320_0000;
+
 /// The group's MOCV as the renderer uploads it, BGRA, with the doorway fade applied.
 pub fn wmo_group_fixed_colors(group_bytes: &[u8], root: &WmoRoot) -> Option<Vec<[u8; 4]>> {
     let Ok(ParsedWmo::Group(group)) = parse_wmo(&mut Cursor::new(group_bytes)) else {
@@ -497,6 +500,12 @@ pub fn wmo_group_submeshes(group_bytes: &[u8], root: &WmoRoot) -> Result<Vec<Ren
         let has_colors = colors.len() == group.vertex_positions.len();
         // Neither exterior (`0x8`) nor exterior-lit (`0x40`): the reference's interior test.
         let interior = (group.flags & 0x48) == 0;
+        // Deviation (benilla-gamepad fork): an exterior group saved by a later client's tools
+        // (`MOGP.flags` bits 1.12 never sets: mounts allowed `0x200000`, a second MOCV
+        // `0x1000000` or MOTV `0x2000000`) bakes its MOCV at half scale, 127 being untinted,
+        // as those clients draw an exterior at twice the vertex colour. Read at 1.12's scale an
+        // HD pack's house draws at half its light. No stock exterior group carries a MOCV.
+        let half_scale = !interior && group.flags & LATER_CLIENT_GROUP_BITS != 0;
         let vertex = |g: u32| {
             let p = &group.vertex_positions[g as usize];
             let n = group
@@ -509,11 +518,12 @@ pub fn wmo_group_submeshes(group_bytes: &[u8], root: &WmoRoot) -> Result<Vec<Ren
                 .map_or([0.0, 0.0], |t| [t.u, t.v]);
             // MOCV RGB is the shade multiplier; the alpha rides along and is forced opaque below
             // where it is not lighting data. No MOCV is white.
+            let k = if half_scale { 2.0 / 255.0 } else { 1.0 / 255.0 };
             let c = colors.get(g as usize).map_or([1.0, 1.0, 1.0, 1.0], |c| {
                 [
-                    c.r as f32 / 255.0,
-                    c.g as f32 / 255.0,
-                    c.b as f32 / 255.0,
+                    (c.r as f32 * k).min(1.0),
+                    (c.g as f32 * k).min(1.0),
+                    (c.b as f32 * k).min(1.0),
                     c.a as f32 / 255.0,
                 ]
             });

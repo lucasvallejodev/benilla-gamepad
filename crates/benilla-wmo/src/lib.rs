@@ -300,7 +300,10 @@ fn parse_group(mogp: &[u8]) -> Result<WmoGroup> {
                     });
                 }
             }
-            b"VCOM" => {
+            // Deviation (benilla-gamepad fork): only the first MOCV. A later client's group may
+            // carry a second (its blend layer's), which 1.12 has no use for; appended, the
+            // colours no longer matched the vertices and the whole bake was dropped.
+            b"VCOM" if g.vertex_colors.is_empty() => {
                 for c in s.as_chunks::<4>().0 {
                     g.vertex_colors.push(Color {
                         b: c[0],
