@@ -1,4 +1,5 @@
--- Quick Chat: a Bots tab (the roster and the command catalog, see Bots.lua) and phrase tabs for
+-- Quick Chat: a Bots tab (your party of throwaway bots by role and class, the command catalog, your
+-- own characters, see Bots.lua) and phrase tabs for
 -- Say, Party, Raid, Guild, Yell and Reply, driven by the pad (BENILLAPAD_NAV) or the mouse.
 --   Every tab: LB / RB change tab, B or Select close.
 --   Bots: the category list on the left, tiles on the right. A runs a tile, X adds it to the bot
@@ -50,13 +51,23 @@ Chat.tile = 1
 
 -- The Bots tab's left list: the roster, the catalog's categories, the custom commands.
 local function botCategories()
-    local list = { { title = "Roster", roster = true } }
+    local list = { { title = "Party", party = true } }
+    for i = 1, table.getn(Bots.ROLES) do
+        table.insert(list, { title = Bots.ROLES[i].title, role = Bots.ROLES[i] })
+    end
     for i = 1, table.getn(Bots.CATEGORIES) do
         table.insert(list, Bots.CATEGORIES[i])
     end
     table.insert(list, { title = "Custom", custom = true })
+    table.insert(list, { title = "My characters", roster = true })
     return list
 end
+
+local ROLE_COLOR = {
+    tank = { 0.35, 0.65, 1 }, Tank = { 0.35, 0.65, 1 },
+    healer = { 0.3, 1, 0.4 }, Healer = { 0.3, 1, 0.4 },
+    dps = { 1, 0.35, 0.25 }, DPS = { 1, 0.35, 0.25 },
+}
 
 -- ── The phrases ──
 
@@ -147,11 +158,11 @@ for i = 1, table.getn(TABS) do
 end
 
 local listRows = {}
-for i = 1, 10 do
+for i = 1, 13 do
     local r = CreateFrame("Button", nil, win)
     r:SetWidth(170)
-    r:SetHeight(26)
-    r:SetPoint("TOPLEFT", win, "TOPLEFT", 24, -84 - (i - 1) * 30)
+    r:SetHeight(24)
+    r:SetPoint("TOPLEFT", win, "TOPLEFT", 24, -84 - (i - 1) * 26)
     local bg = r:CreateTexture(nil, "BACKGROUND")
     bg:SetAllPoints(r)
     r.bg = bg
@@ -228,6 +239,32 @@ function Chat.Tiles()
         return out
     end
     local cat = botCategories()[Chat.category]
+    if cat.party then
+        local party = Bots.party
+        for i = 1, table.getn(party) do
+            local b = party[i]
+            local state = b.online and ("L" .. b.level) or "joining"
+            table.insert(out, { label = b.name, sub = b.role .. " " .. b.class .. " " .. state,
+                color = ROLE_COLOR[b.role] or { 1, 0.82, 0 }, kind = "partybot", bot = b })
+        end
+        if table.getn(party) > 0 then
+            table.insert(out, { label = "Dismiss all", sub = "everyone goes home", kind = "do", color = { 1, 0.3, 0.25 },
+                run = Bots.PartyClear })
+        else
+            table.insert(out, { label = "No bots yet", sub = "pick Add Tank, Healer or DPS", kind = "do", empty = true,
+                run = function() Chat.category = 2; Chat.focus = "list"; Chat.Refresh() end })
+        end
+        table.insert(out, { label = "Refresh", sub = "ask the server", kind = "do", run = Bots.PartyRefresh })
+        return out
+    end
+    if cat.role then
+        local classes = Bots.RoleClasses(cat.role)
+        for i = 1, table.getn(classes) do
+            table.insert(out, { label = classes[i], sub = "A: add to party", kind = "hire",
+                class = classes[i], role = cat.role.id, color = ROLE_COLOR[cat.role.id] })
+        end
+        return out
+    end
     if cat.roster then
         table.insert(out, { label = "Refresh", sub = ".bot list", kind = "do", run = Bots.Refresh })
         table.insert(out, { label = "Add all", sub = "log every bot in", kind = "do", run = Bots.AddAll })
@@ -353,6 +390,10 @@ function Chat.Refresh()
         sendTo:Show()
         if Chat.focus == "list" then
             P.SetHintText(hint, "D-pad: choose a category   A / Right: open it   LB / RB: tab   B: close")
+        elseif botCategories()[Chat.category].party then
+            P.SetHintText(hint, "A: dismiss the bot (or run)   Y: send commands to   LB / RB: tab   B: back")
+        elseif botCategories()[Chat.category].role then
+            P.SetHintText(hint, "A: add this class to your party   LB / RB: tab   B: back")
         elseif botCategories()[Chat.category].roster then
             P.SetHintText(hint, "A: log in / out (or run)   X: invite   Y: send to   LB / RB: tab   B: back")
         else
@@ -379,6 +420,10 @@ local function activate(e)
         end
     elseif e.kind == "do" then
         e.run()
+    elseif e.kind == "hire" then
+        Bots.PartyAdd(e.class, e.role)
+    elseif e.kind == "partybot" then
+        Bots.PartyRemove(e.bot.name)
     elseif e.kind == "bot" then
         if e.bot.online then Bots.Remove(e.bot.name) else Bots.Add(e.bot.name) end
     elseif e.kind == "command" then
@@ -489,6 +534,7 @@ function Chat.Open()
     if P.Menu and P.Menu.frame:IsVisible() then P.Menu.Close() end
     if P.Binds and P.Binds.frame:IsVisible() then P.Binds.frame:Hide() end
     if P.Wheel and P.Wheel.frame:IsVisible() then P.Wheel.Close() end
+    Bots.PartyRefresh()
     win:Show()
 end
 

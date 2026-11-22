@@ -31,11 +31,12 @@ Menu.pages = {
         rows = {
             { label = "Keybinds", desc = "Put spells, macros, items and game actions on every button and layer.",
                 run = function() Menu.Close() P.Binds.Toggle() end },
-            { label = "Quick Chat", desc = "Phrases for every channel, the on-screen keyboard, and your bots: log them in, command them, build the bot wheel (LT+RT+Y).",
+            { label = "Quick Chat", desc = "Your party of bots: add a tank, healer or DPS by class, dismiss them, command them, build the bot wheel (LT+RT+Y). Also phrases for every channel and the on-screen keyboard.",
                 run = function() Menu.Close() P.Chat.Open() end },
             { label = "Camera & sticks", desc = "Look speed, camera direction, stick dead zone, zoom.", open = "camera" },
             { label = "Buttons", desc = "When spells cast, what A / B / X / Y do with no trigger held, and vibration.", open = "buttons" },
             { label = "Look", desc = "Size and place of the gamepad bar, button symbols, the stock action bar.", open = "look" },
+            { label = "On-screen help", desc = "Show or hide the control tips panel and the \"press X to talk\" prompts.", open = "help" },
             { label = "Reset all settings", desc = "Every setting on this menu back to its default. Your binds are kept.",
                 run = function()
                     if Menu.confirm then
@@ -107,9 +108,14 @@ Menu.pages = {
                 key = "layerCooldowns" },
             { label = "Other sets' previews", desc = "Small icons at each bar button's corners: what it holds on the LT set (left) and the RT set (right).",
                 key = "peek" },
-            { label = "Button legend", desc = "A panel at the top left listing what the buttons do right now: in the world, in a game window.",
+        },
+    },
+    help = {
+        title = "On-screen help",
+        rows = {
+            { label = "Control tips panel", desc = "The panel at the bottom right listing what the buttons do right now: in the world and in a game window.",
                 key = "legend" },
-            { label = "Interact prompt", desc = "Above the bar, what X does now: Talk, Loot, Open, Attack.",
+            { label = "Interact prompts", desc = "The \"X Talk\", \"X Loot\" and \"X Attack\" button shown over NPCs, corpses and objects. X still works with this off.",
                 key = "prompt" },
         },
     },

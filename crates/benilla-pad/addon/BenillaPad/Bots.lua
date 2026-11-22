@@ -164,6 +164,88 @@ function Bots.ToggleFavorite(id)
     return true
 end
 
+-- ── The party: throwaway bots ──
+-- `.bot party add <class> <role>` hires a bot from the server's random bot pool at the player's
+-- level; it leaves when dismissed or when the player logs out. The server answers with a
+-- "Bot party: Name/Class/Role/Level/on, ..." line (ZoneBotMgr.cpp), or "Bot party error: why".
+
+Bots.party = {}
+
+-- What each role can be picked from; `only` is the one faction that has the class in 1.12.
+Bots.ROLES = {
+    { id = "tank", title = "Add Tank", classes = {
+        { name = "Warrior" }, { name = "Paladin", only = "Alliance" }, { name = "Druid" },
+    } },
+    { id = "healer", title = "Add Healer", classes = {
+        { name = "Priest" }, { name = "Paladin", only = "Alliance" }, { name = "Shaman", only = "Horde" }, { name = "Druid" },
+    } },
+    { id = "dps", title = "Add DPS", classes = {
+        { name = "Mage" }, { name = "Hunter" }, { name = "Rogue" }, { name = "Warlock" }, { name = "Warrior" },
+        { name = "Priest" }, { name = "Paladin", only = "Alliance" }, { name = "Shaman", only = "Horde" }, { name = "Druid" },
+    } },
+}
+
+-- The classes of a role that the player's faction has.
+function Bots.RoleClasses(role)
+    local faction = UnitFactionGroup("player")
+    local out = {}
+    for i = 1, table.getn(role.classes) do
+        local c = role.classes[i]
+        if not c.only or c.only == faction then
+            table.insert(out, c.name)
+        end
+    end
+    return out
+end
+
+function Bots.ParseParty(msg)
+    local _, _, why = string.find(msg, "^Bot party error: (.*)$")
+    if why then
+        UIErrorsFrame:AddMessage(why, 1, 0.1, 0.1, 1, 5)
+        return true
+    end
+    local _, _, body = string.find(msg, "^Bot party: (.*)$")
+    if not body then
+        return false
+    end
+    local party = {}
+    for name, class, role, level, state in string.gfind(body, "([^/,%s]+)/([^/]+)/([^/]+)/(%d+)/(%a+)") do
+        table.insert(party, { name = name, class = class, role = role, level = tonumber(level), online = (state == "on") })
+    end
+    Bots.party = party
+    if P.Chat and P.Chat.Refresh then
+        P.Chat.Refresh()
+    end
+    return true
+end
+
+function Bots.PartyAdd(class, role)
+    Bots.Dot(".bot party add " .. string.lower(class) .. " " .. role)
+end
+
+function Bots.PartyRemove(name)
+    Bots.Dot(".bot party remove " .. name)
+end
+
+function Bots.PartyClear()
+    Bots.Dot(".bot party clear")
+end
+
+function Bots.PartyRefresh()
+    Bots.Dot(".bot party list")
+end
+
+-- The answers are for the Party page, not the chat log.
+if ChatFrame_OnEvent then
+    local stockOnEvent = ChatFrame_OnEvent
+    ChatFrame_OnEvent = function(e)
+        if e == "CHAT_MSG_SYSTEM" and arg1 and string.find(arg1, "^Bot party") then
+            return
+        end
+        return stockOnEvent(e)
+    end
+end
+
 -- ── The roster ──
 
 function Bots.Roster()
@@ -171,6 +253,11 @@ function Bots.Roster()
 end
 
 function Bots.Find(name)
+    for i = 1, table.getn(Bots.party) do
+        if Bots.party[i].name == name then
+            return Bots.party[i]
+        end
+    end
     local roster = db().roster
     for i = 1, table.getn(roster) do
         if roster[i].name == name then
@@ -258,12 +345,26 @@ function Bots.TargetLabel()
     return Bots.target
 end
 
+function Bots.InParty(name)
+    for i = 1, table.getn(Bots.party) do
+        if Bots.party[i].name == name then
+            return true
+        end
+    end
+    return false
+end
+
 -- Step the target choice: auto, everyone, then each online bot.
 function Bots.CycleTarget(dir)
     local choices = { "auto", "all" }
+    for i = 1, table.getn(Bots.party) do
+        if Bots.party[i].online then
+            table.insert(choices, Bots.party[i].name)
+        end
+    end
     local roster = db().roster
     for i = 1, table.getn(roster) do
-        if roster[i].online then
+        if roster[i].online and not Bots.InParty(roster[i].name) then
             table.insert(choices, roster[i].name)
         end
     end
@@ -360,7 +461,7 @@ listen:RegisterEvent("CHAT_MSG_SYSTEM")
 listen:RegisterEvent("PARTY_MEMBERS_CHANGED")
 listen:SetScript("OnEvent", function()
     if event == "CHAT_MSG_SYSTEM" then
-        if Bots.ParseRoster(arg1 or "") then
+        if Bots.ParseParty(arg1 or "") or Bots.ParseRoster(arg1 or "") then
             return
         end
     end
